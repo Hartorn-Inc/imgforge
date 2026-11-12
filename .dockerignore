@@ -1,0 +1,5 @@
+# Exclude everything from the Docker build context by default so local secrets,
+# worktrees, and large build artifacts are never streamed to the Docker daemon.
+# Dockerfile builds a pure toolchain image without copying host repository files.
+*
+!Dockerfile

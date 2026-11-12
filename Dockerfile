@@ -48,7 +48,8 @@ RUN if ! getent group "${BUILDER_GID}" >/dev/null; then \
         useradd --uid "${BUILDER_UID}" --gid "${BUILDER_GID}" --create-home --shell /bin/bash builder; \
     fi \
     && mkdir -p /workspace /cache/cargo /cache/npm \
-    && chmod 1777 /cache /cache/cargo /cache/npm
+    && chown -R "${BUILDER_UID}:${BUILDER_GID}" /workspace /cache \
+    && chmod 0755 /cache /cache/cargo /cache/npm
 
 # Verify pinned toolchain versions and Bookworm glibc compatibility (<= 2.39).
 RUN rustc --version \

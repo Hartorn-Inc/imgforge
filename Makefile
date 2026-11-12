@@ -13,6 +13,8 @@ DOCKER_CACHE_DIR ?= $(if $(XDG_CACHE_HOME),$(XDG_CACHE_HOME)/imgforge,$(HOME)/.c
 DOCKER_RUN = \
 	mkdir -p "$(DOCKER_CACHE_DIR)/cargo" "$(DOCKER_CACHE_DIR)/npm" && \
 	docker run --rm \
+		--cap-drop=ALL \
+		--security-opt=no-new-privileges \
 		--user "$(HOST_UID):$(HOST_GID)" \
 		-v "$(CURDIR):/workspace" \
 		-v "$(DOCKER_CACHE_DIR)/cargo:/cache/cargo" \
@@ -22,6 +24,15 @@ DOCKER_RUN = \
 		-e HOME=/tmp \
 		-w /workspace \
 		"$(IMAGE_NAME)"
+
+ENSURE_FRONTEND_DEPS = \
+	if [ ! -d frontend/node_modules ] || { [ -f frontend/package-lock.json ] && { [ ! -f frontend/node_modules/.package-lock.json ] || [ frontend/package-lock.json -nt frontend/node_modules/.package-lock.json ]; }; }; then \
+		if [ -f frontend/package-lock.json ]; then \
+			npm --prefix frontend ci --prefer-offline; \
+		else \
+			npm --prefix frontend install; \
+		fi; \
+	fi
 
 define ENSURE_IMAGE
 	@docker image inspect "$(IMAGE_NAME)" >/dev/null 2>&1 || $(MAKE) docker-build
@@ -45,11 +56,7 @@ ui-build: ## Install frontend dependencies and build the embedded Web Canvas SPA
 	$(ENSURE_IMAGE)
 	@$(DOCKER_RUN) bash -euo pipefail -c '\
 		if [ -f frontend/package.json ]; then \
-			if [ -f frontend/package-lock.json ]; then \
-				npm --prefix frontend ci --prefer-offline; \
-			else \
-				npm --prefix frontend install; \
-			fi; \
+			$(ENSURE_FRONTEND_DEPS); \
 			npm --prefix frontend run build; \
 		else \
 			echo "[imgforge] skipping ui-build: frontend/package.json not present yet"; \
@@ -68,17 +75,11 @@ build: ui-build ## Build the embedded SPA and compile the release Rust binary fo
 			echo "[imgforge] skipping Rust release build: Cargo.toml not present yet"; \
 		fi'
 
-test: ## Run frontend and Rust workspace test suites inside the builder container
+test: ui-build ## Run frontend and Rust workspace test suites inside the builder container
 	$(ENSURE_IMAGE)
 	@$(DOCKER_RUN) bash -euo pipefail -c '\
 		if [ -f frontend/package.json ]; then \
-			if [ ! -d frontend/node_modules ]; then \
-				if [ -f frontend/package-lock.json ]; then \
-					npm --prefix frontend ci --prefer-offline; \
-				else \
-					npm --prefix frontend install; \
-				fi; \
-			fi; \
+			$(ENSURE_FRONTEND_DEPS); \
 			npm --prefix frontend test --if-present; \
 		else \
 			echo "[imgforge] skipping frontend tests: frontend/package.json not present yet"; \
@@ -93,17 +94,11 @@ test: ## Run frontend and Rust workspace test suites inside the builder containe
 			echo "[imgforge] skipping Rust tests: Cargo.toml not present yet"; \
 		fi'
 
-lint: ## Run frontend typecheck/lint and cargo clippy (-D warnings)
+lint: ui-build ## Run frontend typecheck/lint and cargo clippy (-D warnings)
 	$(ENSURE_IMAGE)
 	@$(DOCKER_RUN) bash -euo pipefail -c '\
 		if [ -f frontend/package.json ]; then \
-			if [ ! -d frontend/node_modules ]; then \
-				if [ -f frontend/package-lock.json ]; then \
-					npm --prefix frontend ci --prefer-offline; \
-				else \
-					npm --prefix frontend install; \
-				fi; \
-			fi; \
+			$(ENSURE_FRONTEND_DEPS); \
 			npm --prefix frontend run --if-present lint; \
 			npm --prefix frontend run --if-present typecheck; \
 		else \
@@ -123,13 +118,7 @@ fmt-check: ## Check formatting for frontend and Rust workspace without modifying
 	$(ENSURE_IMAGE)
 	@$(DOCKER_RUN) bash -euo pipefail -c '\
 		if [ -f frontend/package.json ]; then \
-			if [ ! -d frontend/node_modules ]; then \
-				if [ -f frontend/package-lock.json ]; then \
-					npm --prefix frontend ci --prefer-offline; \
-				else \
-					npm --prefix frontend install; \
-				fi; \
-			fi; \
+			$(ENSURE_FRONTEND_DEPS); \
 			npm --prefix frontend run --if-present format:check; \
 		else \
 			echo "[imgforge] skipping frontend fmt-check: frontend/package.json not present yet"; \
@@ -144,13 +133,7 @@ fmt: ## Format frontend and Rust source files inside the builder container
 	$(ENSURE_IMAGE)
 	@$(DOCKER_RUN) bash -euo pipefail -c '\
 		if [ -f frontend/package.json ]; then \
-			if [ ! -d frontend/node_modules ]; then \
-				if [ -f frontend/package-lock.json ]; then \
-					npm --prefix frontend ci --prefer-offline; \
-				else \
-					npm --prefix frontend install; \
-				fi; \
-			fi; \
+			$(ENSURE_FRONTEND_DEPS); \
 			npm --prefix frontend run --if-present format; \
 		else \
 			echo "[imgforge] skipping frontend fmt: frontend/package.json not present yet"; \
