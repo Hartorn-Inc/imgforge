@@ -59,7 +59,7 @@ fn build_exemplar_png(base: [u8; 3], accent: [u8; 3], line: [u8; 3]) -> Vec<u8> 
     let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(SIZE, SIZE);
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let is_border = x < 3 || x >= SIZE - 3 || y < 3 || y >= SIZE - 3;
+            let is_border = !(3..SIZE - 3).contains(&x) || !(3..SIZE - 3).contains(&y);
             let is_diagonal = (x as i32 - y as i32).abs() <= 1 && (10..54).contains(&x);
             let is_accent_box = (16..32).contains(&x) && (16..32).contains(&y);
             let rgb = if is_border || is_diagonal {
