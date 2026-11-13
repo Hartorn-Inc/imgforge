@@ -644,6 +644,10 @@ body {
   touch-action: none;
 }
 
+.mask-paint-overlay[hidden] {
+  display: none;
+}
+
 .mask-preview-thumb,
 .rendered-guide-preview,
 .preview-img {

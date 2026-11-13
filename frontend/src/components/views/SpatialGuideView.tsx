@@ -29,7 +29,7 @@ export interface SpatialGuideViewProps {
   readonly exportedMaskBase64: string | null;
   readonly onSpecUpdate: (nextSpec: GuideSpec, nextJson: string) => void;
   readonly onJsonDraftChange: (nextJson: string) => void;
-  readonly onMaskCaptured: (maskPngBase64: string, switchToPatchEdit: boolean) => void;
+  readonly onMaskCaptured: (maskPngBase64: string | null, switchToPatchEdit: boolean) => void;
 }
 
 function isSpatialGuideVariant(value: string): value is SpatialGuideVariant {
@@ -97,39 +97,63 @@ export function SpatialGuideView({
     syncSpec(nextSpec);
   };
 
-  const handleApplyJson = async (): Promise<void> => {
+  const validateAndApplyDraft = async (): Promise<GuideSpec | null> => {
     const result = parseGuideSpecJson(jsonDraft);
     if (!result.ok) {
       setValidationErrors(result.errors);
-      return;
+      setRenderStatus('GuideSpec JSON validation failed.');
+      return null;
     }
     setIsBusy(true);
     setRenderStatus('Validating via POST /api/guide/validate...');
     const remote = await validateGuideRemote(result.value);
-    setIsBusy(false);
 
     if (remote.ok) {
       if (!remote.data.valid) {
+        setIsBusy(false);
         setValidationErrors(remote.data.errors);
         setRenderStatus('Server GuideSpec validation failed.');
-        return;
+        return null;
       }
       const validated = remote.data.spec ?? result.value;
       syncSpec(validated);
       setRenderStatus('GuideSpec validated cleanly against Rust schema.');
-      return;
+      return validated;
+    }
+
+    if (remote.error.httpStatus !== null) {
+      setIsBusy(false);
+      setValidationErrors([{ path: '$', message: remote.error.message }]);
+      setRenderStatus(`Server GuideSpec validation failed: ${remote.error.message}`);
+      return null;
     }
 
     // If local server is unreachable during standalone UI work, apply local schema validation.
     syncSpec(result.value);
     setRenderStatus(`Applied locally (server validate unavailable: ${remote.error.message}).`);
+    return result.value;
+  };
+
+  const handleApplyJson = async (): Promise<void> => {
+    const applied = await validateAndApplyDraft();
+    if (applied !== null) {
+      setIsBusy(false);
+    }
   };
 
   const handleRenderRustGuide = async (): Promise<void> => {
+    let specToRender = spec;
+    if (jsonDraft !== serializeGuideSpecJson(spec)) {
+      const applied = await validateAndApplyDraft();
+      if (applied === null) {
+        return;
+      }
+      specToRender = applied;
+    }
     setIsBusy(true);
     setRenderStatus('Rendering via Rust GuideRenderer (POST /api/guide/render)...');
     setValidationErrors([]);
-    const res = await renderGuideRemote(spec);
+    const res = await renderGuideRemote(specToRender);
     setIsBusy(false);
     if (!res.ok) {
       setRenderStatus(`Render failed: ${res.error.message}`);
@@ -306,9 +330,13 @@ export function SpatialGuideView({
               toolMode={toolMode}
               brushRadiusPx={brushRadiusPx}
               backgroundImageUrl={backgroundImageUrl}
+              maskPngBase64={exportedMaskBase64}
               onSpecChange={syncSpec}
               onMaskExport={(b64) => {
                 onMaskCaptured(b64, false);
+              }}
+              onMaskClear={() => {
+                onMaskCaptured(null, false);
               }}
             />
           )}

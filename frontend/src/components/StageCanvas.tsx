@@ -35,8 +35,10 @@ export interface StageCanvasProps {
   readonly toolMode?: StageToolMode;
   readonly brushRadiusPx?: number;
   readonly backgroundImageUrl?: string | null;
+  readonly maskPngBase64?: string | null;
   readonly onSpecChange?: (nextSpec: GuideSpec) => void;
   readonly onMaskExport?: (maskPngBase64: string) => void;
+  readonly onMaskClear?: () => void;
 }
 
 const STAGE_VIEWPORT_SIZE = 512;
@@ -57,16 +59,21 @@ export function StageCanvas({
   toolMode = 'select',
   brushRadiusPx = 20,
   backgroundImageUrl = null,
+  maskPngBase64,
   onSpecChange,
   onMaskExport,
+  onMaskClear,
 }: StageCanvasProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const isPaintingRef = useRef<boolean>(false);
+  const lastExportedMaskRef = useRef<string | null>(null);
   const [canvasUnavailable, setCanvasUnavailable] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState<number>(STAGE_VIEWPORT_SIZE);
   const [bgImgElement, setBgImgElement] = useState<HTMLImageElement | null>(null);
-  const [hasMaskStrokes, setHasMaskStrokes] = useState<boolean>(false);
+  const [hasMaskStrokes, setHasMaskStrokes] = useState<boolean>(
+    () => typeof maskPngBase64 === 'string' && maskPngBase64.length > 0,
+  );
 
   const specRef = useRef<GuideSpec>(spec);
   specRef.current = spec;
@@ -641,22 +648,70 @@ export function StageCanvas({
       return;
     }
     const b64 = stripPngDataUrlPrefix(canvas.toDataURL('image/png'));
+    lastExportedMaskRef.current = b64;
     onMaskExport(b64);
   }, [onMaskExport]);
 
   const clearMaskCanvas = useCallback((): void => {
     const canvas = maskCanvasRef.current;
-    if (canvas === null) {
-      return;
+    if (canvas !== null) {
+      const ctx = canvas.getContext('2d');
+      if (ctx !== null) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
     }
-    const ctx = canvas.getContext('2d');
-    if (ctx !== null) {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }
+    lastExportedMaskRef.current = null;
     setHasMaskStrokes(false);
-  }, []);
+    onMaskClear?.();
+  }, [onMaskClear]);
 
   const isCanvasHidden = disabled || canvasUnavailable !== null;
+
+  useEffect(() => {
+    if (isCanvasHidden) {
+      lastExportedMaskRef.current = null;
+      return;
+    }
+    if (maskPngBase64 === undefined) {
+      return;
+    }
+    const canvas = maskCanvasRef.current;
+    if (maskPngBase64 === null || maskPngBase64.length === 0) {
+      lastExportedMaskRef.current = null;
+      if (canvas !== null) {
+        const ctx = canvas.getContext('2d');
+        if (ctx !== null) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+      }
+      setHasMaskStrokes(false);
+      return;
+    }
+    setHasMaskStrokes(true);
+    if (
+      maskPngBase64 === lastExportedMaskRef.current ||
+      canvas === null ||
+      typeof Image === 'undefined'
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (cancelled) {
+        return;
+      }
+      const ctx = canvas.getContext('2d');
+      if (ctx !== null) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      }
+    };
+    img.src = `data:image/png;base64,${maskPngBase64}`;
+    return () => {
+      cancelled = true;
+    };
+  }, [isCanvasHidden, maskPngBase64, spec.canvasWidth, spec.canvasHeight]);
 
   return (
     <div class="stage-frame">
@@ -687,20 +742,24 @@ export function StageCanvas({
           role="img"
           aria-label={`Konva SpatialGuide stage for ${spec.title} (${spec.variant}, ${String(spec.canvasWidth)} by ${String(spec.canvasHeight)} pixels)`}
         />
-        {toolMode === 'paint_mask' && !isCanvasHidden && (
+        {!isCanvasHidden && (
           <canvas
             ref={maskCanvasRef}
             width={spec.canvasWidth}
             height={spec.canvasHeight}
+            hidden={toolMode !== 'paint_mask'}
             class="mask-paint-overlay"
             style={{ width: `${String(stageWidth)}px`, height: `${String(stageHeight)}px` }}
             aria-label="Freehand PatchEdit alpha mask painting canvas"
             onPointerDown={(e) => {
+              if (toolMode !== 'paint_mask') {
+                return;
+              }
               isPaintingRef.current = true;
               paintMaskAt(e.clientX, e.clientY);
             }}
             onPointerMove={(e) => {
-              if (isPaintingRef.current) {
+              if (toolMode === 'paint_mask' && isPaintingRef.current) {
                 paintMaskAt(e.clientX, e.clientY);
               }
             }}

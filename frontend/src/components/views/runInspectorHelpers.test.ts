@@ -53,26 +53,69 @@ describe('Run Inspector eyedropper, lens, vectorscope, and Export helpers', () =
     expect(rgbBytesToHex(rgb[0], rgb[1], rgb[2])).toBe(expected);
   });
 
-  test('projects OKLab (a, b) into plot coordinates with origin at center', () => {
-    expect(projectOklabToPlot(0, 0, 220)).toEqual({ x: 110, y: 110 });
-    const pos = projectOklabToPlot(0.35, 0.35, 220);
-    expect(pos.x).toBe(210);
-    expect(pos.y).toBe(10);
+  test.each<{
+    id: string;
+    a: number;
+    b: number;
+    plotSize: number;
+    expected: { readonly x: number; readonly y: number };
+  }>([
+    {
+      id: 'maps-neutral-origin-to-plot-center',
+      a: 0,
+      b: 0,
+      plotSize: 220,
+      expected: { x: 110, y: 110 },
+    },
+    {
+      id: 'maps-positive-oklab-to-top-right',
+      a: 0.35,
+      b: 0.35,
+      plotSize: 220,
+      expected: { x: 210, y: 10 },
+    },
+    {
+      id: 'clamps-extreme-oklab-coordinates',
+      a: -1.5,
+      b: -1.5,
+      plotSize: 220,
+      expected: { x: 10, y: 210 },
+    },
+  ])('$id', ({ a, b, plotSize, expected }) => {
+    expect(projectOklabToPlot(a, b, plotSize)).toEqual(expected);
   });
 
-  test('clamps zoomed ROI lens source rect inside image bounds', () => {
-    expect(computeLensSourceRect(4, 6, 512, 512, 4, 128)).toEqual({
-      sx: 0,
-      sy: 0,
-      sw: 32,
-      sh: 32,
-    });
-    expect(computeLensSourceRect(510, 510, 512, 512, 4, 128)).toEqual({
-      sx: 480,
-      sy: 480,
-      sw: 32,
-      sh: 32,
-    });
+  test.each<{
+    id: string;
+    cx: number;
+    cy: number;
+    width: number;
+    height: number;
+    expected: {
+      readonly sx: number;
+      readonly sy: number;
+      readonly sw: number;
+      readonly sh: number;
+    };
+  }>([
+    {
+      id: 'clamps-top-left-lens-crop-to-zero',
+      cx: 4,
+      cy: 6,
+      width: 512,
+      height: 512,
+      expected: { sx: 0, sy: 0, sw: 32, sh: 32 },
+    },
+    {
+      id: 'clamps-bottom-right-lens-crop-within-image',
+      cx: 510,
+      cy: 510,
+      width: 512,
+      height: 512,
+      expected: { sx: 480, sy: 480, sw: 32, sh: 32 },
+    },
+  ])('$id', ({ cx, cy, width, height, expected }) => {
+    expect(computeLensSourceRect(cx, cy, width, height, 4, 128)).toEqual(expected);
   });
 
   test.each<{

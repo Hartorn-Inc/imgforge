@@ -41,7 +41,7 @@ export interface RunInspectorViewProps {
   readonly workspaceState: AsyncViewState<WorkspaceSummary>;
   readonly selectedRunId: string;
   readonly onSelectRunId: (runId: string) => void;
-  readonly onRefreshWorkspace: () => void;
+  readonly onRefreshWorkspace: () => Promise<void>;
   readonly onSendRunToPatchEdit: (run: RunRecord) => void;
 }
 
@@ -118,11 +118,15 @@ export function RunInspectorView({
 
   const samplerCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const lensCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const loadedRunImgRef = useRef<HTMLImageElement | null>(null);
+  const inspectReqSeqRef = useRef<number>(0);
+  const validateReqSeqRef = useRef<number>(0);
 
   const ws = workspaceState.status === 'ready' ? workspaceState.data : null;
   const runs = ws?.runs ?? [];
   const activeRun = runs.find((r) => r.runId === selectedRunId) ?? runs[0] ?? null;
+
+  const activeRunIdRef = useRef<string>(activeRun?.runId ?? '');
+  activeRunIdRef.current = activeRun?.runId ?? '';
 
   useEffect(() => {
     if (ws === null) {
@@ -154,7 +158,6 @@ export function RunInspectorView({
   // Draw activeRun image onto offscreen sampler canvas for zero-latency pixel eyedropper + 4x loupe.
   useEffect(() => {
     if (activeRun === null || typeof Image === 'undefined') {
-      loadedRunImgRef.current = null;
       return;
     }
     let cancelled = false;
@@ -163,7 +166,6 @@ export function RunInspectorView({
       if (cancelled) {
         return;
       }
-      loadedRunImgRef.current = img;
       const canvas = samplerCanvasRef.current;
       if (canvas !== null) {
         canvas.width = img.naturalWidth || activeRun.widthPx;
@@ -181,30 +183,20 @@ export function RunInspectorView({
     };
   }, [activeRun?.imageUrl, activeRun?.widthPx, activeRun?.heightPx]);
 
-  const sampleAtClientPoint = useCallback(
-    (clientX: number, clientY: number, element: HTMLElement): void => {
+  const sampleAtImagePixel = useCallback(
+    (rawX: number, rawY: number): void => {
       const sampler = samplerCanvasRef.current;
+      const maxW =
+        sampler !== null && sampler.width > 0 ? sampler.width : (activeRun?.widthPx ?? 1);
+      const maxH =
+        sampler !== null && sampler.height > 0 ? sampler.height : (activeRun?.heightPx ?? 1);
+      const px = Math.max(0, Math.min(maxW - 1, Math.round(rawX)));
+      const py = Math.max(0, Math.min(maxH - 1, Math.round(rawY)));
+      setSampledCoords({ x: px, y: py });
+
       if (sampler === null || sampler.width === 0 || sampler.height === 0) {
         return;
       }
-      const rect = element.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) {
-        return;
-      }
-      const px = Math.max(
-        0,
-        Math.min(
-          sampler.width - 1,
-          Math.floor(((clientX - rect.left) / rect.width) * sampler.width),
-        ),
-      );
-      const py = Math.max(
-        0,
-        Math.min(
-          sampler.height - 1,
-          Math.floor(((clientY - rect.top) / rect.height) * sampler.height),
-        ),
-      );
       const ctx = sampler.getContext('2d');
       if (ctx === null) {
         return;
@@ -212,7 +204,6 @@ export function RunInspectorView({
       const data = ctx.getImageData(px, py, 1, 1).data;
       const hex = rgbBytesToHex(data[0] ?? 0, data[1] ?? 0, data[2] ?? 0);
       setSampledHex(hex);
-      setSampledCoords({ x: px, y: py });
 
       const lens = lensCanvasRef.current;
       if (lens !== null) {
@@ -232,7 +223,24 @@ export function RunInspectorView({
         }
       }
     },
-    [],
+    [activeRun?.widthPx, activeRun?.heightPx],
+  );
+
+  const sampleAtClientPoint = useCallback(
+    (clientX: number, clientY: number, element: HTMLElement): void => {
+      const sampler = samplerCanvasRef.current;
+      if (sampler === null || sampler.width === 0 || sampler.height === 0) {
+        return;
+      }
+      const rect = element.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return;
+      }
+      const px = Math.floor(((clientX - rect.left) / rect.width) * sampler.width);
+      const py = Math.floor(((clientY - rect.top) / rect.height) * sampler.height);
+      sampleAtImagePixel(px, py);
+    },
+    [sampleAtImagePixel],
   );
 
   if (workspaceState.status !== 'ready') {
@@ -243,7 +251,12 @@ export function RunInspectorView({
             <h2 class="panel-title">Run Inspector</h2>
           </div>
         </div>
-        <StatePanel state={workspaceState} onRetry={onRefreshWorkspace} />
+        <StatePanel
+          state={workspaceState}
+          onRetry={() => {
+            void onRefreshWorkspace();
+          }}
+        />
       </div>
     );
   }
@@ -284,7 +297,10 @@ export function RunInspectorView({
       : null;
 
   const handleInspect = async (): Promise<void> => {
-    setBusyLabel(`Inspecting ${activeRun.slug} ${activeRun.versionLabel}...`);
+    const targetRun = activeRun;
+    const targetRunId = targetRun.runId;
+    const reqSeq = ++inspectReqSeqRef.current;
+    setBusyLabel(`Inspecting ${targetRun.slug} ${targetRun.versionLabel}...`);
     setFeedback(null);
     const payload: {
       atmosphereSlug?: string;
@@ -303,7 +319,10 @@ export function RunInspectorView({
     if (beforeRun !== null) {
       payload.beforeRunVersion = beforeRun.version;
     }
-    const res = await inspectRun(activeRun.slug, activeRun.version, payload);
+    const res = await inspectRun(targetRun.slug, targetRun.version, payload);
+    if (reqSeq !== inspectReqSeqRef.current || activeRunIdRef.current !== targetRunId) {
+      return;
+    }
     setBusyLabel(null);
     if (!res.ok) {
       setFeedback({ kind: 'error', text: `${res.error.code}: ${res.error.message}` });
@@ -318,7 +337,10 @@ export function RunInspectorView({
   };
 
   const handleValidateRun = async (): Promise<void> => {
-    setBusyLabel(`Validating ${activeRun.slug} ${activeRun.versionLabel}...`);
+    const targetRun = activeRun;
+    const targetRunId = targetRun.runId;
+    const reqSeq = ++validateReqSeqRef.current;
+    setBusyLabel(`Validating ${targetRun.slug} ${targetRun.versionLabel}...`);
     setFeedback(null);
     const payload: {
       atmosphereSlug?: string;
@@ -333,7 +355,10 @@ export function RunInspectorView({
     if (selectedSubjects.length > 0) {
       payload.subjectSlugs = selectedSubjects;
     }
-    const res = await validateRun(activeRun.slug, activeRun.version, payload);
+    const res = await validateRun(targetRun.slug, targetRun.version, payload);
+    if (reqSeq !== validateReqSeqRef.current || activeRunIdRef.current !== targetRunId) {
+      return;
+    }
     setBusyLabel(null);
     if (!res.ok) {
       setFeedback({ kind: 'error', text: `${res.error.code}: ${res.error.message}` });
@@ -345,7 +370,7 @@ export function RunInspectorView({
       kind: 'ok',
       text: `Validated ${res.data.run.runId} -> ${res.data.run.lifecycle}.`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handlePromoteRun = async (): Promise<void> => {
@@ -361,7 +386,7 @@ export function RunInspectorView({
       kind: 'ok',
       text: `Promoted ${res.data.run.runId} to canonical (lock entries: ${String(res.data.canonicalCount)}).`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handleSaveEyedropperSwatch = async (): Promise<void> => {
@@ -394,7 +419,7 @@ export function RunInspectorView({
       kind: 'ok',
       text: `Saved ${sampledHex} to Subject '${res.data.slug}' PaletteLock.`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handleExport = async (): Promise<void> => {
@@ -416,7 +441,7 @@ export function RunInspectorView({
       kind: 'ok',
       text: `Exported ${String(res.data.artifacts.length)} deliverable(s) from ${res.data.sourceId}.`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const sameSlugPriorRuns = runs.filter(
@@ -446,10 +471,14 @@ export function RunInspectorView({
               class="select-input"
               value={activeRun.runId}
               onChange={(e) => {
+                inspectReqSeqRef.current += 1;
+                validateReqSeqRef.current += 1;
                 onSelectRunId(e.currentTarget.value);
                 setInspection(null);
+                setActiveColorQa(null);
                 setCriticReport(null);
                 setExportResult(null);
+                setBusyLabel(null);
               }}
             >
               {runs.map((r) => (
@@ -653,6 +682,9 @@ export function RunInspectorView({
 
           <div
             class="compare-stage"
+            tabIndex={0}
+            role="region"
+            aria-label="Run visual comparator and PaletteLock eyedropper stage; use arrow keys to step sample coordinates"
             onMouseMove={(e) => {
               if (eyedropperEnabled) {
                 sampleAtClientPoint(e.clientX, e.clientY, e.currentTarget);
@@ -660,6 +692,22 @@ export function RunInspectorView({
             }}
             onClick={(e) => {
               sampleAtClientPoint(e.clientX, e.clientY, e.currentTarget);
+            }}
+            onKeyDown={(e) => {
+              const step = e.shiftKey ? 10 : 1;
+              if (e.key === 'ArrowLeft') {
+                e.preventDefault();
+                sampleAtImagePixel(sampledCoords.x - step, sampledCoords.y);
+              } else if (e.key === 'ArrowRight') {
+                e.preventDefault();
+                sampleAtImagePixel(sampledCoords.x + step, sampledCoords.y);
+              } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                sampleAtImagePixel(sampledCoords.x, sampledCoords.y - step);
+              } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                sampleAtImagePixel(sampledCoords.x, sampledCoords.y + step);
+              }
             }}
           >
             {beforeRun !== null && (
@@ -779,6 +827,49 @@ export function RunInspectorView({
                 <span class="muted-note">
                   @ ({sampledCoords.x}, {sampledCoords.y})
                 </span>
+              </div>
+
+              <div class="form-row-2">
+                <div class="control-group">
+                  <label class="field-label" for="eyedropper-x">
+                    Sample X (px)
+                  </label>
+                  <input
+                    id="eyedropper-x"
+                    type="number"
+                    min={0}
+                    max={Math.max(0, activeRun.widthPx - 1)}
+                    step={1}
+                    class="text-input"
+                    value={sampledCoords.x}
+                    onInput={(e) => {
+                      const n = Number.parseInt(e.currentTarget.value, 10);
+                      if (Number.isFinite(n)) {
+                        sampleAtImagePixel(n, sampledCoords.y);
+                      }
+                    }}
+                  />
+                </div>
+                <div class="control-group">
+                  <label class="field-label" for="eyedropper-y">
+                    Sample Y (px)
+                  </label>
+                  <input
+                    id="eyedropper-y"
+                    type="number"
+                    min={0}
+                    max={Math.max(0, activeRun.heightPx - 1)}
+                    step={1}
+                    class="text-input"
+                    value={sampledCoords.y}
+                    onInput={(e) => {
+                      const n = Number.parseInt(e.currentTarget.value, 10);
+                      if (Number.isFinite(n)) {
+                        sampleAtImagePixel(sampledCoords.x, n);
+                      }
+                    }}
+                  />
+                </div>
               </div>
 
               <div class="control-group">
@@ -950,10 +1041,11 @@ export function RunInspectorView({
               class="select-input"
               value={exportDraft.profile}
               onChange={(e) => {
-                if (isExportProfileName(e.currentTarget.value)) {
+                const value = e.currentTarget.value;
+                if (isExportProfileName(value)) {
                   setExportDraft((prev) => ({
                     ...prev,
-                    profile: e.currentTarget.value as ExportProfileName,
+                    profile: value,
                   }));
                 }
               }}
@@ -974,10 +1066,11 @@ export function RunInspectorView({
               class="select-input"
               value={exportDraft.visibility}
               onChange={(e) => {
-                if (isVisibility(e.currentTarget.value)) {
+                const value = e.currentTarget.value;
+                if (isVisibility(value)) {
                   setExportDraft((prev) => ({
                     ...prev,
-                    visibility: e.currentTarget.value as Visibility,
+                    visibility: value,
                   }));
                 }
               }}

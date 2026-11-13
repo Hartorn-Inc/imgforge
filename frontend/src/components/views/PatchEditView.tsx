@@ -33,6 +33,7 @@ export interface PatchEditViewProps {
   readonly workspaceState: AsyncViewState<WorkspaceSummary>;
   readonly draft: PatchEditDraft;
   readonly onDraftChange: (next: PatchEditDraft) => void;
+  readonly onRefreshWorkspace: () => Promise<void>;
   readonly onPatchCompleted: (res: PatchEditResponse) => void;
 }
 
@@ -53,6 +54,7 @@ export function PatchEditView({
   workspaceState,
   draft,
   onDraftChange,
+  onRefreshWorkspace,
   onPatchCompleted,
 }: PatchEditViewProps): JSX.Element {
   const [brushRadiusPx, setBrushRadiusPx] = useState<number>(22);
@@ -72,7 +74,12 @@ export function PatchEditView({
             </p>
           </div>
         </div>
-        <StatePanel state={workspaceState} />
+        <StatePanel
+          state={workspaceState}
+          onRetry={() => {
+            void onRefreshWorkspace();
+          }}
+        />
       </div>
     );
   }
@@ -192,6 +199,14 @@ export function PatchEditView({
             }}
             onMaskChange={(b64) => {
               updateDraft({ maskPngBase64: b64 });
+            }}
+            onImageDimensions={(width, height) => {
+              if (
+                draft.targetRunKey === null &&
+                (draft.canvasWidthPx !== width || draft.canvasHeightPx !== height)
+              ) {
+                updateDraft({ canvasWidthPx: width, canvasHeightPx: height });
+              }
             }}
           />
         </div>

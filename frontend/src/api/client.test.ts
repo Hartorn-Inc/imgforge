@@ -4,8 +4,12 @@ import {
   connectWorkspaceEvents,
   createAtmosphere,
   createStyle,
+  decodeAtmosphereDto,
   decodeColorQaReport,
   decodeCriticReport,
+  decodeReferencePackDto,
+  decodeRunDto,
+  decodeStyleDto,
   decodeWorkspaceEvent,
   executePatchEdit,
   exportRun,
@@ -317,7 +321,38 @@ describe('imgforge API client serialization and defensive decoding', () => {
     }
   });
 
-  test('sends exact CreateAtmosphereRequest and UpdateAtmosphereRequest fields', async () => {
+  test.each<{
+    id: string;
+    mode: 'create' | 'update';
+    expectedMethod: string;
+    expectedBody: Record<string, unknown>;
+  }>([
+    {
+      id: 'sends-exact-create-atmosphere-request-fields',
+      mode: 'create',
+      expectedMethod: 'POST',
+      expectedBody: {
+        slug: 'harbor-noon',
+        displayName: 'Harbor Noon',
+        keyLightDirection: 'high overhead sun',
+        secondaryLightDirection: 'sea bounce',
+        colorTemperatureK: 5600,
+        maxAmbientTintBlend: 0.15,
+        minMeanLStar: 38,
+        minP10LStar: 14,
+        weatherAndParticles: 'crisp sea breeze',
+      },
+    },
+    {
+      id: 'sends-exact-update-atmosphere-request-fields',
+      mode: 'update',
+      expectedMethod: 'PUT',
+      expectedBody: {
+        colorTemperatureK: 5900,
+        weatherAndParticles: 'mist',
+      },
+    },
+  ])('$id', async ({ mode, expectedMethod, expectedBody }) => {
     const calls: { url: string; method: string; body: unknown }[] = [];
     const dto = {
       slug: 'harbor-noon',
@@ -342,256 +377,135 @@ describe('imgforge API client serialization and defensive decoding', () => {
       });
       return Promise.resolve(
         new Response(JSON.stringify(dto), {
-          status: 201,
+          status: mode === 'create' ? 201 : 200,
           headers: { 'Content-Type': 'application/json' },
         }),
       );
     };
 
-    const createRes = await createAtmosphere(
-      {
-        slug: 'harbor-noon',
-        displayName: 'Harbor Noon',
-        keyLightDirection: 'high overhead sun',
-        secondaryLightDirection: 'sea bounce',
-        colorTemperatureK: 5600,
-        maxAmbientTintBlend: 0.15,
-        minMeanLStar: 38,
-        minP10LStar: 14,
-        weatherAndParticles: 'crisp sea breeze',
-      },
-      { fetchImpl },
-    );
-    expect(createRes.ok).toBe(true);
-    expect(calls[0]?.body).toEqual({
-      slug: 'harbor-noon',
-      displayName: 'Harbor Noon',
-      keyLightDirection: 'high overhead sun',
-      secondaryLightDirection: 'sea bounce',
-      colorTemperatureK: 5600,
-      maxAmbientTintBlend: 0.15,
-      minMeanLStar: 38,
-      minP10LStar: 14,
-      weatherAndParticles: 'crisp sea breeze',
-    });
+    const res =
+      mode === 'create'
+        ? await createAtmosphere(
+            {
+              slug: 'harbor-noon',
+              displayName: 'Harbor Noon',
+              keyLightDirection: 'high overhead sun',
+              secondaryLightDirection: 'sea bounce',
+              colorTemperatureK: 5600,
+              maxAmbientTintBlend: 0.15,
+              minMeanLStar: 38,
+              minP10LStar: 14,
+              weatherAndParticles: 'crisp sea breeze',
+            },
+            { fetchImpl },
+          )
+        : await updateAtmosphere(
+            'harbor-noon',
+            { colorTemperatureK: 5900, weatherAndParticles: 'mist' },
+            { fetchImpl },
+          );
 
-    const updateRes = await updateAtmosphere(
-      'harbor-noon',
-      { colorTemperatureK: 5900, weatherAndParticles: 'mist' },
-      { fetchImpl },
-    );
-    expect(updateRes.ok).toBe(true);
-    expect(calls[1]?.method).toBe('PUT');
-    expect(calls[1]?.body).toEqual({ colorTemperatureK: 5900, weatherAndParticles: 'mist' });
+    expect(res.ok).toBe(true);
+    expect(calls[0]?.method).toBe(expectedMethod);
+    expect(calls[0]?.body).toEqual(expectedBody);
   });
 
-  test('covers Style CRUD, PaletteLock, GuideSpec, ReferencePack, PatchEdit, Inspect, and Export routes', async () => {
-    const routes: { url: string; method: string }[] = [];
-    const sampleStyle = (sampleWorkspacePayload(true)['styles'] as unknown[])[0];
-    const sampleSubject = (sampleWorkspacePayload(true)['subjects'] as unknown[])[0];
-    const samplePack = (sampleWorkspacePayload(true)['referencePacks'] as unknown[])[0];
-    const sampleRun = (sampleWorkspacePayload(true)['runs'] as unknown[])[0];
+  const sampleStyle = (sampleWorkspacePayload(true)['styles'] as unknown[])[0];
+  const sampleSubject = (sampleWorkspacePayload(true)['subjects'] as unknown[])[0];
+  const samplePack = (sampleWorkspacePayload(true)['referencePacks'] as unknown[])[0];
+  const sampleRun = (sampleWorkspacePayload(true)['runs'] as unknown[])[0];
 
-    const fetchImpl: typeof fetch = (input, init) => {
-      const url =
-        typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-      const method = init?.method ?? 'GET';
-      routes.push({ url, method });
-
-      if (
-        url === '/api/styles' ||
-        url === '/api/styles/harbor' ||
-        url === '/api/styles/harbor/exemplars'
-      ) {
-        return Promise.resolve(new Response(JSON.stringify(sampleStyle), { status: 200 }));
-      }
-      if (url === '/api/styles/harbor/promote') {
-        return Promise.resolve(
-          new Response(JSON.stringify({ style: sampleStyle, manifestLock: null }), { status: 200 }),
-        );
-      }
-      if (url === '/api/subjects/courier-ren/palette-lock') {
-        return Promise.resolve(new Response(JSON.stringify(sampleSubject), { status: 200 }));
-      }
-      if (url === '/api/guide/validate') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({ valid: true, spec: createDefaultGuideSpec('Blockout'), errors: [] }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/guide/render') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              id: 'guide-blockout-001',
-              variant: 'Blockout',
-              width: 1024,
-              height: 1024,
-              pngBase64: 'iVBORw0KGgo=',
-              errors: [],
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/packs/courier-ren/franco-belgian-line/reslice') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              schemaVersion: 1,
-              sheetFilename: 'turnaround.png',
-              sheetWidth: 1536,
-              sheetHeight: 1024,
-              calibrationStripHeight: 72,
-              slices: (samplePack as Record<string, unknown>)['slices'],
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/packs/courier-ren/franco-belgian-line/validate') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              referencePack: samplePack,
-              checks: ['ok'],
-              criticReport: sampleCriticReport(true),
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/packs/courier-ren/franco-belgian-line/promote') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              referencePack: samplePack,
-              canonicalCount: 2,
-              supersededCount: 0,
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/edit/patch') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              run: sampleRun,
-              beforeImageUrl: '/api/assets/runs/harbor-dock/v001.png',
-              afterImageUrl: '/api/assets/runs/harbor-dock/v002.png',
-              cropRect: { x: 16, y: 16, width: 80, height: 80 },
-              roiRect: { x: 40, y: 40, width: 32, height: 32 },
-              reinhardGains: { gain_l: 1.02, gain_a: 0.99, gain_b: 1.01, collar_pixel_count: 512 },
-              colorQa: sampleColorQaReport(true),
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/runs/harbor-dock/1/inspect') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              run: sampleRun,
-              telemetry: {
-                width: 1024,
-                height: 1024,
-                opaquePixelCount: 1048576,
-                lStarBins: [{ binIndex: 0, minLStar: 0, maxLStar: 5, count: 10, fraction: 0.01 }],
-                vectorscopePoints: [{ oklabL: 0.5, a: 0.01, b: -0.02, lStar: 48, hex: '#2C3E50' }],
-              },
-              colorQa: sampleColorQaReport(true),
-              heatmaps: { drift: 'AA==', bleed: null, sparkle: 'BB==', outOfRoi: null },
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/runs/harbor-dock/1/validate') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              run: sampleRun,
-              colorQa: sampleColorQaReport(true),
-              criticReport: sampleCriticReport(false),
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      if (url === '/api/runs/harbor-dock/1/promote') {
-        return Promise.resolve(
-          new Response(JSON.stringify({ run: sampleRun, canonicalCount: 2, supersededCount: 1 }), {
-            status: 200,
-          }),
-        );
-      }
-      if (url === '/api/export') {
-        return Promise.resolve(
-          new Response(
-            JSON.stringify({
-              sourceId: 'harbor-dock-v001',
-              sourceVisibility: 'public',
-              profileVisibility: 'public',
-              matchGradeApplied: true,
-              artifacts: [
-                {
-                  role: 'web_webp',
-                  path: 'exports/harbor-dock.webp',
-                  assetUrl: '/api/assets/exports/harbor-dock.webp',
-                  width: 1024,
-                  height: 1024,
-                  sha256: 'abc',
-                },
-              ],
-            }),
-            { status: 200 },
-          ),
-        );
-      }
-      return Promise.resolve(new Response(null, { status: 404 }));
-    };
-
-    expect(
-      (
-        await createStyle(
+  test.each<{
+    id: string;
+    expectedMethod: string;
+    expectedUrl: string;
+    responseBody: unknown;
+    invoke: (fetchImpl: typeof fetch) => Promise<{ readonly ok: boolean }>;
+  }>([
+    {
+      id: 'route-create-style',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/styles',
+      responseBody: sampleStyle,
+      invoke: (fetchImpl) =>
+        createStyle(
           { slug: 'harbor', displayName: 'Harbor', cloneFromSlug: 'franco-belgian-line' },
           { fetchImpl },
-        )
-      ).ok,
-    ).toBe(true);
-    expect((await updateStyle('harbor', { medium: 'gouache' }, { fetchImpl })).ok).toBe(true);
-    expect(
-      (
-        await uploadStyleExemplars(
+        ),
+    },
+    {
+      id: 'route-update-style',
+      expectedMethod: 'PUT',
+      expectedUrl: '/api/styles/harbor',
+      responseBody: sampleStyle,
+      invoke: (fetchImpl) => updateStyle('harbor', { medium: 'gouache' }, { fetchImpl }),
+    },
+    {
+      id: 'route-upload-style-exemplars',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/styles/harbor/exemplars',
+      responseBody: sampleStyle,
+      invoke: (fetchImpl) =>
+        uploadStyleExemplars(
           'harbor',
           { exemplarsBase64: ['iVBORw0KGgo='], replace: true },
           { fetchImpl },
-        )
-      ).ok,
-    ).toBe(true);
-    expect((await promoteStyle('harbor', 'candidate', { fetchImpl })).ok).toBe(true);
-    expect(
-      (
-        await updateSubjectPaletteLock(
+        ),
+    },
+    {
+      id: 'route-promote-style',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/styles/harbor/promote',
+      responseBody: { style: sampleStyle, manifestLock: null },
+      invoke: (fetchImpl) => promoteStyle('harbor', 'candidate', { fetchImpl }),
+    },
+    {
+      id: 'route-update-subject-palette-lock',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/subjects/courier-ren/palette-lock',
+      responseBody: sampleSubject,
+      invoke: (fetchImpl) =>
+        updateSubjectPaletteLock(
           'courier-ren',
           { name: 'lantern', colorHex: '#D4A843', surfaceSlot: 'lantern' },
           { fetchImpl },
-        )
-      ).ok,
-    ).toBe(true);
-    expect((await validateGuideRemote(createDefaultGuideSpec('Blockout'), { fetchImpl })).ok).toBe(
-      true,
-    );
-    expect((await renderGuideRemote(createDefaultGuideSpec('Blockout'), { fetchImpl })).ok).toBe(
-      true,
-    );
-    expect(
-      (
-        await resliceReferencePack(
+        ),
+    },
+    {
+      id: 'route-validate-guide',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/guide/validate',
+      responseBody: { valid: true, spec: createDefaultGuideSpec('Blockout'), errors: [] },
+      invoke: (fetchImpl) => validateGuideRemote(createDefaultGuideSpec('Blockout'), { fetchImpl }),
+    },
+    {
+      id: 'route-render-guide',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/guide/render',
+      responseBody: {
+        id: 'guide-blockout-001',
+        variant: 'Blockout',
+        width: 1024,
+        height: 1024,
+        pngBase64: 'iVBORw0KGgo=',
+        errors: [],
+      },
+      invoke: (fetchImpl) => renderGuideRemote(createDefaultGuideSpec('Blockout'), { fetchImpl }),
+    },
+    {
+      id: 'route-reslice-reference-pack',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/packs/courier-ren/franco-belgian-line/reslice',
+      responseBody: {
+        schemaVersion: 1,
+        sheetFilename: 'turnaround.png',
+        sheetWidth: 1536,
+        sheetHeight: 1024,
+        calibrationStripHeight: 72,
+        slices: (samplePack as Record<string, unknown>)['slices'],
+      },
+      invoke: (fetchImpl) =>
+        resliceReferencePack(
           'courier-ren',
           'franco-belgian-line',
           {
@@ -602,77 +516,250 @@ describe('imgforge API client serialization and defensive decoding', () => {
             ],
           },
           { fetchImpl },
-        )
-      ).ok,
-    ).toBe(true);
-    const valPack = await validateReferencePack(
-      'courier-ren',
-      'franco-belgian-line',
-      { runCritic: true },
-      { fetchImpl },
-    );
-    expect(valPack.ok).toBe(true);
-    if (valPack.ok) {
-      expect(valPack.data.criticReport?.passed).toBe(true);
-    }
-    expect(
-      (await promoteReferencePack('courier-ren', 'franco-belgian-line', { fetchImpl })).ok,
-    ).toBe(true);
-
-    const patch = await executePatchEdit(
-      {
-        slug: 'harbor-dock',
-        runSlug: 'harbor-dock',
-        runVersion: 1,
-        roi: { x: 40, y: 40, width: 32, height: 32 },
-        prepMode: 'cue_outline',
-        collarWidthPx: 24,
-        featherPx: 12,
-        prompt: 'refine lantern',
-        visibility: 'public',
+        ),
+    },
+    {
+      id: 'route-validate-reference-pack',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/packs/courier-ren/franco-belgian-line/validate',
+      responseBody: {
+        referencePack: samplePack,
+        checks: ['ok'],
+        criticReport: sampleCriticReport(true),
       },
-      { fetchImpl },
-    );
-    expect(patch.ok).toBe(true);
-    if (patch.ok) {
-      expect(patch.data.reinhardGains.collar_pixel_count).toBe(512);
-      expect(patch.data.colorQa.untouched_drift?.max_delta_e2000).toBe(0);
-    }
-
-    const insp = await inspectRun(
-      'harbor-dock',
-      1,
-      { atmosphereSlug: 'golden-dawn', subjectSlugs: ['courier-ren'], maxSamples: 128 },
-      { fetchImpl },
-    );
-    expect(insp.ok).toBe(true);
-    if (insp.ok) {
-      expect(insp.data.telemetry.lStarBins).toHaveLength(1);
-      expect(insp.data.heatmaps.drift).toBe('AA==');
-    }
-
-    const valRun = await validateRun('harbor-dock', 1, { runCritic: true }, { fetchImpl });
-    expect(valRun.ok).toBe(true);
-    if (valRun.ok) {
-      expect(valRun.data.criticReport?.passed).toBe(false);
-    }
-    expect((await promoteRun('harbor-dock', 1, { fetchImpl })).ok).toBe(true);
-    const exp = await exportRun(
-      {
-        runSlug: 'harbor-dock',
-        runVersion: 1,
-        profile: 'web_webp',
-        visibility: 'public',
-        matchGrade: { enabled: true, gradeStrength: 0.35 },
+      invoke: (fetchImpl) =>
+        validateReferencePack(
+          'courier-ren',
+          'franco-belgian-line',
+          { runCritic: true },
+          { fetchImpl },
+        ),
+    },
+    {
+      id: 'route-promote-reference-pack',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/packs/courier-ren/franco-belgian-line/promote',
+      responseBody: {
+        referencePack: samplePack,
+        canonicalCount: 2,
+        supersededCount: 0,
       },
-      { fetchImpl },
-    );
-    expect(exp.ok).toBe(true);
-    if (exp.ok) {
-      expect(exp.data.matchGradeApplied).toBe(true);
-      expect(exp.data.artifacts[0]?.assetUrl).toBe('/api/assets/exports/harbor-dock.webp');
-    }
-    expect(routes).toHaveLength(15);
+      invoke: (fetchImpl) =>
+        promoteReferencePack('courier-ren', 'franco-belgian-line', { fetchImpl }),
+    },
+    {
+      id: 'route-execute-patch-edit',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/edit/patch',
+      responseBody: {
+        run: sampleRun,
+        beforeImageUrl: '/api/assets/runs/harbor-dock/v001.png',
+        afterImageUrl: '/api/assets/runs/harbor-dock/v002.png',
+        cropRect: { x: 16, y: 16, width: 80, height: 80 },
+        roiRect: { x: 40, y: 40, width: 32, height: 32 },
+        reinhardGains: { gain_l: 1.02, gain_a: 0.99, gain_b: 1.01, collar_pixel_count: 512 },
+        colorQa: sampleColorQaReport(true),
+      },
+      invoke: (fetchImpl) =>
+        executePatchEdit(
+          {
+            slug: 'harbor-dock',
+            runSlug: 'harbor-dock',
+            runVersion: 1,
+            roi: { x: 40, y: 40, width: 32, height: 32 },
+            prepMode: 'cue_outline',
+            collarWidthPx: 24,
+            featherPx: 12,
+            prompt: 'refine lantern',
+            visibility: 'public',
+          },
+          { fetchImpl },
+        ),
+    },
+    {
+      id: 'route-inspect-run',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/runs/harbor-dock/1/inspect',
+      responseBody: {
+        run: sampleRun,
+        telemetry: {
+          width: 1024,
+          height: 1024,
+          opaquePixelCount: 1048576,
+          lStarBins: [{ binIndex: 0, minLStar: 0, maxLStar: 5, count: 10, fraction: 0.01 }],
+          vectorscopePoints: [{ oklabL: 0.5, a: 0.01, b: -0.02, lStar: 48, hex: '#2C3E50' }],
+        },
+        colorQa: sampleColorQaReport(true),
+        heatmaps: { drift: 'AA==', bleed: null, sparkle: 'BB==', outOfRoi: null },
+      },
+      invoke: (fetchImpl) =>
+        inspectRun(
+          'harbor-dock',
+          1,
+          { atmosphereSlug: 'golden-dawn', subjectSlugs: ['courier-ren'], maxSamples: 128 },
+          { fetchImpl },
+        ),
+    },
+    {
+      id: 'route-validate-run',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/runs/harbor-dock/1/validate',
+      responseBody: {
+        run: sampleRun,
+        colorQa: sampleColorQaReport(true),
+        criticReport: sampleCriticReport(false),
+      },
+      invoke: (fetchImpl) => validateRun('harbor-dock', 1, { runCritic: true }, { fetchImpl }),
+    },
+    {
+      id: 'route-promote-run',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/runs/harbor-dock/1/promote',
+      responseBody: { run: sampleRun, canonicalCount: 2, supersededCount: 1 },
+      invoke: (fetchImpl) => promoteRun('harbor-dock', 1, { fetchImpl }),
+    },
+    {
+      id: 'route-export-run',
+      expectedMethod: 'POST',
+      expectedUrl: '/api/export',
+      responseBody: {
+        sourceId: 'harbor-dock-v001',
+        sourceVisibility: 'public',
+        profileVisibility: 'public',
+        matchGradeApplied: true,
+        artifacts: [
+          {
+            role: 'web_webp',
+            path: 'exports/harbor-dock.webp',
+            assetUrl: '/api/assets/exports/harbor-dock.webp',
+            width: 1024,
+            height: 1024,
+            sha256: 'abc',
+          },
+        ],
+      },
+      invoke: (fetchImpl) =>
+        exportRun(
+          {
+            runSlug: 'harbor-dock',
+            runVersion: 1,
+            profile: 'web_webp',
+            visibility: 'public',
+            matchGrade: { enabled: true, gradeStrength: 0.35 },
+          },
+          { fetchImpl },
+        ),
+    },
+  ])('$id', async ({ expectedMethod, expectedUrl, responseBody, invoke }) => {
+    const calls: { url: string; method: string }[] = [];
+    const fetchImpl: typeof fetch = (input, init) => {
+      calls.push({
+        url:
+          typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url,
+        method: init?.method ?? 'GET',
+      });
+      return Promise.resolve(new Response(JSON.stringify(responseBody), { status: 200 }));
+    };
+
+    const res = await invoke(fetchImpl);
+    expect(res.ok).toBe(true);
+    expect(calls).toEqual([{ url: expectedUrl, method: expectedMethod }]);
+  });
+
+  test.each<{ id: string; input: unknown; expectedValid: boolean }>([
+    {
+      id: 'decodes-valid-style-dto',
+      input: sampleStyle,
+      expectedValid: true,
+    },
+    {
+      id: 'rejects-style-dto-with-non-array-guardrails',
+      input: { ...(sampleStyle as Record<string, unknown>), styleGuardrails: 'crisp' },
+      expectedValid: false,
+    },
+    {
+      id: 'rejects-style-dto-with-unknown-source',
+      input: { ...(sampleStyle as Record<string, unknown>), source: 'remote' },
+      expectedValid: false,
+    },
+  ])('$id', ({ input, expectedValid }) => {
+    expect(decodeStyleDto(input) !== null).toBe(expectedValid);
+  });
+
+  test.each<{ id: string; input: unknown; expectedValid: boolean }>([
+    {
+      id: 'decodes-valid-atmosphere-dto',
+      input: (sampleWorkspacePayload(true)['atmospheres'] as unknown[])[0],
+      expectedValid: true,
+    },
+    {
+      id: 'rejects-atmosphere-dto-missing-kelvin',
+      input: {
+        ...((sampleWorkspacePayload(true)['atmospheres'] as Record<string, unknown>[])[0] ?? {}),
+        colorTemperatureKelvin: 'warm',
+      },
+      expectedValid: false,
+    },
+    {
+      id: 'rejects-atmosphere-dto-non-object',
+      input: null,
+      expectedValid: false,
+    },
+  ])('$id', ({ input, expectedValid }) => {
+    expect(decodeAtmosphereDto(input) !== null).toBe(expectedValid);
+  });
+
+  test.each<{ id: string; input: unknown; expectedValid: boolean }>([
+    {
+      id: 'decodes-valid-reference-pack-dto',
+      input: samplePack,
+      expectedValid: true,
+    },
+    {
+      id: 'rejects-reference-pack-dto-with-invalid-sheet-kind',
+      input: { ...(samplePack as Record<string, unknown>), sheetKind: 'poster' },
+      expectedValid: false,
+    },
+    {
+      id: 'rejects-reference-pack-dto-with-malformed-slice-rect',
+      input: {
+        ...(samplePack as Record<string, unknown>),
+        slices: [
+          {
+            id: 's1',
+            file: 's1.png',
+            imageUrl: '/x',
+            rect: null,
+            source: 'auto',
+            label: null,
+            sha256: 'a',
+          },
+        ],
+      },
+      expectedValid: false,
+    },
+  ])('$id', ({ input, expectedValid }) => {
+    expect(decodeReferencePackDto(input) !== null).toBe(expectedValid);
+  });
+
+  test.each<{ id: string; input: unknown; expectedValid: boolean }>([
+    {
+      id: 'decodes-valid-run-dto',
+      input: sampleRun,
+      expectedValid: true,
+    },
+    {
+      id: 'rejects-run-dto-with-invalid-lifecycle',
+      input: { ...(sampleRun as Record<string, unknown>), lifecycle: 'archived' },
+      expectedValid: false,
+    },
+    {
+      id: 'rejects-run-dto-with-string-delta-e',
+      input: { ...(sampleRun as Record<string, unknown>), colorQaMaxDeltaE2000: '1.25' },
+      expectedValid: false,
+    },
+  ])('$id', ({ input, expectedValid }) => {
+    expect(decodeRunDto(input) !== null).toBe(expectedValid);
   });
 
   test.each<{ id: string; input: unknown; expectedValid: boolean }>([
@@ -715,18 +802,40 @@ describe('imgforge API client serialization and defensive decoding', () => {
     expect(decodeCriticReport(input) !== null).toBe(expectedValid);
   });
 
-  test('decodes WorkspaceEvent and handles WebSocket lifecycle cleanly', () => {
-    const ev = decodeWorkspaceEvent({
-      eventType: 'promoted',
-      resourceKind: 'run',
-      id: 'harbor-dock-v001',
-      lifecycle: 'canonical',
-      detail: 'Promoted',
-      timestampIso: '2026-11-13T00:00:00Z',
-    });
-    expect(ev?.lifecycle).toBe('canonical');
-    expect(decodeWorkspaceEvent({ eventType: 'bad' })).toBeNull();
+  test.each<{
+    id: string;
+    input: unknown;
+    expectedLifecycle: string | null;
+    expectedValid: boolean;
+  }>([
+    {
+      id: 'decodes-valid-workspace-event',
+      input: {
+        eventType: 'promoted',
+        resourceKind: 'run',
+        id: 'harbor-dock-v001',
+        lifecycle: 'canonical',
+        detail: 'Promoted',
+        timestampIso: '2026-11-13T00:00:00Z',
+      },
+      expectedLifecycle: 'canonical',
+      expectedValid: true,
+    },
+    {
+      id: 'rejects-malformed-workspace-event',
+      input: { eventType: 'bad' },
+      expectedLifecycle: null,
+      expectedValid: false,
+    },
+  ])('$id', ({ input, expectedLifecycle, expectedValid }) => {
+    const ev = decodeWorkspaceEvent(input);
+    expect(ev !== null).toBe(expectedValid);
+    if (ev !== null) {
+      expect(ev.lifecycle).toBe(expectedLifecycle);
+    }
+  });
 
+  test('handles WebSocket connect, event dispatch, and clean close', () => {
     const listeners = new Map<string, ((e: unknown) => void)[]>();
     let closedCalled = false;
     const fakeWs = {
@@ -778,24 +887,37 @@ describe('imgforge API client serialization and defensive decoding', () => {
     expect(statuses.at(-1)).toBe('closed');
   });
 
-  test('converts PNG Blob to raw base64 and extracts PNG files from DataTransfer', async () => {
+  test.each<{
+    id: string;
+    createTransfer: (pngBytes: Uint8Array<ArrayBuffer>) => DataTransfer | null;
+    expectedNames: readonly string[];
+  }>([
+    {
+      id: 'extracts-only-png-files-from-file-list',
+      createTransfer: (pngBytes) => {
+        const pngFile = new File([pngBytes], 'exemplar.png', { type: 'image/png' });
+        const jpgFile = new File([pngBytes], 'ignored.jpg', { type: 'image/jpeg' });
+        return {
+          files: {
+            length: 2,
+            item: (idx: number) => (idx === 0 ? jpgFile : pngFile),
+          },
+          items: [],
+        } as unknown as DataTransfer;
+      },
+      expectedNames: ['exemplar.png'],
+    },
+    {
+      id: 'returns-empty-for-null-data-transfer',
+      createTransfer: () => null,
+      expectedNames: [],
+    },
+  ])('$id', async ({ createTransfer, expectedNames }) => {
     const pngBytes = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
     const blob = new Blob([pngBytes], { type: 'image/png' });
-    const b64 = await blobToRawBase64(blob);
-    expect(b64).toBe('iVBORw0KGgo=');
-
-    const pngFile = new File([pngBytes], 'exemplar.png', { type: 'image/png' });
-    const jpgFile = new File([pngBytes], 'ignored.jpg', { type: 'image/jpeg' });
-    const fakeTransfer = {
-      files: {
-        length: 2,
-        item: (idx: number) => (idx === 0 ? jpgFile : pngFile),
-      },
-      items: [],
-    } as unknown as DataTransfer;
-
-    const extracted = extractPngFilesFromDataTransfer(fakeTransfer);
-    expect(extracted.map((f) => f.name)).toEqual(['exemplar.png']);
-    expect(extractPngFilesFromDataTransfer(null)).toEqual([]);
+    expect(await blobToRawBase64(blob)).toBe('iVBORw0KGgo=');
+    expect(extractPngFilesFromDataTransfer(createTransfer(pngBytes)).map((f) => f.name)).toEqual(
+      expectedNames,
+    );
   });
 });

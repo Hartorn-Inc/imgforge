@@ -25,6 +25,7 @@ export interface PatchCropStageProps {
   readonly maskPngBase64: string | null;
   readonly onRoiChange: (originXPx: number, originYPx: number, cropSizePx: number) => void;
   readonly onMaskChange: (maskPngBase64: string | null) => void;
+  readonly onImageDimensions?: (width: number, height: number) => void;
 }
 
 const MAX_STAGE_SIDE = 480;
@@ -43,6 +44,7 @@ export function PatchCropStage({
   maskPngBase64,
   onRoiChange,
   onMaskChange,
+  onImageDimensions,
 }: PatchCropStageProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -58,6 +60,8 @@ export function PatchCropStage({
 
   const onRoiChangeRef = useRef(onRoiChange);
   onRoiChangeRef.current = onRoiChange;
+  const onImageDimensionsRef = useRef(onImageDimensions);
+  onImageDimensionsRef.current = onImageDimensions;
 
   useEffect(() => {
     if (imageUrl === null || imageUrl.trim().length === 0 || typeof Image === 'undefined') {
@@ -69,6 +73,9 @@ export function PatchCropStage({
     img.onload = () => {
       if (!cancelled) {
         setImgElement(img);
+        if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+          onImageDimensionsRef.current?.(img.naturalWidth, img.naturalHeight);
+        }
       }
     };
     img.onerror = () => {

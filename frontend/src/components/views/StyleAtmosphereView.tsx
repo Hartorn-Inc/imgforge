@@ -14,7 +14,7 @@
  */
 
 import type { JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import {
   blobToRawBase64,
   createAtmosphere,
@@ -49,16 +49,20 @@ import {
   buildResliceOverrides,
   buildUpdateAtmospherePayload,
   buildUpdateStylePayload,
+  createSliceRowKey,
+  filterSlicesForSheetRole,
   isOverrideMode,
   isPackMutable,
+  isReferenceSheetKind,
   isStyleMutable,
+  isSubjectPaletteMutable,
   slicesToEditableOverrides,
   styleToFormDraft,
 } from './styleAtmosphereHelpers';
 
 export interface StyleAtmosphereViewProps {
   readonly workspaceState: AsyncViewState<WorkspaceSummary>;
-  readonly onRefreshWorkspace: () => void;
+  readonly onRefreshWorkspace: () => Promise<void>;
 }
 
 const EMPTY_STYLE_DRAFT: StyleFormDraft = {
@@ -123,42 +127,67 @@ export function StyleAtmosphereView({
 
   const workspace = workspaceState.status === 'ready' ? workspaceState.data : null;
 
+  const selectedStyleSlugRef = useRef(selectedStyleSlug);
+  selectedStyleSlugRef.current = selectedStyleSlug;
+  const styleModeRef = useRef(styleMode);
+  styleModeRef.current = styleMode;
+  const selectedAtmoSlugRef = useRef(selectedAtmoSlug);
+  selectedAtmoSlugRef.current = selectedAtmoSlug;
+  const atmoModeRef = useRef(atmoMode);
+  atmoModeRef.current = atmoMode;
+  const selectedSubjectSlugRef = useRef(selectedSubjectSlug);
+  selectedSubjectSlugRef.current = selectedSubjectSlug;
+  const selectedPackKeyRef = useRef(selectedPackKey);
+  selectedPackKeyRef.current = selectedPackKey;
+
   useEffect(() => {
     if (workspace === null) {
       return;
     }
+    const currentStyleSlug = selectedStyleSlugRef.current;
     const firstStyle = workspace.styles[0];
-    if (firstStyle !== undefined && !workspace.styles.some((st) => st.slug === selectedStyleSlug)) {
+    if (
+      firstStyle !== undefined &&
+      styleModeRef.current !== 'create' &&
+      !workspace.styles.some((st) => st.slug === currentStyleSlug)
+    ) {
       setSelectedStyleSlug(firstStyle.slug);
       setStyleDraft(styleToFormDraft(firstStyle));
       setStyleMode('edit');
     }
+
+    const currentAtmoSlug = selectedAtmoSlugRef.current;
     const firstAtmo = workspace.atmospheres[0];
     if (
       firstAtmo !== undefined &&
-      !workspace.atmospheres.some((a) => a.slug === selectedAtmoSlug)
+      atmoModeRef.current !== 'create' &&
+      !workspace.atmospheres.some((a) => a.slug === currentAtmoSlug)
     ) {
       setSelectedAtmoSlug(firstAtmo.slug);
       setAtmoDraft(atmosphereToFormDraft(firstAtmo));
       setAtmoMode('edit');
     }
+
+    const currentSubjectSlug = selectedSubjectSlugRef.current;
     const firstSubj = workspace.subjects[0];
-    if (
-      firstSubj !== undefined &&
-      !workspace.subjects.some((s) => s.slug === selectedSubjectSlug)
-    ) {
+    if (firstSubj !== undefined && !workspace.subjects.some((s) => s.slug === currentSubjectSlug)) {
       setSelectedSubjectSlug(firstSubj.slug);
     }
+
+    const currentPackKey = selectedPackKeyRef.current;
     const firstPack = workspace.referencePacks[0];
     if (
       firstPack !== undefined &&
-      !workspace.referencePacks.some((p) => `${p.subjectSlug}/${p.styleSlug}` === selectedPackKey)
+      !workspace.referencePacks.some((p) => `${p.subjectSlug}/${p.styleSlug}` === currentPackKey)
     ) {
+      const nextRole = firstPack.sheets[0]?.role ?? firstPack.sheetKind;
       setSelectedPackKey(`${firstPack.subjectSlug}/${firstPack.styleSlug}`);
-      setSelectedSheetRole(firstPack.sheets[0]?.role ?? firstPack.sheetKind);
-      setSliceOverrides(slicesToEditableOverrides(firstPack.slices));
+      setSelectedSheetRole(nextRole);
+      setSliceOverrides(
+        slicesToEditableOverrides(filterSlicesForSheetRole(firstPack.slices, nextRole)),
+      );
     }
-  }, [workspace, selectedStyleSlug, selectedAtmoSlug, selectedSubjectSlug, selectedPackKey]);
+  }, [workspace]);
 
   if (workspaceState.status !== 'ready') {
     return (
@@ -172,7 +201,12 @@ export function StyleAtmosphereView({
             </p>
           </div>
         </div>
-        <StatePanel state={workspaceState} onRetry={onRefreshWorkspace} />
+        <StatePanel
+          state={workspaceState}
+          onRetry={() => {
+            void onRefreshWorkspace();
+          }}
+        />
       </div>
     );
   }
@@ -201,8 +235,16 @@ export function StyleAtmosphereView({
     }
     const limited = files.slice(0, 3);
     const encoded: string[] = [];
-    for (const file of limited) {
-      encoded.push(await blobToRawBase64(file));
+    try {
+      for (const file of limited) {
+        encoded.push(await blobToRawBase64(file));
+      }
+    } catch (err) {
+      setFeedback({
+        kind: 'error',
+        text: err instanceof Error ? err.message : 'Failed to decode PNG exemplar file.',
+      });
+      return;
     }
     setPendingExemplarsB64((prev) => [...prev, ...encoded].slice(0, 3));
     setFeedback({
@@ -231,7 +273,7 @@ export function StyleAtmosphereView({
       setStyleMode('edit');
       setPendingExemplarsB64([]);
       setFeedback({ kind: 'ok', text: `Created Style '${res.data.slug}'.` });
-      onRefreshWorkspace();
+      await onRefreshWorkspace();
       return;
     }
 
@@ -247,7 +289,7 @@ export function StyleAtmosphereView({
     }
     setStyleDraft(styleToFormDraft(res.data));
     setFeedback({ kind: 'ok', text: `Updated Style '${res.data.slug}'.` });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handleUploadExemplars = async (): Promise<void> => {
@@ -270,7 +312,7 @@ export function StyleAtmosphereView({
       kind: 'ok',
       text: `Uploaded exemplars (${String(res.data.exemplarCount)}/3) for '${res.data.slug}'.`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handlePromoteStyle = async (): Promise<void> => {
@@ -289,7 +331,7 @@ export function StyleAtmosphereView({
       kind: 'ok',
       text: `Style '${res.data.style.slug}' promoted to ${res.data.style.lifecycle}.`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handleSaveAtmosphere = async (): Promise<void> => {
@@ -311,7 +353,7 @@ export function StyleAtmosphereView({
       setAtmoDraft(atmosphereToFormDraft(res.data));
       setAtmoMode('edit');
       setFeedback({ kind: 'ok', text: `Created Atmosphere '${res.data.slug}'.` });
-      onRefreshWorkspace();
+      await onRefreshWorkspace();
       return;
     }
 
@@ -327,7 +369,7 @@ export function StyleAtmosphereView({
     }
     setAtmoDraft(atmosphereToFormDraft(res.data));
     setFeedback({ kind: 'ok', text: `Updated Atmosphere '${res.data.slug}'.` });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handleAddPaletteSwatch = async (): Promise<void> => {
@@ -353,7 +395,7 @@ export function StyleAtmosphereView({
     setSwatchName('');
     setSwatchSlot('');
     setFeedback({ kind: 'ok', text: `Updated PaletteLock for '${res.data.slug}'.` });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const activeSheet =
@@ -378,12 +420,13 @@ export function StyleAtmosphereView({
       setFeedback({ kind: 'error', text: res.error.message });
       return;
     }
-    setSliceOverrides(slicesToEditableOverrides(res.data.slices));
+    const scopedSlices = filterSlicesForSheetRole(res.data.slices, selectedSheetRole);
+    setSliceOverrides(slicesToEditableOverrides(scopedSlices));
     setFeedback({
       kind: 'ok',
-      text: `Resliced ${res.data.sheetFilename}: ${String(res.data.slices.length)} slice(s).`,
+      text: `Resliced ${res.data.sheetFilename}: ${String(scopedSlices.length)} slice(s).`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handleValidatePack = async (): Promise<void> => {
@@ -406,7 +449,7 @@ export function StyleAtmosphereView({
       kind: 'ok',
       text: `ReferencePack transitioned to ${res.data.referencePack.lifecycle}.`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
 
   const handlePromotePack = async (): Promise<void> => {
@@ -425,8 +468,11 @@ export function StyleAtmosphereView({
       kind: 'ok',
       text: `Promoted ReferencePack to canonical (lock entries: ${String(res.data.canonicalCount)}).`,
     });
-    onRefreshWorkspace();
+    await onRefreshWorkspace();
   };
+
+  const subjectPaletteMutable =
+    activeSubject !== null && isSubjectPaletteMutable(activeSubject, ws.hasWorkspace);
 
   return (
     <div class="workspace-panel">
@@ -439,7 +485,13 @@ export function StyleAtmosphereView({
             <code>PaletteLock</code> swatches, and override <code>ReferencePack</code> slice bounds.
           </p>
         </div>
-        <button type="button" class="btn btn--secondary" onClick={onRefreshWorkspace}>
+        <button
+          type="button"
+          class="btn btn--secondary"
+          onClick={() => {
+            void onRefreshWorkspace();
+          }}
+        >
           Refresh Workspace
         </button>
       </div>
@@ -855,7 +907,7 @@ export function StyleAtmosphereView({
               setAtmoDraft({
                 ...EMPTY_ATMO_DRAFT,
                 slug: 'custom-atmo',
-                displayName: 'Custom Mood',
+                displayName: 'Custom Atmosphere',
               });
             }}
           >
@@ -1135,7 +1187,7 @@ export function StyleAtmosphereView({
                         class="text-input"
                         value={swatchName}
                         placeholder="lantern_brass"
-                        disabled={!ws.hasWorkspace || activeSubject.lifecycle === 'canonical'}
+                        disabled={!subjectPaletteMutable}
                         onInput={(e) => {
                           setSwatchName(e.currentTarget.value);
                         }}
@@ -1149,7 +1201,7 @@ export function StyleAtmosphereView({
                         id="swatch-hex"
                         class="text-input"
                         value={swatchHex}
-                        disabled={!ws.hasWorkspace || activeSubject.lifecycle === 'canonical'}
+                        disabled={!subjectPaletteMutable}
                         onInput={(e) => {
                           setSwatchHex(e.currentTarget.value);
                         }}
@@ -1164,7 +1216,7 @@ export function StyleAtmosphereView({
                         class="text-input"
                         value={swatchSlot}
                         placeholder="lantern"
-                        disabled={!ws.hasWorkspace || activeSubject.lifecycle === 'canonical'}
+                        disabled={!subjectPaletteMutable}
                         onInput={(e) => {
                           setSwatchSlot(e.currentTarget.value);
                         }}
@@ -1175,7 +1227,7 @@ export function StyleAtmosphereView({
                     <button
                       type="button"
                       class="btn btn--secondary"
-                      disabled={!ws.hasWorkspace || activeSubject.lifecycle === 'canonical'}
+                      disabled={!subjectPaletteMutable}
                       onClick={() => {
                         void handleAddPaletteSwatch();
                       }}
@@ -1183,6 +1235,12 @@ export function StyleAtmosphereView({
                       Save PaletteLock Swatch
                     </button>
                   </div>
+                  {!subjectPaletteMutable && (
+                    <p class="muted-note">
+                      PaletteLock swatches are read-only for non-project, canonical, or superseded
+                      Subjects.
+                    </p>
+                  )}
                 </>
               )}
             </>
@@ -1220,8 +1278,13 @@ export function StyleAtmosphereView({
                         (p) => `${p.subjectSlug}/${p.styleSlug}` === key,
                       );
                       if (pack !== undefined) {
-                        setSelectedSheetRole(pack.sheets[0]?.role ?? pack.sheetKind);
-                        setSliceOverrides(slicesToEditableOverrides(pack.slices));
+                        const nextRole = pack.sheets[0]?.role ?? pack.sheetKind;
+                        setSelectedSheetRole(nextRole);
+                        setSliceOverrides(
+                          slicesToEditableOverrides(
+                            filterSlicesForSheetRole(pack.slices, nextRole),
+                          ),
+                        );
                         setPackChecks([]);
                         setPackCriticReport(null);
                       }
@@ -1248,7 +1311,16 @@ export function StyleAtmosphereView({
                       class="select-input"
                       value={selectedSheetRole}
                       onChange={(e) => {
-                        setSelectedSheetRole(e.currentTarget.value as ReferenceSheetKind);
+                        const value = e.currentTarget.value;
+                        if (isReferenceSheetKind(value)) {
+                          setSelectedSheetRole(value);
+                          setSliceOverrides(
+                            slicesToEditableOverrides(
+                              filterSlicesForSheetRole(activePack.slices, value),
+                            ),
+                          );
+                          setSelectedSliceId(null);
+                        }
                       }}
                     >
                       {activePack.sheets.map((sh) => (
@@ -1295,7 +1367,7 @@ export function StyleAtmosphereView({
                   >
                     {sliceOverrides.map((ov) => (
                       <rect
-                        key={ov.id}
+                        key={ov.rowKey}
                         x={ov.x}
                         y={ov.y}
                         width={ov.width}
@@ -1325,7 +1397,7 @@ export function StyleAtmosphereView({
                   <tbody>
                     {sliceOverrides.map((ov, idx) => (
                       <tr
-                        key={`${ov.id}-${String(idx)}`}
+                        key={ov.rowKey}
                         onClick={() => {
                           setSelectedSliceId(ov.id);
                         }}
@@ -1438,6 +1510,7 @@ export function StyleAtmosphereView({
                     setSliceOverrides((prev) => [
                       ...prev,
                       {
+                        rowKey: createSliceRowKey(),
                         id: `slice_${String(prev.length + 1)}`,
                         label: '',
                         x: 64,

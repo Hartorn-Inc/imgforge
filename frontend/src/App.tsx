@@ -62,11 +62,14 @@ export function App(): JSX.Element {
   const [selectedRunId, setSelectedRunId] = useState<string>('');
 
   const tabRefs = useRef<Partial<Record<WorkspaceTab, HTMLButtonElement | null>>>({});
+  const healthReqSeqRef = useRef<number>(0);
+  const workspaceReqSeqRef = useRef<number>(0);
 
-  const refreshHealth = useCallback((signal?: AbortSignal) => {
+  const refreshHealth = useCallback((signal?: AbortSignal): Promise<void> => {
+    const seq = ++healthReqSeqRef.current;
     setHealthState({ status: 'loading', message: 'Checking GET /api/health...' });
-    void fetchHealthStatus(signal).then((result) => {
-      if (signal?.aborted) {
+    return fetchHealthStatus(signal).then((result) => {
+      if (signal?.aborted || seq !== healthReqSeqRef.current) {
         return;
       }
       if (result.ok) {
@@ -81,14 +84,15 @@ export function App(): JSX.Element {
     });
   }, []);
 
-  const refreshWorkspace = useCallback((signal?: AbortSignal) => {
+  const refreshWorkspace = useCallback((signal?: AbortSignal): Promise<void> => {
+    const seq = ++workspaceReqSeqRef.current;
     setWorkspaceState((prev) =>
       prev.status === 'ready'
         ? prev
         : { status: 'loading', message: 'Loading workspace catalog from GET /api/workspace...' },
     );
-    void fetchWorkspace(signal !== undefined ? { signal } : {}).then((result) => {
-      if (signal?.aborted) {
+    return fetchWorkspace(signal !== undefined ? { signal } : {}).then((result) => {
+      if (signal?.aborted || seq !== workspaceReqSeqRef.current) {
         return;
       }
       if (!result.ok) {
@@ -114,8 +118,8 @@ export function App(): JSX.Element {
 
   useEffect(() => {
     const controller = new AbortController();
-    refreshHealth(controller.signal);
-    refreshWorkspace(controller.signal);
+    void refreshHealth(controller.signal);
+    void refreshWorkspace(controller.signal);
     return () => {
       controller.abort();
     };
@@ -126,7 +130,7 @@ export function App(): JSX.Element {
       onStatusChange: setWsStatus,
       onEvent: (event) => {
         setLastWsEvent(event);
-        refreshWorkspace();
+        void refreshWorkspace();
       },
     });
     return dispose;
@@ -167,8 +171,8 @@ export function App(): JSX.Element {
           <HealthBadge
             state={healthState}
             onRefresh={() => {
-              refreshHealth();
-              refreshWorkspace();
+              void refreshHealth();
+              void refreshWorkspace();
             }}
           />
         </div>
@@ -214,9 +218,7 @@ export function App(): JSX.Element {
           {activeTab === 'style_atmosphere' && (
             <StyleAtmosphereView
               workspaceState={workspaceState}
-              onRefreshWorkspace={() => {
-                refreshWorkspace();
-              }}
+              onRefreshWorkspace={() => refreshWorkspace()}
             />
           )}
           {activeTab === 'spatial_guide' && (
@@ -234,11 +236,11 @@ export function App(): JSX.Element {
                 setPatchDraft((prev) =>
                   clampPatchEditDraft({
                     ...prev,
-                    mode: 'mask',
+                    mode: maskB64 === null ? prev.mode : 'mask',
                     maskPngBase64: maskB64,
                   }),
                 );
-                if (switchToPatchEdit) {
+                if (switchToPatchEdit && maskB64 !== null) {
                   setActiveTab('patch_edit');
                 }
               }}
@@ -249,9 +251,10 @@ export function App(): JSX.Element {
               workspaceState={workspaceState}
               draft={patchDraft}
               onDraftChange={setPatchDraft}
+              onRefreshWorkspace={() => refreshWorkspace()}
               onPatchCompleted={(res) => {
                 setSelectedRunId(res.run.runId);
-                refreshWorkspace();
+                void refreshWorkspace();
               }}
             />
           )}
@@ -260,9 +263,7 @@ export function App(): JSX.Element {
               workspaceState={workspaceState}
               selectedRunId={selectedRunId}
               onSelectRunId={setSelectedRunId}
-              onRefreshWorkspace={() => {
-                refreshWorkspace();
-              }}
+              onRefreshWorkspace={() => refreshWorkspace()}
               onSendRunToPatchEdit={(run) => {
                 setPatchDraft(createDefaultPatchEditDraft(run));
                 setActiveTab('patch_edit');

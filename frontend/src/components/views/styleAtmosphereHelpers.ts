@@ -18,8 +18,10 @@ import type {
   PixelRect,
   RectOverride,
   ReferencePackSummary,
+  ReferenceSheetKind,
   SliceRecordDto,
   StyleSummary,
+  SubjectSummary,
 } from '../../types/domain';
 
 export interface StyleFormDraft {
@@ -47,12 +49,29 @@ export interface AtmosphereFormDraft {
 }
 
 export interface EditableSliceOverride {
+  readonly rowKey: string;
   readonly id: string;
   readonly label: string;
   readonly x: number;
   readonly y: number;
   readonly width: number;
   readonly height: number;
+}
+
+let sliceRowCounter = 0;
+
+/** Generate a stable React/Preact key for an editable `RectOverride` row. */
+export function createSliceRowKey(): string {
+  sliceRowCounter += 1;
+  return `slice-row-${String(sliceRowCounter)}`;
+}
+
+/** Return true only when a `Subject`'s `PaletteLock` belongs to `project` and is mutable. */
+export function isSubjectPaletteMutable(subject: SubjectSummary, hasWorkspace: boolean): boolean {
+  if (!hasWorkspace || subject.source !== 'project') {
+    return false;
+  }
+  return subject.lifecycle !== 'canonical' && subject.lifecycle !== 'superseded';
 }
 
 /** Return true only when a `Style` belongs to `project` and is not `canonical`/`superseded`. */
@@ -227,11 +246,12 @@ export function buildUpdateAtmospherePayload(draft: AtmosphereFormDraft): Update
   };
 }
 
-/** Convert existing `SliceRecordDto`s into editable `RectOverride` drafts. */
+/** Convert existing `SliceRecordDto`s into editable `RectOverride` drafts with stable `rowKey`s. */
 export function slicesToEditableOverrides(
   slices: readonly SliceRecordDto[],
 ): readonly EditableSliceOverride[] {
   return slices.map((sl) => ({
+    rowKey: createSliceRowKey(),
     id: sl.id,
     label: sl.label ?? '',
     x: sl.rect.x,
@@ -239,6 +259,29 @@ export function slicesToEditableOverrides(
     width: sl.rect.width,
     height: sl.rect.height,
   }));
+}
+
+/** Return the slice ID prefix assigned by Rust core for a `ReferenceSheetKind`. */
+export function slicePrefixForSheetRole(role: ReferenceSheetKind): string {
+  switch (role) {
+    case 'turnaround':
+      return 'turnaround_';
+    case 'poses_expressions':
+      return 'poses_';
+    case 'inventory_flatlay':
+      return 'inventory_';
+    case 'single_sheet':
+      return 'sheet_';
+  }
+}
+
+/** Scope a `ReferencePack`'s slices to the active `ReferenceSheetKind` prefix. */
+export function filterSlicesForSheetRole(
+  slices: readonly SliceRecordDto[],
+  role: ReferenceSheetKind,
+): readonly SliceRecordDto[] {
+  const prefix = slicePrefixForSheetRole(role);
+  return slices.filter((sl) => sl.id.startsWith(prefix));
 }
 
 /** Clamp a `RectOverride` pixel rectangle inside sheet dimensions (`width > 0`, `height > 0`). */
@@ -258,7 +301,7 @@ export function clampRectToSheet(
 
 /** Build `RectOverride[]` payload for `POST /api/packs/{subject}/{style}/reslice`. */
 export function buildResliceOverrides(
-  items: readonly EditableSliceOverride[],
+  items: readonly Omit<EditableSliceOverride, 'rowKey'>[],
   sheetWidth: number,
   sheetHeight: number,
 ): readonly RectOverride[] {
@@ -284,4 +327,13 @@ export function isPackMutable(pack: ReferencePackSummary): boolean {
 
 export function isOverrideMode(value: string): value is OverrideMode {
   return value === 'replace_all' || value === 'merge_by_id';
+}
+
+export function isReferenceSheetKind(value: string): value is ReferenceSheetKind {
+  return (
+    value === 'turnaround' ||
+    value === 'poses_expressions' ||
+    value === 'inventory_flatlay' ||
+    value === 'single_sheet'
+  );
 }

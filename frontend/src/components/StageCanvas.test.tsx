@@ -280,4 +280,72 @@ describe('StageCanvas', () => {
     });
     expect(canvasContainer?.hasAttribute('hidden')).toBe(false);
   });
+
+  test('preserves mask strokes across toolMode switches and notifies onMaskClear', async () => {
+    const spec = createDefaultGuideSpec('Blockout');
+    const onMaskClear = vi.fn();
+
+    await act(() => {
+      render(
+        <StageCanvas
+          spec={spec}
+          showGrid={true}
+          toolMode="paint_mask"
+          maskPngBase64="iVBORw0KGgo="
+          onMaskClear={onMaskClear}
+        />,
+        mountNode,
+      );
+    });
+
+    const maskCanvas = mountNode.querySelector<HTMLCanvasElement>('.mask-paint-overlay');
+    expect(maskCanvas).not.toBeNull();
+    expect(maskCanvas?.hasAttribute('hidden')).toBe(false);
+
+    // Switch to select mode: canvas remains mounted (hidden) so painted bitmap is preserved.
+    await act(() => {
+      render(
+        <StageCanvas
+          spec={spec}
+          showGrid={true}
+          toolMode="select"
+          maskPngBase64="iVBORw0KGgo="
+          onMaskClear={onMaskClear}
+        />,
+        mountNode,
+      );
+    });
+
+    const maskCanvasWhileSelect = mountNode.querySelector<HTMLCanvasElement>('.mask-paint-overlay');
+    expect(maskCanvasWhileSelect).toBe(maskCanvas);
+    expect(maskCanvasWhileSelect?.hasAttribute('hidden')).toBe(true);
+
+    // Switch back to paint_mask and click Clear Mask -> calls onMaskClear.
+    await act(() => {
+      render(
+        <StageCanvas
+          spec={spec}
+          showGrid={true}
+          toolMode="paint_mask"
+          maskPngBase64="iVBORw0KGgo="
+          onMaskClear={onMaskClear}
+        />,
+        mountNode,
+      );
+    });
+
+    const clearBtn = Array.from(mountNode.querySelectorAll('button')).find(
+      (b) => b.textContent.trim() === 'Clear Mask',
+    );
+    expect(clearBtn).toBeDefined();
+    if (clearBtn === undefined) {
+      return;
+    }
+    expect(clearBtn.disabled).toBe(false);
+
+    await act(() => {
+      clearBtn.click();
+    });
+    expect(onMaskClear).toHaveBeenCalledTimes(1);
+  });
 });
