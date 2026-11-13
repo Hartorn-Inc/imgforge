@@ -18,6 +18,7 @@ pub mod critic;
 pub mod edit;
 pub mod error;
 pub mod export;
+pub mod generate;
 pub mod guide_renderer;
 pub mod lifecycle;
 pub mod presets;
@@ -29,6 +30,7 @@ pub mod slicer;
 pub mod store;
 pub mod style;
 pub mod subject;
+pub mod validation;
 
 pub use atlas::{
     AtlasPackRequest, AtlasPage, AtlasPlacement, AtlasResult, AtlasSliceSelection,
@@ -90,6 +92,10 @@ pub use export::{
     MIN_VTT_TOKEN_SIZE_PX, MatchGradeOptions, VttMapOptions, VttTokenOptions,
     apply_damped_l_star_cdf_match, execute_export, render_vtt_token, split_grid_2x2,
 };
+pub use generate::{
+    GenerateRequest, GenerateResult, GenerateSceneInput, GenerationMode, SubjectRoiBinding,
+    execute_generate,
+};
 pub use guide_renderer::{
     ActionVector, DepthBand, GuideDepthPlane, GuideRenderer, GuideSpec, MAX_GUIDE_CANVAS_DIM,
     MannequinFacing, NormalizedPoint, OverlayRegion, OverlayRegionKind, RenderedSpatialGuide,
@@ -126,3 +132,8 @@ pub use store::{
 };
 pub use style::{MAX_STYLE_EXEMPLARS, MIN_STYLE_EXEMPLARS, Style};
 pub use subject::{PaletteLock, PaletteSwatch, Subject, SubjectHandBindings, SubjectKind};
+pub use validation::{
+    ValidateReferencePackRequest, ValidateReferencePackResult, ValidateRunRequest,
+    ValidateRunResult, WorkspaceLifecycleStatus, inspect_workspace_status, promote_reference_pack,
+    promote_run, validate_reference_pack, validate_run,
+};

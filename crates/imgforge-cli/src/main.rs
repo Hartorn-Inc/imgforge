@@ -28,15 +28,18 @@ use imgforge_core::{
     DEFAULT_ATLAS_HEIGHT, DEFAULT_ATLAS_PADDING_PX, DEFAULT_ATLAS_WIDTH, DEFAULT_CDF_DAMP_STRENGTH,
     DEFAULT_COLLAR_WIDTH_PX, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
     DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportSource, ExposureQaConfig,
-    GuideRenderer, GuideSpec, ImageBackend, ImageGenerationRequest, LibraryRegistry,
-    ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi, PaletteQaConfig, PatchEditConfig,
-    PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect, PromptCompiler,
+    GenerateRequest, GenerateSceneInput, GenerationMode, GuideRenderer, GuideSpec, LibraryRegistry,
+    Lifecycle, ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi, PaletteQaConfig,
+    PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect, PromptCompiler,
     ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore, SceneComposer,
-    SceneSpec, SlicerConfig, SparkleConfig, TraitCategory, TraitCheckInput, UntouchedDriftConfig,
-    Visibility, VisionCritic, VisionCriticRequest, VttMapOptions, VttTokenOptions,
-    WholeImageEditRequest, check_visibility_compatibility, execute_export, execute_patch_edit,
-    execute_whole_image_edit, pack_dynamic_atlas, resolve_codex_auth_dir_from_env,
-    resolve_user_config_dir_from_env, resolve_workspace_from_env, slice_sheet_to_dir, write_atomic,
+    SceneSpec, SlicerConfig, SparkleConfig, SubjectRoiBinding, TraitCategory, TraitCheckInput,
+    UntouchedDriftConfig, ValidateReferencePackRequest, ValidateRunRequest, Visibility,
+    VisionCritic, VisionCriticRequest, VttMapOptions, VttTokenOptions, WholeImageEditRequest,
+    check_visibility_compatibility, execute_export, execute_generate, execute_patch_edit,
+    execute_whole_image_edit, inspect_workspace_status, pack_dynamic_atlas, promote_reference_pack,
+    promote_run, resolve_codex_auth_dir_from_env, resolve_user_config_dir_from_env,
+    resolve_workspace_from_env, slice_sheet_to_dir, validate_reference_pack, validate_run,
+    write_atomic,
 };
 use serde::Serialize;
 
@@ -69,10 +72,14 @@ enum Commands {
     Auth(AuthArgs),
     /// Translate unstructured prose into a validated SceneSpec via read-only SceneComposer.
     Compose(ComposeArgs),
-    /// Deterministically validate a SceneSpec file via PromptCompiler.
+    /// Deterministically validate a SceneSpec file, Run, or ReferencePack (`draft -> candidate -> validated`).
     Validate(ValidateArgs),
-    /// Compile a SceneSpec and generate a verified PNG via CodexNativeBackend.
+    /// Promote a Validated Run or ReferencePack to Canonical in `manifest.lock.json`.
+    Promote(PromoteArgs),
+    /// Compile a SceneSpec (or prose via --compose) and generate a verified Run via ImageBackend.
     Generate(GenerateArgs),
+    /// Inspect, validate, or promote recorded Runs.
+    Run(RunArgs),
     /// Run WholeImageEdit or PatchEdit with OKLab/DeltaE_2000 Color QA and Run recording.
     Edit(EditArgs),
     /// Validate or deterministically render a SpatialGuide from GuideSpec JSON.
@@ -136,26 +143,143 @@ struct ComposeArgs {
 #[derive(Debug, Args)]
 struct ValidateArgs {
     /// Path to the SceneSpec YAML or JSON file.
-    scene_spec: PathBuf,
+    #[arg(value_name = "SCENE_SPEC", conflicts_with_all = ["run", "pack"])]
+    scene_spec: Option<PathBuf>,
+    /// Recorded Run formatted as `slug:version` (`harbor-dock:1` or `harbor-dock:v001`).
+    #[arg(long, value_name = "SLUG:VER", conflicts_with = "pack")]
+    run: Option<String>,
+    /// Style-scoped ReferencePack formatted as `subject_slug:style_slug`.
+    #[arg(long, value_name = "SUBJECT:STYLE", conflicts_with = "run")]
+    pack: Option<String>,
+    /// Optional Atmosphere slug enforcing exposure_floor when validating a Run.
+    #[arg(long)]
+    atmosphere: Option<String>,
+    /// Optional Subject slug(s) enforcing PaletteLock adherence when validating a Run.
+    #[arg(long = "subject")]
+    subjects: Vec<String>,
+    /// Reference anchor image path(s) forwarded to VisionCritic.
+    #[arg(short = 'i', long = "ref", value_name = "PATH")]
+    references: Vec<PathBuf>,
+    /// Binary trait check specification (`id:category:criterion` or `criterion`) for VisionCritic.
+    #[arg(long = "trait", value_name = "SPEC")]
+    traits: Vec<String>,
+    /// Run VisionCritic with default checklist even when --trait is omitted.
+    #[arg(long)]
+    critic: bool,
+    /// Emit machine-readable JSON validation report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct PromoteArgs {
+    /// Validated Run formatted as `slug:version` (`harbor-dock:1` or `harbor-dock:v001`).
+    #[arg(long, value_name = "SLUG:VER", conflicts_with = "pack")]
+    run: Option<String>,
+    /// Validated ReferencePack formatted as `subject_slug:style_slug`.
+    #[arg(long, value_name = "SUBJECT:STYLE", conflicts_with = "run")]
+    pack: Option<String>,
+    /// Emit machine-readable JSON promotion report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct RunArgs {
+    #[command(subcommand)]
+    action: RunSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum RunSubcommand {
+    /// Validate a Run (structural + ColorQaEngine + optional VisionCritic) to `validated`.
+    Validate {
+        /// Recorded Run formatted as `slug:version`.
+        #[arg(value_name = "SLUG:VER")]
+        run: String,
+        /// Optional Atmosphere slug enforcing exposure_floor.
+        #[arg(long)]
+        atmosphere: Option<String>,
+        /// Optional Subject slug(s) enforcing PaletteLock adherence.
+        #[arg(long = "subject")]
+        subjects: Vec<String>,
+        /// Reference anchor image path(s) forwarded to VisionCritic.
+        #[arg(short = 'i', long = "ref", value_name = "PATH")]
+        references: Vec<PathBuf>,
+        /// Binary trait check specification (`id:category:criterion` or `criterion`) for VisionCritic.
+        #[arg(long = "trait", value_name = "SPEC")]
+        traits: Vec<String>,
+        /// Run VisionCritic with default checklist even when --trait is omitted.
+        #[arg(long)]
+        critic: bool,
+        /// Emit machine-readable JSON validation report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Promote a Validated Run to Canonical in `manifest.lock.json` (superseding prior canonical).
+    Promote {
+        /// Validated Run formatted as `slug:version`.
+        #[arg(value_name = "SLUG:VER")]
+        run: String,
+        /// Emit machine-readable JSON promotion report.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List recorded Runs in the workspace.
+    List {
+        /// Optional stream slug filter.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Emit machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
 struct GenerateArgs {
     /// Path to the SceneSpec YAML or JSON file.
+    #[arg(long, value_name = "PATH", conflicts_with = "compose")]
+    scene: Option<PathBuf>,
+    /// Unstructured scene prose translated via read-only SceneComposer (ADR 0004).
+    #[arg(long, value_name = "PROSE", conflicts_with = "scene")]
+    compose: Option<String>,
+    /// Optional explicit output PNG destination path (in addition to `runs/<slug>/vNNN.png`).
     #[arg(long, value_name = "PATH")]
-    scene: PathBuf,
-    /// Output PNG destination path.
-    #[arg(long, value_name = "PATH")]
-    out: PathBuf,
-    /// Override output width in pixels.
+    out: Option<PathBuf>,
+    /// Override target Run stream slug (defaults to SceneSpec.id).
+    #[arg(long)]
+    slug: Option<String>,
+    /// Run 0-reference `explore` generation without requiring a ReferencePack.
+    #[arg(long)]
+    explore: bool,
+    /// Override output width in pixels (applied to SceneSpec before PromptCompiler).
     #[arg(long)]
     width: Option<u32>,
-    /// Override output height in pixels.
+    /// Override output height in pixels (applied to SceneSpec before PromptCompiler).
     #[arg(long)]
     height: Option<u32>,
     /// Reference image path(s) forwarded to `codex exec -i <FILE>`.
     #[arg(short = 'i', long = "ref", value_name = "FILE")]
     references: Vec<PathBuf>,
+    /// Explicit dynamic Atlas slice selector (`subject_slug:style_slug:slice_id1[,slice_id2...]`).
+    #[arg(long = "slice", value_name = "SPEC")]
+    slices: Vec<String>,
+    /// Attach a SpatialGuide PNG reference image with explicit role labeling.
+    #[arg(long, value_name = "PATH")]
+    spatial_guide: Option<PathBuf>,
+    /// Subject PaletteLock ROI selector formatted as `subject_slug[:x,y,w,h]`.
+    #[arg(long = "subject-roi", value_name = "SPEC")]
+    subject_rois: Vec<String>,
+    /// Record Draft Run even when fail-closed Color QA rejects it.
+    #[arg(long)]
+    allow_qa_fail: bool,
+    /// Record Run in `draft` lifecycle instead of advancing to `candidate` on QA pass.
+    #[arg(long)]
+    draft: bool,
+    /// Emit machine-readable JSON generation summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -414,6 +538,18 @@ enum LibrarySubcommand {
     },
     /// Verify SHA-256 checksums of all canonical entries in library/manifest.lock.json.
     VerifyLock,
+    /// Promote a Validated style-scoped ReferencePack to Canonical in `manifest.lock.json`.
+    Promote {
+        /// Subject slug.
+        #[arg(long)]
+        subject: String,
+        /// Style slug.
+        #[arg(long)]
+        style: String,
+        /// Emit machine-readable JSON promotion report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -602,6 +738,41 @@ fn parse_run_ref_arg(raw: &str) -> anyhow::Result<(String, u32)> {
     Ok((trimmed_slug.to_string(), version))
 }
 
+fn parse_pack_ref_arg(raw: &str) -> anyhow::Result<(String, String)> {
+    let (subject_raw, style_raw) = raw.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("--pack '{raw}' must be formatted as subject_slug:style_slug")
+    })?;
+    let subject = subject_raw.trim();
+    let style = style_raw.trim();
+    if subject.is_empty() || style.is_empty() {
+        bail!("--pack '{raw}' must include non-empty subject_slug and style_slug");
+    }
+    Ok((subject.to_string(), style.to_string()))
+}
+
+fn parse_subject_roi_arg(raw: &str) -> anyhow::Result<SubjectRoiBinding> {
+    if let Some((slug_raw, rect_raw)) = raw.split_once(':') {
+        let slug = slug_raw.trim();
+        if slug.is_empty() {
+            bail!("--subject-roi '{raw}' must have a non-empty subject_slug");
+        }
+        let rect = parse_roi_arg(rect_raw.trim())?;
+        Ok(SubjectRoiBinding {
+            subject_slug: slug.to_string(),
+            rois: vec![rect],
+        })
+    } else {
+        let slug = raw.trim();
+        if slug.is_empty() {
+            bail!("--subject-roi must not be empty");
+        }
+        Ok(SubjectRoiBinding {
+            subject_slug: slug.to_string(),
+            rois: Vec::new(),
+        })
+    }
+}
+
 fn parse_trait_arg(index: usize, raw: &str) -> anyhow::Result<TraitCheckInput> {
     let parts: Vec<&str> = raw.splitn(3, ':').collect();
     if parts.len() == 3 {
@@ -623,6 +794,7 @@ fn parse_trait_arg(index: usize, raw: &str) -> anyhow::Result<TraitCheckInput> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -695,57 +867,376 @@ async fn main() -> anyhow::Result<()> {
                 println!("{rendered}");
             }
         }
-        Commands::Validate(args) => {
-            let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
-
-            let spec = SceneSpec::load_from_path(&args.scene_spec)?;
-            let compiled = PromptCompiler::compile(&spec)?;
-            println!(
-                "SceneSpec '{}' valid (visibility={}, slots={}, target={}x{})",
-                spec.id,
-                compiled.visibility.as_str(),
-                compiled.foreground_slot_count,
-                compiled.target_width,
-                compiled.target_height
-            );
-            println!("\n{}", compiled.prompt);
+        Commands::Validate(args) => match (args.scene_spec, args.run, args.pack) {
+            (Some(scene_path), None, None) => {
+                let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+                let spec = SceneSpec::load_from_path(&scene_path)?;
+                let mut overrides = std::collections::BTreeMap::new();
+                if let Some(resolved_ws) = ws.as_ref() {
+                    let registry = LibraryRegistry::from_workspace(resolved_ws);
+                    for slot in &spec.foreground_slots {
+                        if let Ok(resolved) = registry.resolve_subject(slot.subject_ref.trim()) {
+                            overrides.insert(resolved.subject.slug, resolved.subject.visibility);
+                        }
+                    }
+                }
+                let compiled = PromptCompiler::compile_with_subject_visibility(&spec, &overrides)?;
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "id": spec.id,
+                            "visibility": compiled.visibility,
+                            "slots": compiled.foreground_slot_count,
+                            "width": compiled.target_width,
+                            "height": compiled.target_height,
+                            "prompt": compiled.prompt,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "SceneSpec '{}' valid (visibility={}, slots={}, target={}x{})",
+                        spec.id,
+                        compiled.visibility.as_str(),
+                        compiled.foreground_slot_count,
+                        compiled.target_width,
+                        compiled.target_height
+                    );
+                    println!("\n{}", compiled.prompt);
+                }
+            }
+            (None, Some(run_ref), None) => {
+                let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+                let run_store =
+                    RunStore::new(resolved_ws.root.join(&resolved_ws.config.paths.runs_dir));
+                let registry = LibraryRegistry::from_workspace(&resolved_ws);
+                let (slug, version) = parse_run_ref_arg(&run_ref)?;
+                let mut traits = Vec::with_capacity(args.traits.len());
+                for (idx, raw) in args.traits.iter().enumerate() {
+                    traits.push(parse_trait_arg(idx, raw)?);
+                }
+                let critic = VisionCritic::with_codex_bin(auth_dir, codex_bin);
+                let subject_rois = args
+                    .subjects
+                    .into_iter()
+                    .map(|s| SubjectRoiBinding {
+                        subject_slug: s,
+                        rois: Vec::new(),
+                    })
+                    .collect();
+                let res = validate_run(
+                    &run_store,
+                    &registry,
+                    Some(&critic),
+                    &ValidateRunRequest {
+                        slug,
+                        version,
+                        atmosphere_slug: args.atmosphere,
+                        subject_rois,
+                        explicit_subject_rois: Vec::new(),
+                        reference_images: args.references,
+                        traits,
+                        run_critic: args.critic,
+                        exposure_config: ExposureQaConfig::default(),
+                        palette_config: PaletteQaConfig::default(),
+                        sparkle_config: SparkleConfig::default(),
+                    },
+                )
+                .await?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                } else {
+                    println!(
+                        "Validated Run '{}' (lifecycle={}, color_qa_passed={})",
+                        res.metadata.run_id,
+                        res.metadata.lifecycle.as_str(),
+                        res.color_qa.passed
+                    );
+                }
+            }
+            (None, None, Some(pack_ref)) => {
+                let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+                let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+                let registry = LibraryRegistry::from_workspace(&resolved_ws);
+                let (subject_slug, style_slug) = parse_pack_ref_arg(&pack_ref)?;
+                let mut traits = Vec::with_capacity(args.traits.len());
+                for (idx, raw) in args.traits.iter().enumerate() {
+                    traits.push(parse_trait_arg(idx, raw)?);
+                }
+                let critic = VisionCritic::with_codex_bin(auth_dir, codex_bin);
+                let mut req = ValidateReferencePackRequest::new(subject_slug, style_slug);
+                req.traits = traits;
+                req.run_critic = args.critic;
+                let res =
+                    validate_reference_pack(&library_dir, &registry, Some(&critic), &req).await?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                } else {
+                    println!(
+                        "Validated ReferencePack '{}/{}' v{} (lifecycle={})",
+                        res.manifest.subject_slug,
+                        res.manifest.style_slug,
+                        res.manifest.version,
+                        res.manifest.lifecycle.as_str()
+                    );
+                }
+            }
+            (None, None, None) => {
+                bail!("provide a SceneSpec path, --run SLUG:VER, or --pack SUBJECT:STYLE");
+            }
+            _ => unreachable!("clap conflicts_with prevents multiple validate targets"),
+        },
+        Commands::Promote(args) => {
+            let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+            let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+            let lock_store = ManifestLockStore::new(&library_dir);
+            match (args.run, args.pack) {
+                (Some(run_ref), None) => {
+                    let run_store =
+                        RunStore::new(resolved_ws.root.join(&resolved_ws.config.paths.runs_dir));
+                    let (slug, version) = parse_run_ref_arg(&run_ref)?;
+                    let (meta, lock) =
+                        promote_run(&lock_store, &run_store, &slug, version, &resolved_ws.root)?;
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "metadata": meta,
+                                "canonicalCount": lock.canonical.len(),
+                                "supersededCount": lock.superseded.len(),
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Promoted Run '{}' to canonical (superseded={})",
+                            meta.run_id,
+                            lock.superseded.len()
+                        );
+                    }
+                }
+                (None, Some(pack_ref)) => {
+                    let (subject_slug, style_slug) = parse_pack_ref_arg(&pack_ref)?;
+                    let (manifest, lock) = promote_reference_pack(
+                        &lock_store,
+                        &library_dir,
+                        &subject_slug,
+                        &style_slug,
+                        &resolved_ws.root,
+                    )?;
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "manifest": manifest,
+                                "canonicalCount": lock.canonical.len(),
+                                "supersededCount": lock.superseded.len(),
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Promoted ReferencePack '{}/{}' v{} to canonical (superseded={})",
+                            manifest.subject_slug,
+                            manifest.style_slug,
+                            manifest.version,
+                            lock.superseded.len()
+                        );
+                    }
+                }
+                (None, None) => bail!("either --run SLUG:VER or --pack SUBJECT:STYLE is required"),
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both"),
+            }
         }
         Commands::Generate(args) => {
-            let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+            let _fallback_runs_dir = if ws.is_none() {
+                Some(tempfile::TempDir::new().context("creating temporary runs directory")?)
+            } else {
+                None
+            };
+            let run_store = match ws.as_ref() {
+                Some(resolved) => {
+                    RunStore::new(resolved.root.join(&resolved.config.paths.runs_dir))
+                }
+                None => RunStore::new(
+                    _fallback_runs_dir
+                        .as_ref()
+                        .expect("temp runs dir exists")
+                        .path()
+                        .to_path_buf(),
+                ),
+            };
+            let registry = match ws.as_ref() {
+                Some(resolved) => LibraryRegistry::from_workspace(resolved),
+                None => LibraryRegistry::new(None, resolve_user_config_dir_from_env()),
+            };
 
-            let spec = SceneSpec::load_from_path(&args.scene)?;
-            let compiled = PromptCompiler::compile(&spec)?;
-            let width = args.width.unwrap_or(compiled.target_width);
-            let height = args.height.unwrap_or(compiled.target_height);
+            let scene_input = match (args.scene, args.compose) {
+                (Some(scene_path), None) => {
+                    GenerateSceneInput::Spec(Box::new(SceneSpec::load_from_path(&scene_path)?))
+                }
+                (None, Some(prose)) => GenerateSceneInput::Prose(prose),
+                (None, None) => bail!("either --scene PATH or --compose PROSE must be provided"),
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both"),
+            };
 
-            let backend = CodexNativeBackend::with_codex_bin(auth_dir, codex_bin);
-            let output = backend
-                .generate(&ImageGenerationRequest {
-                    prompt: compiled.prompt,
-                    width,
-                    height,
-                    reference_images: args.references,
-                })
-                .await?;
-
-            if let Some(parent) = args.out.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("creating output parent directory {}", parent.display())
-                })?;
+            let mut atlas_selections = Vec::with_capacity(args.slices.len());
+            for raw in &args.slices {
+                atlas_selections.push(parse_atlas_selection(raw)?);
             }
-            fs::write(&args.out, &output.png_bytes)
-                .with_context(|| format!("writing PNG to {}", args.out.display()))?;
-            println!(
-                "Generated {}x{} PNG (raw {}x{}, thread_id={:?}) at {}",
-                output.width,
-                output.height,
-                output.raw_width,
-                output.raw_height,
-                output.thread_id,
-                args.out.display()
-            );
+            let mut subject_rois = Vec::with_capacity(args.subject_rois.len());
+            for raw in &args.subject_rois {
+                subject_rois.push(parse_subject_roi_arg(raw)?);
+            }
+
+            let backend = CodexNativeBackend::with_codex_bin(auth_dir.clone(), codex_bin.clone());
+            let composer = SceneComposer::with_codex_bin(auth_dir, codex_bin);
+            let res = execute_generate(
+                &backend,
+                Some(&composer),
+                &registry,
+                &run_store,
+                &GenerateRequest {
+                    scene_input,
+                    slug: args.slug,
+                    mode: if args.explore {
+                        GenerationMode::Explore
+                    } else {
+                        GenerationMode::Standard
+                    },
+                    width_override: args.width,
+                    height_override: args.height,
+                    atlas_selections,
+                    reference_images: args.references,
+                    spatial_guide_path: args.spatial_guide,
+                    subject_rois,
+                    explicit_subject_rois: Vec::new(),
+                    exposure_config: ExposureQaConfig::default(),
+                    palette_config: PaletteQaConfig::default(),
+                    allowed_sparkle_mask: None,
+                    sparkle_config: SparkleConfig::default(),
+                    fail_closed_on_qa: !args.allow_qa_fail,
+                    initial_lifecycle: if args.draft {
+                        Lifecycle::Draft
+                    } else {
+                        Lifecycle::Candidate
+                    },
+                    extra_out_path: args.out.clone(),
+                },
+            )
+            .await?;
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&res)?);
+            } else {
+                let display_path = args.out.as_deref().unwrap_or(res.image_path.as_path());
+                println!(
+                    "Generated Run '{}' (lifecycle={}, refs={}, atlas_placements={}, qa_passed={}) at {}",
+                    res.run_id,
+                    res.lifecycle.as_str(),
+                    res.reference_count,
+                    res.atlas_placements.len(),
+                    res.qa_report.passed,
+                    display_path.display()
+                );
+            }
+        }
+        Commands::Run(args) => {
+            let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+            let run_store =
+                RunStore::new(resolved_ws.root.join(&resolved_ws.config.paths.runs_dir));
+            let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+            let lock_store = ManifestLockStore::new(&library_dir);
+            let registry = LibraryRegistry::from_workspace(&resolved_ws);
+
+            match args.action {
+                RunSubcommand::Validate {
+                    run,
+                    atmosphere,
+                    subjects,
+                    references,
+                    traits,
+                    critic,
+                    json,
+                } => {
+                    let (slug, version) = parse_run_ref_arg(&run)?;
+                    let mut parsed_traits = Vec::with_capacity(traits.len());
+                    for (idx, raw) in traits.iter().enumerate() {
+                        parsed_traits.push(parse_trait_arg(idx, raw)?);
+                    }
+                    let vc = VisionCritic::with_codex_bin(auth_dir, codex_bin);
+                    let subject_rois = subjects
+                        .into_iter()
+                        .map(|s| SubjectRoiBinding {
+                            subject_slug: s,
+                            rois: Vec::new(),
+                        })
+                        .collect();
+                    let res = validate_run(
+                        &run_store,
+                        &registry,
+                        Some(&vc),
+                        &ValidateRunRequest {
+                            slug,
+                            version,
+                            atmosphere_slug: atmosphere,
+                            subject_rois,
+                            explicit_subject_rois: Vec::new(),
+                            reference_images: references,
+                            traits: parsed_traits,
+                            run_critic: critic,
+                            exposure_config: ExposureQaConfig::default(),
+                            palette_config: PaletteQaConfig::default(),
+                            sparkle_config: SparkleConfig::default(),
+                        },
+                    )
+                    .await?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&res)?);
+                    } else {
+                        println!(
+                            "Validated Run '{}' (lifecycle={})",
+                            res.metadata.run_id,
+                            res.metadata.lifecycle.as_str()
+                        );
+                    }
+                }
+                RunSubcommand::Promote { run, json } => {
+                    let (slug, version) = parse_run_ref_arg(&run)?;
+                    let (meta, lock) =
+                        promote_run(&lock_store, &run_store, &slug, version, &resolved_ws.root)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "metadata": meta,
+                                "canonicalCount": lock.canonical.len(),
+                                "supersededCount": lock.superseded.len(),
+                            }))?
+                        );
+                    } else {
+                        println!("Promoted Run '{}' to canonical", meta.run_id);
+                    }
+                }
+                RunSubcommand::List { slug, json } => {
+                    let status =
+                        inspect_workspace_status(&lock_store, &run_store, slug.as_deref())?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    } else {
+                        for (s, runs) in &status.runs {
+                            for r in runs {
+                                println!(
+                                    "{}\t{}\t{}",
+                                    r.run_id,
+                                    r.lifecycle.as_str(),
+                                    r.visibility.as_str()
+                                );
+                            }
+                            let _ = s;
+                        }
+                    }
+                }
+            }
         }
         Commands::Edit(args) => {
             let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
@@ -1202,6 +1693,37 @@ async fn main() -> anyhow::Result<()> {
                         lock_store.lock_path().display()
                     );
                 }
+                LibrarySubcommand::Promote {
+                    subject,
+                    style,
+                    json,
+                } => {
+                    let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+                    let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+                    let lock_store = ManifestLockStore::new(&library_dir);
+                    let (manifest, lock) = promote_reference_pack(
+                        &lock_store,
+                        &library_dir,
+                        &subject,
+                        &style,
+                        &resolved_ws.root,
+                    )?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "manifest": manifest,
+                                "canonicalCount": lock.canonical.len(),
+                                "supersededCount": lock.superseded.len(),
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Promoted ReferencePack '{}/{}' v{} to canonical",
+                            manifest.subject_slug, manifest.style_slug, manifest.version
+                        );
+                    }
+                }
             }
         }
         Commands::Pack(args) => match args.action {
@@ -1402,6 +1924,38 @@ mod tests {
                 let parsed = res.expect("valid run ref");
                 assert_eq!(parsed.0, slug);
                 assert_eq!(parsed.1, ver);
+            }
+            None => assert!(res.is_err()),
+        }
+    }
+
+    #[rstest]
+    #[case::valid_pack("courier-ren:franco-belgian-line", Some(("courier-ren", "franco-belgian-line")))]
+    #[case::missing_style("courier-ren:", None)]
+    #[case::missing_colon("courier-ren", None)]
+    fn parses_pack_ref_arg_strictly(#[case] raw: &str, #[case] expected: Option<(&str, &str)>) {
+        let res = parse_pack_ref_arg(raw);
+        match expected {
+            Some((subj, style)) => {
+                let parsed = res.expect("valid pack ref");
+                assert_eq!(parsed.0, subj);
+                assert_eq!(parsed.1, style);
+            }
+            None => assert!(res.is_err()),
+        }
+    }
+
+    #[rstest]
+    #[case::slug_only("courier-ren", Some(("courier-ren", 0)))]
+    #[case::slug_with_roi("courier-ren:10,20,64,64", Some(("courier-ren", 1)))]
+    #[case::empty_slug(":10,20,64,64", None)]
+    fn parses_subject_roi_arg_strictly(#[case] raw: &str, #[case] expected: Option<(&str, usize)>) {
+        let res = parse_subject_roi_arg(raw);
+        match expected {
+            Some((slug, roi_len)) => {
+                let parsed = res.expect("valid subject roi");
+                assert_eq!(parsed.subject_slug, slug);
+                assert_eq!(parsed.rois.len(), roi_len);
             }
             None => assert!(res.is_err()),
         }
