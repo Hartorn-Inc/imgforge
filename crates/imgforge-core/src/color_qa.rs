@@ -195,6 +195,7 @@ pub struct ExposureReport {
 
 /// Hue-degree sector forbidden inside a Subject ROI unless within `max_fraction`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ForbiddenHueSector {
     /// Descriptive sector name (for example `"neon-magenta"`).
     pub name: String,
@@ -1876,5 +1877,22 @@ mod tests {
                 assert!(pt.l_star >= 0.0 && pt.l_star <= 100.0);
             }
         }
+    }
+
+    #[rstest]
+    #[case::valid_sector(
+        "name: neon-magenta\nmin_hue_deg: 315.0\nmax_hue_deg: 15.0\nmin_chroma: 25.0\nmax_fraction: 0.02\n",
+        true
+    )]
+    #[case::unknown_field_rejected(
+        "name: neon-magenta\nmin_hue_deg: 315.0\nmax_hue_deg: 15.0\nmin_chroma: 25.0\nmax_fraction: 0.02\nextra_field: 1.0\n",
+        false
+    )]
+    fn forbidden_hue_sector_rejects_unknown_yaml_fields(
+        #[case] raw_yaml: &str,
+        #[case] expect_ok: bool,
+    ) {
+        let parsed: Result<ForbiddenHueSector, _> = yaml_serde::from_str(raw_yaml);
+        assert_eq!(parsed.is_ok(), expect_ok);
     }
 }

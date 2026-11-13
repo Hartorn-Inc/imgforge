@@ -55,7 +55,6 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinSet;
 
 use crate::auth::{DEFAULT_CODEX_BIN, TempCodexHome};
 use crate::backend::{ImageBackend, ImageGenerationRequest};
@@ -79,7 +78,7 @@ use crate::slicer::PixelRect;
 use crate::store::{
     MAX_TEXT_FILE_BYTES, RunStore, decode_png_checked, read_regular_file_nofollow,
     read_text_file_nofollow_bounded, validate_strict_relative_path,
-    verify_contained_path_no_symlinks, verify_existing_dir_prefix_no_symlinks, write_atomic,
+    verify_contained_path_no_symlinks, write_atomic,
 };
 use crate::subject::PaletteLock;
 
@@ -89,8 +88,17 @@ pub const SUPPORTED_EVAL_SCHEMA_VERSION: u32 = 1;
 /// Default maximum concurrent generative or VLM evaluation tasks.
 pub const DEFAULT_EVAL_MAX_CONCURRENCY: usize = 2;
 
+/// Maximum permitted concurrent evaluation tasks (well below `tokio::sync::Semaphore::MAX_PERMITS`).
+pub const MAX_EVAL_MAX_CONCURRENCY: usize = 64;
+
+/// Maximum permitted repeated trials per strategy in an `EvalCaseSpec`.
+pub const MAX_EVAL_TRIALS: u32 = 100;
+
 /// Maximum JSONL line bytes accepted from an external scorer plugin (`1 MiB`).
 pub const MAX_EXTERNAL_SCORER_LINE_BYTES: usize = 1024 * 1024;
+
+/// Maximum stderr bytes retained for external scorer error diagnostics (`64 KiB`).
+const MAX_EXTERNAL_SCORER_STDERR_BYTES: usize = 64 * 1024;
 
 /// Default timeout in seconds for a single external scorer invocation.
 pub const DEFAULT_EXTERNAL_SCORER_TIMEOUT_SECS: u64 = 30;
@@ -484,10 +492,10 @@ impl EvalCaseSpec {
                 )));
             }
         }
-        if self.trials == 0 {
+        if self.trials == 0 || self.trials > MAX_EVAL_TRIALS {
             return Err(CoreError::EvalFailed(format!(
-                "EvalCaseSpec '{}' trials must be >= 1",
-                self.id
+                "EvalCaseSpec '{}' trials ({}) must be in 1..={MAX_EVAL_TRIALS}",
+                self.id, self.trials
             )));
         }
         for (idx, tr) in self.pairwise_traits.iter().enumerate() {
@@ -938,11 +946,13 @@ pub fn compute_line_straightness_residual(
             let (m1, m2) = if !(22.5..157.5).contains(&deg) {
                 (mag[y * rw + (x - 1)], mag[y * rw + (x + 1)])
             } else if (22.5..67.5).contains(&deg) {
-                (mag[(y - 1) * rw + (x + 1)], mag[(y + 1) * rw + (x - 1)])
+                // Gradient normal points along (+1, +1) / (-1, -1) in y-down image coords.
+                (mag[(y - 1) * rw + (x - 1)], mag[(y + 1) * rw + (x + 1)])
             } else if (67.5..112.5).contains(&deg) {
                 (mag[(y - 1) * rw + x], mag[(y + 1) * rw + x])
             } else {
-                (mag[(y - 1) * rw + (x - 1)], mag[(y + 1) * rw + (x + 1)])
+                // (112.5..157.5): gradient normal points along (+1, -1) / (-1, +1).
+                (mag[(y - 1) * rw + (x + 1)], mag[(y + 1) * rw + (x - 1)])
             };
             if m >= m1 && m >= m2 {
                 edge_pts.push((x as f64, y as f64));
@@ -1910,24 +1920,7 @@ pub async fn invoke_external_scorer(
         reason: format!("failed to spawn '{trimmed}': {err}"),
     })?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(req_line.as_bytes())
-            .await
-            .map_err(|err| CoreError::SubprocessFailed {
-                stage: "ExternalScorer",
-                reason: format!("writing JSONL request to stdin: {err}"),
-            })?;
-        stdin
-            .flush()
-            .await
-            .map_err(|err| CoreError::SubprocessFailed {
-                stage: "ExternalScorer",
-                reason: format!("flushing stdin: {err}"),
-            })?;
-        // Explicit drop closes stdin so line-oriented plugins observe EOF cleanly.
-    }
-
+    let stdin_opt = child.stdin.take();
     let stdout = child
         .stdout
         .take()
@@ -1935,61 +1928,124 @@ pub async fn invoke_external_scorer(
             stage: "ExternalScorer",
             reason: "missing stdout pipe".to_string(),
         })?;
+    let stderr_opt = child.stderr.take();
 
-    let read_fut = async {
-        let mut reader = BufReader::new(stdout.take((MAX_EXTERNAL_SCORER_LINE_BYTES + 1) as u64));
-        let mut line = String::new();
-        let bytes_read =
-            reader
-                .read_line(&mut line)
-                .await
-                .map_err(|err| CoreError::SubprocessFailed {
+    let io_and_wait_fut = async {
+        let stdin_fut = async {
+            if let Some(mut stdin) = stdin_opt {
+                if let Err(err) = stdin.write_all(req_line.as_bytes()).await
+                    && err.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    return Err(CoreError::SubprocessFailed {
+                        stage: "ExternalScorer",
+                        reason: format!("writing JSONL request to stdin: {err}"),
+                    });
+                }
+                if let Err(err) = stdin.flush().await
+                    && err.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    return Err(CoreError::SubprocessFailed {
+                        stage: "ExternalScorer",
+                        reason: format!("flushing stdin: {err}"),
+                    });
+                }
+                // Explicit drop closes stdin so line-oriented plugins observe EOF cleanly.
+            }
+            Ok::<(), CoreError>(())
+        };
+
+        let stdout_fut = async {
+            let mut reader =
+                BufReader::new(stdout.take((MAX_EXTERNAL_SCORER_LINE_BYTES + 1) as u64));
+            let mut line = String::new();
+            let bytes_read =
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|err| CoreError::SubprocessFailed {
+                        stage: "ExternalScorer",
+                        reason: format!("reading JSONL stdout: {err}"),
+                    })?;
+            if line.len() > MAX_EXTERNAL_SCORER_LINE_BYTES {
+                return Err(CoreError::StructuredOutputInvalid {
                     stage: "ExternalScorer",
-                    reason: format!("reading JSONL stdout: {err}"),
-                })?;
-        if bytes_read == 0 {
-            return Err(CoreError::StructuredOutputInvalid {
+                    reason: format!(
+                        "external scorer response line exceeded {MAX_EXTERNAL_SCORER_LINE_BYTES} byte limit"
+                    ),
+                });
+            }
+            Ok::<(usize, String), CoreError>((bytes_read, line))
+        };
+
+        let stderr_fut =
+            async {
+                if let Some(mut stderr) = stderr_opt {
+                    let mut captured = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = stderr.read(&mut buf).await.map_err(|err| {
+                            CoreError::SubprocessFailed {
+                                stage: "ExternalScorer",
+                                reason: format!("reading stderr: {err}"),
+                            }
+                        })?;
+                        if n == 0 {
+                            break;
+                        }
+                        if captured.len() < MAX_EXTERNAL_SCORER_STDERR_BYTES {
+                            let remaining = MAX_EXTERNAL_SCORER_STDERR_BYTES - captured.len();
+                            captured.extend_from_slice(&buf[..n.min(remaining)]);
+                        }
+                    }
+                    Ok::<String, CoreError>(String::from_utf8_lossy(&captured).trim().to_string())
+                } else {
+                    Ok(String::new())
+                }
+            };
+
+        let (_, (bytes_read, line), stderr_text) =
+            tokio::try_join!(stdin_fut, stdout_fut, stderr_fut)?;
+
+        let status = child
+            .wait()
+            .await
+            .map_err(|err| CoreError::SubprocessFailed {
                 stage: "ExternalScorer",
-                reason: "external scorer exited/EOF without emitting a JSONL response line"
-                    .to_string(),
-            });
-        }
-        if line.len() > MAX_EXTERNAL_SCORER_LINE_BYTES {
-            return Err(CoreError::StructuredOutputInvalid {
-                stage: "ExternalScorer",
-                reason: format!(
-                    "external scorer response line exceeded {MAX_EXTERNAL_SCORER_LINE_BYTES} byte limit"
-                ),
-            });
-        }
-        Ok::<String, CoreError>(line)
+                reason: format!("waiting for external scorer: {err}"),
+            })?;
+
+        Ok::<(std::process::ExitStatus, usize, String, String), CoreError>((
+            status,
+            bytes_read,
+            line,
+            stderr_text,
+        ))
     };
 
-    let raw_line = tokio::time::timeout(timeout, read_fut)
-        .await
-        .map_err(|_| CoreError::SubprocessFailed {
-            stage: "ExternalScorer",
-            reason: format!("external scorer timed out after {}s", timeout.as_secs()),
-        })??;
-
-    let status = tokio::time::timeout(timeout, child.wait())
-        .await
-        .map_err(|_| CoreError::SubprocessFailed {
-            stage: "ExternalScorer",
-            reason: format!(
-                "external scorer wait timed out after {}s",
-                timeout.as_secs()
-            ),
-        })?
-        .map_err(|err| CoreError::SubprocessFailed {
-            stage: "ExternalScorer",
-            reason: format!("waiting for external scorer: {err}"),
-        })?;
+    let (status, bytes_read, raw_line, stderr_text) =
+        tokio::time::timeout(timeout, io_and_wait_fut)
+            .await
+            .map_err(|_| CoreError::SubprocessFailed {
+                stage: "ExternalScorer",
+                reason: format!("external scorer timed out after {}s", timeout.as_secs()),
+            })??;
 
     if !status.success() {
+        let detail = if stderr_text.is_empty() {
+            format!("external scorer exited with status {status}")
+        } else {
+            format!("external scorer exited with status {status}: {stderr_text}")
+        };
         return Err(CoreError::SubprocessFailed {
             stage: "ExternalScorer",
-            reason: format!("external scorer exited with status {status}"),
+            reason: detail,
+        });
+    }
+
+    if bytes_read == 0 {
+        return Err(CoreError::StructuredOutputInvalid {
+            stage: "ExternalScorer",
+            reason: "external scorer exited/EOF without emitting a JSONL response line".to_string(),
         });
     }
 
@@ -2078,7 +2134,7 @@ pub struct EvalRunConfig {
     pub out_dir: PathBuf,
     /// When `true`, skip `ImageBackend` generation and swapped VLM pairwise judging.
     pub metrics_only: bool,
-    /// Maximum concurrent generative/VLM jobs (clamped `>= 1`, default `2`).
+    /// Maximum concurrent generative/VLM jobs (clamped to `1..=64`, default `2`).
     pub max_concurrency: usize,
     /// When `true`, ignore existing `eval_state.json` checkpoints and re-run all tuples.
     pub force: bool,
@@ -2165,7 +2221,7 @@ pub async fn execute_eval(
     registry: &LibraryRegistry,
     config: &EvalRunConfig,
 ) -> Result<EvalSummary, CoreError> {
-    let effective_concurrency = config.max_concurrency.max(1);
+    let effective_concurrency = config.max_concurrency.clamp(1, MAX_EVAL_MAX_CONCURRENCY);
     if !config.metrics_only && backend.is_none() {
         return Err(CoreError::EvalFailed(
             "ImageBackend is required when metrics_only is false".to_string(),
@@ -2194,11 +2250,40 @@ pub async fn execute_eval(
     let base_root = resolve_fixture_base_root(&config.cases_dir, config.base_root.as_deref())?;
 
     let state_path = config.out_dir.join("eval_state.json");
-    let mut initial_state = if !config.force && state_path.exists() {
+    let state_exists = match fs::symlink_metadata(&state_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(CoreError::Io {
+                context: format!("inspecting {}", state_path.display()),
+                source: err,
+            });
+        }
+    };
+    let has_filters = !config.filter_cases.is_empty() || !config.filter_strategies.is_empty();
+    let mut initial_state = if state_exists && (!config.force || has_filters) {
         load_eval_state(&state_path)?
     } else {
         EvalState::default()
     };
+
+    if config.force && has_filters {
+        let selected_case_ids: BTreeSet<&str> =
+            selected_cases.iter().map(|c| c.id.as_str()).collect();
+        initial_state.completed_trials.retain(|_, rec| {
+            let case_matches = selected_case_ids.contains(rec.case_id.as_str());
+            let strategy_matches = config.filter_strategies.is_empty()
+                || config.filter_strategies.contains(&rec.strategy);
+            !(case_matches && strategy_matches)
+        });
+        initial_state.pairwise_verdicts.retain(|_, pair| {
+            let case_matches = selected_case_ids.contains(pair.case_id.as_str());
+            let strategy_matches = config.filter_strategies.is_empty()
+                || config.filter_strategies.contains(&pair.strategy_a)
+                || config.filter_strategies.contains(&pair.strategy_b);
+            !(case_matches && strategy_matches)
+        });
+    }
 
     let semaphore = Arc::new(Semaphore::new(effective_concurrency));
     let shared_state = Arc::new(Mutex::new(initial_state.clone()));
@@ -2296,7 +2381,7 @@ pub async fn execute_eval(
                 let key = trial_checkpoint_key(&case.id, strategy, trial);
                 if !config.force
                     && let Some(existing) = initial_state.completed_trials.get(&key)
-                    && checkpoint_artifacts_exist(existing)
+                    && checkpoint_artifacts_exist(&config.out_dir, existing)
                 {
                     resumed_skipped_trials += 1;
                     continue;
@@ -2800,38 +2885,58 @@ pub fn compute_case_deterministic_metrics(
     mask_path: Option<&Path>,
     candidate_img: &RgbaImage,
 ) -> Result<DeterministicMetricsReport, CoreError> {
-    let ref_img = baseline_img.unwrap_or(target_img);
-    let w = ref_img.width();
-    let h = ref_img.height();
-    let edit_mask = load_case_edit_mask(case, mask_path, w, h)?;
+    let has_edit_region = mask_path.is_some() || case.roi.is_some();
     let qa = ColorQaEngine::new();
 
-    let has_untouched_region = edit_mask.iter().any(|&m| m <= 1e-4);
-    let has_mask_boundary =
-        edit_mask.iter().any(|&m| m > 0.5) && edit_mask.iter().any(|&m| m <= 0.5);
+    let (untouched_ssim, untouched_drift, boundary_discontinuity, informational_baseline_ssim) =
+        if has_edit_region {
+            let ref_img = baseline_img.unwrap_or(target_img);
+            let w = ref_img.width();
+            let h = ref_img.height();
+            let edit_mask = load_case_edit_mask(case, mask_path, w, h)?;
 
-    let (untouched_ssim, untouched_drift) =
-        if has_untouched_region && candidate_img.width() == w && candidate_img.height() == h {
-            let ssim = compute_masked_ssim(ref_img, candidate_img, &edit_mask)?;
-            let (drift_rep, _) = qa.evaluate_untouched_drift(
-                ref_img,
-                candidate_img,
-                &edit_mask,
-                &UntouchedDriftConfig::default(),
-            )?;
-            (Some(ssim), Some(drift_rep))
-        } else {
-            (None, None)
-        };
+            let has_untouched_region = edit_mask.iter().any(|&m| m <= 1e-4);
+            let has_mask_boundary =
+                edit_mask.iter().any(|&m| m > 0.5) && edit_mask.iter().any(|&m| m <= 0.5);
 
-    let boundary_discontinuity =
-        if has_mask_boundary && candidate_img.width() == w && candidate_img.height() == h {
-            Some(compute_boundary_discontinuity_score(
-                candidate_img,
-                &edit_mask,
-            )?)
+            let (ssim, drift) = if has_untouched_region
+                && candidate_img.width() == w
+                && candidate_img.height() == h
+            {
+                let ssim = compute_masked_ssim(ref_img, candidate_img, &edit_mask)?;
+                let (drift_rep, _) = qa.evaluate_untouched_drift(
+                    ref_img,
+                    candidate_img,
+                    &edit_mask,
+                    &UntouchedDriftConfig::default(),
+                )?;
+                (Some(ssim), Some(drift_rep))
+            } else {
+                (None, None)
+            };
+
+            let bds =
+                if has_mask_boundary && candidate_img.width() == w && candidate_img.height() == h {
+                    Some(compute_boundary_discontinuity_score(
+                        candidate_img,
+                        &edit_mask,
+                    )?)
+                } else {
+                    None
+                };
+
+            (ssim, drift, bds, None)
         } else {
-            None
+            let info_ssim = if let Some(base) = baseline_img
+                && candidate_img.width() == base.width()
+                && candidate_img.height() == base.height()
+            {
+                let zero_mask = vec![0.0f32; (base.width() as usize) * (base.height() as usize)];
+                Some(compute_masked_ssim(base, candidate_img, &zero_mask)?)
+            } else {
+                None
+            };
+            (None, None, None, info_ssim)
         };
 
     let line_straightness = if let Some(line_roi) = case.expected_line_roi {
@@ -2894,6 +2999,9 @@ pub fn compute_case_deterministic_metrics(
         if ssim < 0.85 {
             passed = false;
         }
+    }
+    if let Some(info_ssim) = informational_baseline_ssim {
+        notes.push(format!("informational_baseline_ssim={info_ssim:.4}"));
     }
     if let Some(ref drift) = untouched_drift {
         notes.push(format!(
@@ -2990,8 +3098,6 @@ async fn poll_bounded_futures<F, T>(futures: Vec<F>) -> Result<Vec<T>, CoreError
 where
     F: std::future::Future<Output = Result<T, CoreError>>,
 {
-    let mut join_handles_unused: JoinSet<()> = JoinSet::new();
-    let _ = &mut join_handles_unused;
     let mut pending: Vec<Option<std::pin::Pin<Box<F>>>> =
         futures.into_iter().map(|f| Some(Box::pin(f))).collect();
     let mut results: Vec<Option<T>> = (0..pending.len()).map(|_| None).collect();
@@ -3126,12 +3232,42 @@ fn pairwise_checkpoint_key(case_id: &str, a: EvalStrategy, b: EvalStrategy) -> S
     format!("{case_id}::{}__vs__{}", a.as_str(), b.as_str())
 }
 
-fn checkpoint_artifacts_exist(rec: &EvalTrialResult) -> bool {
-    let png_ok = fs::symlink_metadata(&rec.output_png)
-        .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file());
-    let json_ok = fs::symlink_metadata(&rec.trial_json)
-        .is_ok_and(|m| !m.file_type().is_symlink() && m.is_file());
-    png_ok && json_ok
+fn strip_out_dir_prefix<'a>(out_dir: &Path, path: &'a Path) -> Option<&'a Path> {
+    if let Ok(rel) = path.strip_prefix(out_dir) {
+        return Some(rel);
+    }
+    if let Ok(canon_out) = fs::canonicalize(out_dir)
+        && let Ok(rel) = path.strip_prefix(&canon_out)
+    {
+        return Some(rel);
+    }
+    None
+}
+
+fn checkpoint_artifacts_exist(out_dir: &Path, rec: &EvalTrialResult) -> bool {
+    let Some(rel_png) = strip_out_dir_prefix(out_dir, &rec.output_png) else {
+        return false;
+    };
+    let Some(rel_json) = strip_out_dir_prefix(out_dir, &rec.trial_json) else {
+        return false;
+    };
+    let Ok(verified_png) =
+        verify_contained_path_no_symlinks(out_dir, rel_png, false, "checkpoint output_png")
+    else {
+        return false;
+    };
+    let Ok(verified_json) =
+        verify_contained_path_no_symlinks(out_dir, rel_json, false, "checkpoint trial_json")
+    else {
+        return false;
+    };
+    let Ok(png_bytes) = read_regular_file_nofollow(&verified_png, "checkpoint output_png") else {
+        return false;
+    };
+    if sha256_hex(&png_bytes) != rec.output_sha256 {
+        return false;
+    }
+    read_regular_file_nofollow(&verified_json, "checkpoint trial_json").is_ok()
 }
 
 fn load_eval_state(path: &Path) -> Result<EvalState, CoreError> {
@@ -3193,13 +3329,57 @@ fn resolve_safe_fixture_path(
 }
 
 fn ensure_safe_output_dir(dir: &Path) -> Result<(), CoreError> {
-    if let Some(parent) = dir.parent()
-        && !parent.as_os_str().is_empty()
-        && let Some(name) = dir.file_name()
-        && parent.exists()
-    {
-        verify_existing_dir_prefix_no_symlinks(parent, Path::new(name), "eval output directory")?;
+    if dir.as_os_str().is_empty() {
+        return Err(CoreError::EvalFailed(
+            "eval output directory path must not be empty".to_string(),
+        ));
     }
+
+    // Walk every existing ancestor prefix down to `dir` via `symlink_metadata` before
+    // `fs::create_dir_all` so multi-level missing paths under a symlinked ancestor fail closed.
+    let mut cursor = PathBuf::new();
+    for comp in dir.components() {
+        match comp {
+            std::path::Component::Prefix(prefix) => {
+                cursor.push(prefix.as_os_str());
+                continue;
+            }
+            std::path::Component::RootDir => {
+                cursor.push(comp.as_os_str());
+            }
+            std::path::Component::CurDir => {
+                if cursor.as_os_str().is_empty() {
+                    cursor.push(".");
+                }
+                continue;
+            }
+            std::path::Component::ParentDir | std::path::Component::Normal(_) => {
+                cursor.push(comp.as_os_str());
+            }
+        }
+
+        match fs::symlink_metadata(&cursor) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(CoreError::EvalFailed(format!(
+                        "refusing symlink or non-directory ancestor in eval output directory path: {}",
+                        cursor.display()
+                    )));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!(
+                        "inspecting eval output directory ancestor {}",
+                        cursor.display()
+                    ),
+                    source: err,
+                });
+            }
+        }
+    }
+
     fs::create_dir_all(dir).map_err(|err| CoreError::Io {
         context: format!("creating eval output directory {}", dir.display()),
         source: err,
@@ -3335,15 +3515,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::straight_diagonal_edge(false)]
-    #[case::curved_arc(true)]
+    #[case::pos_45_straight_diagonal(1.0, false)]
+    #[case::pos_45_curved_arc(1.0, true)]
+    #[case::neg_45_straight_diagonal(-1.0, false)]
+    #[case::neg_45_curved_arc(-1.0, true)]
     fn line_straightness_residual_distinguishes_straight_line_from_curved_arc(
+        #[case] slope_sign: f64,
         #[case] curved: bool,
     ) {
         let mut img: RgbaImage = ImageBuffer::from_pixel(128, 128, Rgba([28, 32, 40, 255]));
         for x in 0..128i32 {
             let t = ((x - 16) as f64 / 96.0).clamp(0.0, 1.0);
-            let y_base = 28.0 + 70.0 * t;
+            let y_base = if slope_sign >= 0.0 {
+                16.0 + 96.0 * t
+            } else {
+                112.0 - 96.0 * t
+            };
             let curve_offset = if curved {
                 18.0 * (std::f64::consts::PI * t).sin()
             } else {
@@ -3369,13 +3556,15 @@ mod tests {
         if curved {
             assert!(
                 report.rms_residual_px > 2.5 && report.max_residual_px > 5.0,
-                "curved arc should produce large residuals: {:?}",
+                "curved arc (slope_sign={slope_sign}) should produce large residuals: {:?}",
                 report
             );
         } else {
             assert!(
-                report.rms_residual_px < 1.0 && report.ransac_inlier_ratio > 0.90,
-                "straight edge should have small residuals and high RANSAC inliers: {:?}",
+                report.edge_point_count >= 50
+                    && report.rms_residual_px < 0.6
+                    && report.ransac_inlier_ratio > 0.90,
+                "straight diagonal edge (slope_sign={slope_sign}) should have near-zero residuals and high RANSAC inliers: {:?}",
                 report
             );
         }
@@ -3782,11 +3971,17 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
     #[case::zero_trials(
         "schema_version: 1\nid: a\ntitle: A\nkind: edit_strategy\ntarget_image_path: \"a.png\"\nstrategies: [patch_crop_only]\ntrials: 0\n"
     )]
+    #[case::trials_exceed_max(
+        "schema_version: 1\nid: a\ntitle: A\nkind: edit_strategy\ntarget_image_path: \"a.png\"\nstrategies: [patch_crop_only]\ntrials: 101\n"
+    )]
     #[case::empty_strategies(
         "schema_version: 1\nid: a\ntitle: A\nkind: edit_strategy\ntarget_image_path: \"a.png\"\nstrategies: []\ntrials: 1\n"
     )]
     #[case::unknown_field(
         "schema_version: 1\nid: a\ntitle: A\nkind: edit_strategy\ntarget_image_path: \"a.png\"\nstrategies: [patch_crop_only]\ntrials: 1\nextra: true\n"
+    )]
+    #[case::unknown_forbidden_hue_sector_field(
+        "schema_version: 1\nid: a\ntitle: A\nkind: color_qa\ntarget_image_path: \"a.png\"\nstrategies: [patch_crop_only]\ntrials: 1\nforbidden_hue_sectors:\n  - name: bad\n    min_hue_deg: 10.0\n    max_hue_deg: 20.0\n    min_chroma: 20.0\n    max_fraction: 0.05\n    extra_flag: true\n"
     )]
     #[case::wrong_schema_version(
         "schema_version: 2\nid: a\ntitle: A\nkind: edit_strategy\ntarget_image_path: \"a.png\"\nstrategies: [patch_crop_only]\ntrials: 1\n"
@@ -3795,6 +3990,19 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
         let err = EvalCaseSpec::from_yaml_str(raw_yaml)
             .expect_err("invalid EvalCaseSpec YAML must fail closed");
         assert!(matches!(err, CoreError::EvalFailed(_)));
+    }
+
+    #[rstest]
+    #[case::min_trials(1, true)]
+    #[case::max_trials(MAX_EVAL_TRIALS, true)]
+    #[case::zero_trials(0, false)]
+    #[case::above_max_trials(MAX_EVAL_TRIALS + 1, false)]
+    fn eval_case_spec_bounds_trials_fail_closed(#[case] trials: u32, #[case] expect_ok: bool) {
+        let raw_yaml = format!(
+            "schema_version: 1\nid: bounded-trials\ntitle: Bounded Trials\nkind: edit_strategy\ntarget_image_path: \"a.png\"\nstrategies: [patch_crop_only]\ntrials: {trials}\n"
+        );
+        let res = EvalCaseSpec::from_yaml_str(&raw_yaml);
+        assert_eq!(res.is_ok(), expect_ok);
     }
 
     #[rstest]
@@ -3949,5 +4157,425 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
             }
             other => panic!("unexpected case_id: {other}"),
         }
+    }
+
+    #[rstest]
+    #[case::forest_scene_on_multi_actor_blockout(
+        "eval/cases/multi_actor_metric_scale.yaml",
+        [28, 42, 34],
+        [38, 58, 42],
+        [210, 140, 90],
+        [120, 175, 225]
+    )]
+    #[case::parchment_scene_on_multi_actor_blockout(
+        "eval/cases/multi_actor_metric_scale.yaml",
+        [195, 180, 155],
+        [175, 158, 132],
+        [52, 64, 92],
+        [130, 58, 48]
+    )]
+    #[case::non_edit_overlay_guide_with_baseline_differs_globally(
+        "eval/cases/trajectory_overlay_guide.yaml",
+        [30, 44, 58],
+        [40, 56, 72],
+        [220, 170, 95],
+        [220, 170, 95]
+    )]
+    fn non_mask_spatial_guide_passes_when_scene_differs_from_guide_or_baseline(
+        #[case] case_rel_path: &str,
+        #[case] upper_bg: [u8; 3],
+        #[case] lower_bg: [u8; 3],
+        #[case] fg_a: [u8; 3],
+        #[case] fg_b: [u8; 3],
+    ) {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("resolve repo root");
+        let case_path = repo_root.join(case_rel_path);
+        let case = EvalCaseSpec::load_from_path(&case_path).unwrap();
+        assert!(case.mask_path.is_none());
+        assert!(case.roi.is_none());
+
+        let target_path = repo_root.join(&case.target_image_path);
+        let target_bytes = read_regular_file_nofollow(&target_path, "spatial target").unwrap();
+        let target_img = decode_png_checked(&target_path, &target_bytes)
+            .unwrap()
+            .to_rgba8();
+        let baseline_img = case.expected_baseline_path.as_ref().map(|rel| {
+            let bp = repo_root.join(rel);
+            let bytes = read_regular_file_nofollow(&bp, "spatial baseline").unwrap();
+            decode_png_checked(&bp, &bytes).unwrap().to_rgba8()
+        });
+
+        let w = target_img.width();
+        let h = target_img.height();
+        let mut candidate = RgbaImage::new(w, h);
+        for y in 0..h {
+            let bg = if y < h / 2 { upper_bg } else { lower_bg };
+            for x in 0..w {
+                candidate.put_pixel(x, y, Rgba([bg[0], bg[1], bg[2], 255]));
+            }
+        }
+        if !case.expected_subject_bboxes.is_empty() {
+            let colors = [fg_a, fg_b];
+            for (idx, bbox) in case.expected_subject_bboxes.iter().enumerate() {
+                let rect = bbox.pixel_rect.unwrap();
+                let col = colors[idx % colors.len()];
+                for y in rect.y..rect.bottom() {
+                    for x in rect.x..rect.right() {
+                        candidate.put_pixel(x, y, Rgba([col[0], col[1], col[2], 255]));
+                    }
+                }
+            }
+        } else if let Some(line_roi) = case.expected_line_roi {
+            // Draw a crisp diagonal step edge across expected_line_roi.
+            for x in line_roi.x..line_roi.right() {
+                let t = (x - line_roi.x) as f64 / f64::from(line_roi.width.max(1));
+                let edge_y = line_roi.y as f64 + t * f64::from(line_roi.height.saturating_sub(1));
+                for y in (edge_y.round() as u32)..line_roi.bottom() {
+                    candidate.put_pixel(x, y, Rgba([fg_a[0], fg_a[1], fg_a[2], 255]));
+                }
+            }
+        }
+
+        let registry = LibraryRegistry::new(None, None);
+        let report = compute_case_deterministic_metrics(
+            &registry,
+            &case,
+            &target_img,
+            baseline_img.as_ref(),
+            None,
+            &candidate,
+        )
+        .expect("deterministic metrics succeed");
+
+        assert!(
+            report.passed,
+            "non-mask case '{}' must pass without 1-M untouched drift gating: {:?}",
+            case.id, report.notes
+        );
+        assert!(report.untouched_ssim.is_none());
+        assert!(report.untouched_drift.is_none());
+        assert!(report.boundary_discontinuity.is_none());
+        if !case.expected_subject_bboxes.is_empty() {
+            let align = report.spatial_alignment.expect("spatial alignment present");
+            assert!(align.mean_iou > 0.99);
+            assert!(align.max_height_ratio_error < 1e-3);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum CheckpointTamperMode {
+        OutputPngOutsideOutDir,
+        TrialJsonOutsideOutDir,
+        OutputPngSymlinkParent,
+        MismatchedSha256,
+    }
+
+    #[rstest]
+    #[case::output_png_outside_out_dir(CheckpointTamperMode::OutputPngOutsideOutDir)]
+    #[case::trial_json_outside_out_dir(CheckpointTamperMode::TrialJsonOutsideOutDir)]
+    #[case::output_png_symlink_parent(CheckpointTamperMode::OutputPngSymlinkParent)]
+    #[case::mismatched_sha256(CheckpointTamperMode::MismatchedSha256)]
+    #[tokio::test]
+    async fn tampered_checkpoint_state_is_rejected_and_not_skipped(
+        #[case] mode: CheckpointTamperMode,
+    ) {
+        let root = TempDir::new().unwrap();
+        let cases_dir = root.path().join("eval/cases");
+        let fixtures_dir = root.path().join("eval/fixtures");
+        let out_dir = root.path().join("eval/out");
+        let outside_dir = root.path().join("outside");
+        fs::create_dir_all(&cases_dir).unwrap();
+        fs::create_dir_all(&fixtures_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let target_img: RgbaImage = ImageBuffer::from_pixel(32, 32, Rgba([130, 140, 150, 255]));
+        write_png_file(&fixtures_dir.join("target.png"), &target_img);
+
+        fs::write(
+            cases_dir.join("c1.yaml"),
+            "schema_version: 1\nid: c1\ntitle: Checkpoint Case\nkind: edit_strategy\ntarget_image_path: eval/fixtures/target.png\nroi:\n  x: 8\n  y: 8\n  width: 16\n  height: 16\nprompt: adjust\nstrategies:\n  - whole_image_fix\ntrials: 1\n",
+        )
+        .unwrap();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let backend = ConcurrentTrackingBackend {
+            in_flight,
+            max_observed,
+            call_count: Arc::clone(&call_count),
+        };
+        let registry = LibraryRegistry::new(None, None);
+        let cfg = EvalRunConfig {
+            cases_dir,
+            base_root: Some(root.path().to_path_buf()),
+            out_dir: out_dir.clone(),
+            metrics_only: false,
+            max_concurrency: 1,
+            force: false,
+            filter_cases: Vec::new(),
+            filter_strategies: Vec::new(),
+            external_scorer: None,
+            external_scorer_timeout: Duration::from_secs(5),
+            contact_sheet_panel_px: 64,
+        };
+
+        let summary1 = execute_eval(Some(&backend), None, &registry, &cfg)
+            .await
+            .expect("initial eval succeeds");
+        assert_eq!(summary1.executed_trials, 1);
+
+        let state_path = out_dir.join("eval_state.json");
+        let mut state = load_eval_state(&state_path).unwrap();
+        let key = trial_checkpoint_key("c1", EvalStrategy::WholeImageFix, 1);
+        let rec = state.completed_trials.get_mut(&key).unwrap();
+
+        match mode {
+            CheckpointTamperMode::OutputPngOutsideOutDir => {
+                let outside_png = outside_dir.join("escaped.png");
+                fs::copy(&rec.output_png, &outside_png).unwrap();
+                rec.output_png = outside_png;
+            }
+            CheckpointTamperMode::TrialJsonOutsideOutDir => {
+                let outside_json = outside_dir.join("escaped.json");
+                fs::copy(&rec.trial_json, &outside_json).unwrap();
+                rec.trial_json = outside_json;
+            }
+            CheckpointTamperMode::OutputPngSymlinkParent => {
+                let outside_png = outside_dir.join("trial_001.png");
+                fs::copy(&rec.output_png, &outside_png).unwrap();
+                let sym_parent = out_dir.join("trials/sym_escape");
+                std::os::unix::fs::symlink(&outside_dir, &sym_parent).unwrap();
+                rec.output_png = sym_parent.join("trial_001.png");
+            }
+            CheckpointTamperMode::MismatchedSha256 => {
+                rec.output_sha256 = "0".repeat(64);
+            }
+        }
+
+        assert!(
+            !checkpoint_artifacts_exist(&out_dir, rec),
+            "tampered checkpoint ({mode:?}) must be rejected"
+        );
+        persist_eval_state(&state_path, &state).unwrap();
+
+        call_count.store(0, Ordering::SeqCst);
+        let summary2 = execute_eval(Some(&backend), None, &registry, &cfg)
+            .await
+            .expect("eval re-executes rejected checkpoint");
+        assert_eq!(summary2.resumed_skipped_trials, 0);
+        assert_eq!(summary2.executed_trials, 1);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
+    #[case::force_single_case_preserves_other_case(vec!["case-1".to_string()], Vec::new(), 2)]
+    #[case::force_single_case_and_strategy_preserves_rest(
+        vec!["case-1".to_string()],
+        vec![EvalStrategy::WholeImageFix],
+        1
+    )]
+    #[tokio::test]
+    async fn force_with_filters_preserves_unrelated_checkpoints_in_eval_state(
+        #[case] filter_cases: Vec<String>,
+        #[case] filter_strategies: Vec<EvalStrategy>,
+        #[case] expected_reexecuted: usize,
+    ) {
+        let root = TempDir::new().unwrap();
+        let cases_dir = root.path().join("eval/cases");
+        let fixtures_dir = root.path().join("eval/fixtures");
+        let out_dir = root.path().join("eval/out");
+        fs::create_dir_all(&cases_dir).unwrap();
+        fs::create_dir_all(&fixtures_dir).unwrap();
+
+        let target_img: RgbaImage = ImageBuffer::from_pixel(48, 48, Rgba([130, 140, 150, 255]));
+        write_png_file(&fixtures_dir.join("target.png"), &target_img);
+
+        for idx in 1..=2 {
+            fs::write(
+                cases_dir.join(format!("case_{idx}.yaml")),
+                format!(
+                    "schema_version: 1\nid: case-{idx}\ntitle: Case {idx}\nkind: edit_strategy\ntarget_image_path: eval/fixtures/target.png\nroi:\n  x: 12\n  y: 12\n  width: 20\n  height: 20\nprompt: adjust\nstrategies:\n  - whole_image_fix\n  - patch_crop_only\ntrials: 1\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let backend = ConcurrentTrackingBackend {
+            in_flight,
+            max_observed,
+            call_count: Arc::clone(&call_count),
+        };
+        let registry = LibraryRegistry::new(None, None);
+        let base_cfg = EvalRunConfig {
+            cases_dir,
+            base_root: Some(root.path().to_path_buf()),
+            out_dir: out_dir.clone(),
+            metrics_only: false,
+            max_concurrency: 2,
+            force: false,
+            filter_cases: Vec::new(),
+            filter_strategies: Vec::new(),
+            external_scorer: None,
+            external_scorer_timeout: Duration::from_secs(5),
+            contact_sheet_panel_px: 64,
+        };
+
+        let initial = execute_eval(Some(&backend), None, &registry, &base_cfg)
+            .await
+            .expect("initial 4-trial run succeeds");
+        assert_eq!(initial.executed_trials, 4);
+
+        call_count.store(0, Ordering::SeqCst);
+        let forced_cfg = EvalRunConfig {
+            force: true,
+            filter_cases,
+            filter_strategies,
+            ..base_cfg.clone()
+        };
+        let forced = execute_eval(Some(&backend), None, &registry, &forced_cfg)
+            .await
+            .expect("filtered force run succeeds");
+        assert_eq!(forced.executed_trials, expected_reexecuted);
+        assert_eq!(call_count.load(Ordering::SeqCst), expected_reexecuted);
+
+        let persisted = load_eval_state(&out_dir.join("eval_state.json")).unwrap();
+        assert_eq!(
+            persisted.completed_trials.len(),
+            4,
+            "unrelated checkpoints must remain in eval_state.json"
+        );
+
+        call_count.store(0, Ordering::SeqCst);
+        let resumed = execute_eval(Some(&backend), None, &registry, &base_cfg)
+            .await
+            .expect("subsequent unfiltered resume succeeds");
+        assert_eq!(resumed.resumed_skipped_trials, 4);
+        assert_eq!(resumed.executed_trials, 0);
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[rstest]
+    #[case::direct_symlink("sym_dir", false)]
+    #[case::single_missing_child_under_symlink("sym_dir/child", false)]
+    #[case::multi_level_missing_under_symlink("sym_dir/level1/level2/out", false)]
+    #[case::regular_file_ancestor("regular_file/nested/out", false)]
+    #[case::valid_multi_level_new_dir("real_dir/level1/level2/out", true)]
+    fn ensure_safe_output_dir_rejects_symlinked_ancestors_at_any_depth(
+        #[case] rel_target: &str,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("sym_dir")).unwrap();
+        fs::write(root.path().join("regular_file"), b"not-a-dir").unwrap();
+        fs::create_dir_all(root.path().join("real_dir")).unwrap();
+
+        let target = root.path().join(rel_target);
+        let res = ensure_safe_output_dir(&target);
+        assert_eq!(res.is_ok(), expect_ok, "result: {res:?}");
+        if !expect_ok {
+            assert_eq!(
+                fs::read_dir(outside.path()).unwrap().count(),
+                0,
+                "must not create directories through symlinked ancestor"
+            );
+        } else {
+            assert!(target.is_dir());
+        }
+    }
+
+    #[rstest]
+    #[case::zero_clamped_to_one(0, 1)]
+    #[case::extreme_clamped_to_max(usize::MAX, MAX_EVAL_MAX_CONCURRENCY)]
+    #[tokio::test]
+    async fn execute_eval_clamps_extreme_max_concurrency(
+        #[case] requested: usize,
+        #[case] expected_effective: usize,
+    ) {
+        let root = TempDir::new().unwrap();
+        let cases_dir = root.path().join("eval/cases");
+        let fixtures_dir = root.path().join("eval/fixtures");
+        let out_dir = root.path().join("eval/out");
+        fs::create_dir_all(&cases_dir).unwrap();
+        fs::create_dir_all(&fixtures_dir).unwrap();
+
+        let target_img: RgbaImage = ImageBuffer::from_pixel(32, 32, Rgba([130, 140, 150, 255]));
+        write_png_file(&fixtures_dir.join("target.png"), &target_img);
+        fs::write(
+            cases_dir.join("c1.yaml"),
+            "schema_version: 1\nid: c1\ntitle: Concurrency Case\nkind: edit_strategy\ntarget_image_path: eval/fixtures/target.png\nstrategies:\n  - whole_image_fix\ntrials: 1\n",
+        )
+        .unwrap();
+
+        let registry = LibraryRegistry::new(None, None);
+        let cfg = EvalRunConfig {
+            cases_dir,
+            base_root: Some(root.path().to_path_buf()),
+            out_dir,
+            metrics_only: true,
+            max_concurrency: requested,
+            ..EvalRunConfig::default()
+        };
+
+        let summary = execute_eval(None, None, &registry, &cfg)
+            .await
+            .expect("clamped max_concurrency must not panic");
+        assert_eq!(summary.max_concurrency, expected_effective);
+    }
+
+    #[rstest]
+    #[case::timeout_enforced_across_io("sleep 5", Duration::from_millis(100), false)]
+    #[case::large_stderr_drained_without_deadlock(
+        "cat >/dev/null; head -c 81920 /dev/zero | tr '\\0' 'e' >&2; printf '{\"passed\":true,\"score\":0.9}\\n'",
+        Duration::from_secs(5),
+        true
+    )]
+    #[tokio::test]
+    async fn external_scorer_enforces_single_timeout_and_drains_stderr(
+        #[case] body: &str,
+        #[case] timeout: Duration,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        let script = root.path().join("scorer.sh");
+        fs::write(&script, format!("#!/usr/bin/env bash\n{body}\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let req = ExternalScorerRequest {
+            case_id: "c1".to_string(),
+            strategy: EvalStrategy::PatchCropOnly,
+            trial: 1,
+            output_png: root.path().join("out.png"),
+            target_png: root.path().join("target.png"),
+            roi: None,
+            metrics: DeterministicMetricsReport {
+                untouched_ssim: None,
+                untouched_drift: None,
+                boundary_discontinuity: None,
+                line_straightness: None,
+                spatial_alignment: None,
+                color_qa: ColorQaReport {
+                    passed: true,
+                    exposure: None,
+                    palette_adherence: Vec::new(),
+                    untouched_drift: None,
+                    sparkle: None,
+                    max_delta_e2000: 0.0,
+                    notes: Vec::new(),
+                },
+                passed: true,
+                notes: Vec::new(),
+            },
+        };
+
+        let res = invoke_external_scorer(script.to_str().unwrap(), &req, timeout).await;
+        assert_eq!(res.is_ok(), expect_ok, "result: {res:?}");
     }
 }

@@ -29,9 +29,9 @@ use imgforge_core::{
     DEFAULT_COLLAR_WIDTH_PX, DEFAULT_EVAL_MAX_CONCURRENCY, DEFAULT_TOKEN_RING_HEX,
     DEFAULT_VTT_MAP_GRID_PX, DEFAULT_VTT_TOKEN_SIZE_PX, EvalRunConfig, EvalStrategy, ExportProfile,
     ExportRequest, ExportSource, ExposureQaConfig, GenerateRequest, GenerateSceneInput,
-    GenerationMode, GuideRenderer, GuideSpec, LibraryRegistry, Lifecycle, MAX_TEXT_FILE_BYTES,
-    ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi, PairwiseJudge, PaletteQaConfig,
-    PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect,
+    GenerationMode, GuideRenderer, GuideSpec, LibraryRegistry, Lifecycle, MAX_EVAL_MAX_CONCURRENCY,
+    MAX_TEXT_FILE_BYTES, ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi, PairwiseJudge,
+    PaletteQaConfig, PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect,
     ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore, SceneComposer,
     SceneSpec, SlicerConfig, SparkleConfig, SubjectRoiBinding, TraitCategory, TraitCheckInput,
     UntouchedDriftConfig, ValidateReferencePackRequest, ValidateRunRequest, Visibility,
@@ -533,7 +533,7 @@ struct EvalArgs {
     /// Run deterministic CV metrics only without invoking ImageBackend or VLM judge.
     #[arg(long)]
     metrics_only: bool,
-    /// Maximum concurrent generative/VLM evaluation jobs (clamped >= 1).
+    /// Maximum concurrent generative/VLM evaluation jobs (clamped to 1..=64).
     #[arg(long, default_value_t = DEFAULT_EVAL_MAX_CONCURRENCY)]
     max_concurrency: usize,
     /// Ignore existing eval_state.json checkpoints and re-run all selected tuples.
@@ -1882,7 +1882,7 @@ async fn main() -> anyhow::Result<()> {
                 base_root,
                 out_dir: args.out_dir,
                 metrics_only: args.metrics_only,
-                max_concurrency: args.max_concurrency.max(1),
+                max_concurrency: args.max_concurrency.clamp(1, MAX_EVAL_MAX_CONCURRENCY),
                 force: args.force,
                 filter_cases: args.cases,
                 filter_strategies: args.strategies.into_iter().map(Into::into).collect(),
