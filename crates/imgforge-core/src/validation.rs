@@ -469,7 +469,13 @@ pub async fn validate_reference_pack(
             )));
         }
 
-        let (sparkle_rep, _) = qa_engine.detect_sparkles(&rgba, None, &request.sparkle_config)?;
+        let w = rgba.width() as usize;
+        let h = rgba.height() as usize;
+        let mut strip_mask = vec![0.0f32; w * h];
+        let strip_start_y = (sheet.calibration_strip.strip_y as usize).min(h);
+        strip_mask[strip_start_y * w..].fill(1.0);
+        let (sparkle_rep, _) =
+            qa_engine.detect_sparkles(&rgba, Some(&strip_mask), &request.sparkle_config)?;
         if !sparkle_rep.passed {
             return Err(CoreError::ColorQaFailed(format!(
                 "sheet '{}' failed sparkle Color QA: {}",
@@ -479,12 +485,13 @@ pub async fn validate_reference_pack(
         }
 
         checks.push(format!(
-            "sheet '{}' OK ({}x{}, bg={:.1}%, swatches={}, 0 sparkles)",
+            "sheet '{}' OK ({}x{}, bg={:.1}%, swatches={}, {} sparkles)",
             sheet.filename,
             structural.width,
             structural.height,
             structural.bg_coverage * 100.0,
-            sheet.calibration_strip.palette_swatch_cells.len()
+            sheet.calibration_strip.palette_swatch_cells.len(),
+            sparkle_rep.flagged_blobs.len()
         ));
     }
 
@@ -1069,6 +1076,114 @@ visibility: public
                 assert!(matches!(err, CoreError::VisibilityViolation { .. }))
             }
             _ => unreachable!(),
+        }
+    }
+
+    #[rstest]
+    #[case::bright_yellow_swatch_and_strip_artifacts_masked_out(false, true)]
+    #[case::excessive_upper_sheet_sparkles_fail_closed(true, false)]
+    #[tokio::test]
+    async fn validate_reference_pack_masks_calibration_strip_from_sparkle_qa(
+        #[case] add_upper_sparkles: bool,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        let ws = root.path();
+        let library_dir = ws.join("library");
+        let subj_dir = library_dir.join("subjects/sun-herald");
+        fs::create_dir_all(&subj_dir).unwrap();
+        fs::write(
+            subj_dir.join("card.yaml"),
+            r##"schema_version: 1
+kind: prop
+slug: sun-herald
+display_name: Sun Herald
+exclusive_surface_map:
+  bindings:
+    - slot: emblem
+      material: enamel
+      color_hex: "#FFF014"
+palette_lock:
+  swatches:
+    - name: bright-yellow
+      color_hex: "#FFF014"
+      surface_slot: emblem
+visibility: public
+"##,
+        )
+        .unwrap();
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let pipeline =
+            ReferencePackPipeline::new(&MockPackBackend, &registry, None, library_dir.clone());
+        pipeline
+            .generate(&ReferencePackRequest::new(
+                "sun-herald",
+                "franco-belgian-line",
+            ))
+            .await
+            .unwrap();
+
+        let pack_dir = library_dir.join("subjects/sun-herald/packs/franco-belgian-line");
+        let pack_path = pack_dir.join("pack.json");
+        let mut manifest: ReferencePackManifest =
+            serde_json::from_slice(&fs::read(&pack_path).unwrap()).unwrap();
+
+        let first_sheet = &mut manifest.sheets[0];
+        let sheet_path = pack_dir.join(&first_sheet.filename);
+        let mut rgba = image::open(&sheet_path).unwrap().to_rgba8();
+        let strip_y = first_sheet.calibration_strip.strip_y;
+        for dy in 0..3 {
+            for dx in 0..3 {
+                rgba.put_pixel(1400 + dx, strip_y + 12 + dy, Rgba([255, 240, 20, 255]));
+            }
+        }
+        if add_upper_sparkles {
+            for i in 0..20u32 {
+                let bx = 40 + (i % 10) * 32;
+                let by = 40 + (i / 10) * 32;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        rgba.put_pixel(bx + dx, by + dy, Rgba([255, 240, 20, 255]));
+                    }
+                }
+            }
+        }
+        let mut updated_png = Vec::new();
+        DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut Cursor::new(&mut updated_png), ImageFormat::Png)
+            .unwrap();
+        write_atomic(&sheet_path, &updated_png, &first_sheet.filename).unwrap();
+        first_sheet.sha256 = sha256_hex(&updated_png);
+        write_atomic(
+            &pack_path,
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+            "pack.json",
+        )
+        .unwrap();
+
+        let res = validate_reference_pack(
+            &library_dir,
+            &registry,
+            None,
+            &ValidateReferencePackRequest::new("sun-herald", "franco-belgian-line"),
+        )
+        .await;
+        assert_eq!(res.is_ok(), expect_ok, "result: {:?}", res);
+        if expect_ok {
+            let val = res.unwrap();
+            assert_eq!(val.manifest.lifecycle, Lifecycle::Validated);
+            assert!(
+                val.checks.iter().any(|c| c.contains("0 sparkles")),
+                "expected 0 sparkles check in {:?}",
+                val.checks
+            );
+        } else {
+            let err = res.unwrap_err();
+            assert!(
+                matches!(err, CoreError::ColorQaFailed(_)),
+                "expected ColorQaFailed, got {err:?}"
+            );
         }
     }
 }

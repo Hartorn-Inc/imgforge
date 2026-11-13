@@ -57,6 +57,12 @@ pub const DEFAULT_SPARKLE_MIN_AREA_PX: usize = 1;
 /// Default maximum area (inclusive) for sparkle/yellow-dot blob detection.
 pub const DEFAULT_SPARKLE_MAX_AREA_PX: usize = 64;
 
+/// Default maximum fraction (`0.1%`) of non-allowed pixels that may be flagged by sparkle QA.
+pub const DEFAULT_SPARKLE_MAX_FLAGGED_FRACTION: f64 = 0.001;
+
+/// Default maximum count of isolated yellow-sparkle blobs allowed before failing.
+pub const DEFAULT_SPARKLE_MAX_FLAGGED_BLOBS: usize = 16;
+
 /// Default bin count (`20` bins of width `5.0` covering CIE `L*` `0..=100`).
 pub const DEFAULT_L_STAR_HISTOGRAM_BINS: usize = 20;
 
@@ -383,20 +389,26 @@ pub struct SparkleConfig {
     pub dog_sigma_small: f64,
     /// Outer Gaussian blur sigma (`2.4 px`).
     pub dog_sigma_large: f64,
-    /// Minimum positive DoG yellow-excess residual (`0.06`).
+    /// Minimum positive DoG yellow-excess residual (`0.20`).
     pub min_dog_residual: f64,
-    /// Minimum CIELAB `b*` coordinate (`22.0`) indicating yellow bias.
+    /// Minimum CIE `L*` luminance (`78.0`) isolating bright sparkles from warm brown/gold shading.
+    pub min_yellow_l_star: f64,
+    /// Minimum CIELAB `b*` coordinate (`55.0`) indicating yellow bias.
     pub min_yellow_b_star: f64,
-    /// Minimum CIELAB chroma `C*` (`28.0`) indicating saturated yellow.
+    /// Minimum CIELAB chroma `C*` (`60.0`) indicating saturated yellow.
     pub min_yellow_chroma: f64,
-    /// Minimum CIELAB hue angle in degrees (`60.0`) for yellow sector.
+    /// Minimum CIELAB hue angle in degrees (`72.0`) for yellow sector.
     pub yellow_hue_min_deg: f64,
-    /// Maximum CIELAB hue angle in degrees (`125.0`) for yellow sector.
+    /// Maximum CIELAB hue angle in degrees (`115.0`) for yellow sector.
     pub yellow_hue_max_deg: f64,
     /// Minimum connected blob area in pixels (`1`).
     pub min_blob_area_px: usize,
     /// Maximum connected blob area in pixels (`64`).
     pub max_blob_area_px: usize,
+    /// Maximum fraction (`0.001`, i.e., `0.1%`) of non-allowed pixels flagged before failing.
+    pub max_flagged_fraction: f64,
+    /// Maximum count of isolated yellow-sparkle blobs (`16`) allowed before failing.
+    pub max_flagged_blobs: usize,
 }
 
 impl Default for SparkleConfig {
@@ -404,13 +416,16 @@ impl Default for SparkleConfig {
         Self {
             dog_sigma_small: 0.8,
             dog_sigma_large: 2.4,
-            min_dog_residual: 0.06,
-            min_yellow_b_star: 22.0,
-            min_yellow_chroma: 28.0,
-            yellow_hue_min_deg: 60.0,
-            yellow_hue_max_deg: 125.0,
+            min_dog_residual: 0.20,
+            min_yellow_l_star: 78.0,
+            min_yellow_b_star: 55.0,
+            min_yellow_chroma: 60.0,
+            yellow_hue_min_deg: 72.0,
+            yellow_hue_max_deg: 115.0,
             min_blob_area_px: DEFAULT_SPARKLE_MIN_AREA_PX,
             max_blob_area_px: DEFAULT_SPARKLE_MAX_AREA_PX,
+            max_flagged_fraction: DEFAULT_SPARKLE_MAX_FLAGGED_FRACTION,
+            max_flagged_blobs: DEFAULT_SPARKLE_MAX_FLAGGED_BLOBS,
         }
     }
 }
@@ -429,7 +444,7 @@ pub struct SparkleBlob {
 /// Pass/fail report from the high-pass DoG yellow-sparkle detector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparkleReport {
-    /// `true` when zero isolated yellow-dot blobs are flagged outside allowed masks.
+    /// `true` when zero isolated yellow-dot blobs are flagged or counts remain within tolerance.
     pub passed: bool,
     /// Flagged connected yellow-dot blobs.
     pub flagged_blobs: Vec<SparkleBlob>,
@@ -968,42 +983,87 @@ impl ColorQaEngine {
         let blur_large = gaussian_blur_2d(&yellow_excess, w, h, config.dog_sigma_large);
 
         let mut candidate = vec![false; total];
+        let mut is_yellow_pixel = vec![false; total];
         let mut residual_map = vec![0.0f64; total];
+        let mut non_allowed_pixels = 0usize;
 
         for y in 0..h {
             for x in 0..w {
                 let idx = y * w + x;
+                let px = image.get_pixel(x as u32, y as u32).0;
+                if px[3] == 0 {
+                    continue;
+                }
+                let lab = srgb_u8_to_lab([px[0], px[1], px[2]]);
+                let chroma = lab_chroma(lab);
+                let hue = lab_hue_deg(lab);
+                let is_yellow = f64::from(lab.l) >= config.min_yellow_l_star
+                    && f64::from(lab.b) >= config.min_yellow_b_star
+                    && chroma >= config.min_yellow_chroma
+                    && hue >= config.yellow_hue_min_deg
+                    && hue <= config.yellow_hue_max_deg;
+                is_yellow_pixel[idx] = is_yellow;
+
                 if let Some(mask) = allowed_mask
                     && mask[idx] > 0.5
                 {
                     continue;
                 }
-                let px = image.get_pixel(x as u32, y as u32).0;
-                if px[3] == 0 {
+                non_allowed_pixels += 1;
+
+                if !is_yellow {
                     continue;
                 }
                 let dog = (blur_small[idx] - blur_large[idx]).max(0.0);
-                if dog < config.min_dog_residual {
-                    continue;
-                }
-
-                let lab = srgb_u8_to_lab([px[0], px[1], px[2]]);
-                let chroma = lab_chroma(lab);
-                let hue = lab_hue_deg(lab);
-                if f64::from(lab.b) >= config.min_yellow_b_star
-                    && chroma >= config.min_yellow_chroma
-                    && hue >= config.yellow_hue_min_deg
-                    && hue <= config.yellow_hue_max_deg
-                {
+                if dog >= config.min_dog_residual {
                     candidate[idx] = true;
                     residual_map[idx] = dog;
                 }
             }
         }
 
+        // Suppress high-pass corner/edge candidates belonging to large yellow regions
+        // (> max_blob_area_px) so corners of valid yellow garments/props are not split into
+        // spurious small corner blobs.
+        let mut yellow_visited = vec![false; total];
+        let mut queue = VecDeque::new();
+        for sy in 0..h {
+            for sx in 0..w {
+                let start = sy * w + sx;
+                if !is_yellow_pixel[start] || yellow_visited[start] {
+                    continue;
+                }
+                yellow_visited[start] = true;
+                queue.push_back((sx, sy));
+                let mut coords = Vec::new();
+                while let Some((cx, cy)) = queue.pop_front() {
+                    let cidx = cy * w + cx;
+                    coords.push(cidx);
+                    let y0 = cy.saturating_sub(1);
+                    let y1 = (cy + 1).min(h - 1);
+                    let x0 = cx.saturating_sub(1);
+                    let x1 = (cx + 1).min(w - 1);
+                    for ny in y0..=y1 {
+                        for nx in x0..=x1 {
+                            let nidx = ny * w + nx;
+                            if is_yellow_pixel[nidx] && !yellow_visited[nidx] {
+                                yellow_visited[nidx] = true;
+                                queue.push_back((nx, ny));
+                            }
+                        }
+                    }
+                }
+                if coords.len() > config.max_blob_area_px {
+                    for cidx in coords {
+                        candidate[cidx] = false;
+                        residual_map[cidx] = 0.0;
+                    }
+                }
+            }
+        }
+
         // Connected component labeling (8-connected) to isolate 1..=64 px^2 blobs.
         let mut visited = vec![false; total];
-        let mut queue = VecDeque::new();
         let mut flagged_blobs = Vec::new();
         let mut flagged_pixel_mask = vec![0.0f64; total];
         let mut total_flagged_pixels = 0usize;
@@ -1068,17 +1128,29 @@ impl ColorQaEngine {
             }
         }
 
+        let flagged_fraction = if non_allowed_pixels > 0 {
+            total_flagged_pixels as f64 / non_allowed_pixels as f64
+        } else {
+            0.0
+        };
+        let passed = total_flagged_pixels == 0
+            || (flagged_fraction <= config.max_flagged_fraction
+                && flagged_blobs.len() <= config.max_flagged_blobs);
+
         let mut reasons = Vec::new();
-        if !flagged_blobs.is_empty() {
+        if !passed {
             reasons.push(format!(
-                "detected {} isolated yellow-sparkle blob(s) ({total_flagged_pixels} px^2 total) outside allowed masks",
-                flagged_blobs.len()
+                "detected {} isolated yellow-sparkle blob(s) ({total_flagged_pixels} px^2, {:.4}% of non-allowed pixels) outside allowed masks (max {:.4}%, max {} blobs)",
+                flagged_blobs.len(),
+                flagged_fraction * 100.0,
+                config.max_flagged_fraction * 100.0,
+                config.max_flagged_blobs
             ));
         }
 
         Ok((
             SparkleReport {
-                passed: flagged_blobs.is_empty(),
+                passed,
                 flagged_blobs,
                 total_flagged_pixels,
                 reasons,
@@ -1157,7 +1229,10 @@ impl ColorQaEngine {
                 passed = false;
                 notes.extend(rep.reasons.iter().cloned());
             } else {
-                notes.push("sparkle detector OK (0 blobs)".to_string());
+                notes.push(format!(
+                    "sparkle detector OK ({} blobs)",
+                    rep.flagged_blobs.len()
+                ));
             }
             Some(rep)
         } else {
@@ -1847,6 +1922,48 @@ mod tests {
         let decoded = image::load_from_memory(&heatmap_png).unwrap().to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 0]);
         assert!(decoded.get_pixel(12, 12).0[3] > 0);
+    }
+
+    #[rstest]
+    #[case::warm_brown_leather_thin_strokes_pass(64, 64, [0x9A, 0x6D, 0x45], 4, 2, 12, true)]
+    #[case::warm_tan_gold_thin_strokes_pass(64, 64, [0xB6, 0x81, 0x44], 4, 2, 12, true)]
+    #[case::brass_gold_collar_trim_passes(64, 64, [0xD4, 0xA8, 0x43], 4, 2, 12, true)]
+    #[case::single_incidental_highlight_on_large_canvas_passes(512, 512, [255, 240, 20], 1, 5, 5, true)]
+    #[case::sparkle_creep_above_max_fraction_on_large_canvas_fails(512, 512, [255, 240, 20], 10, 6, 6, false)]
+    #[case::widespread_sparkle_creep_above_max_blobs_fails(512, 512, [255, 240, 20], 20, 3, 3, false)]
+    fn sparkle_detector_calibrates_warm_shading_vs_yellow_sparkle_creep(
+        #[case] width: u32,
+        #[case] height: u32,
+        #[case] rgb: [u8; 3],
+        #[case] blob_count: usize,
+        #[case] blob_w: u32,
+        #[case] blob_h: u32,
+        #[case] expect_ok: bool,
+    ) {
+        let engine = ColorQaEngine::new();
+        let mut img = solid_image(width, height, [37, 40, 48]);
+        for i in 0..blob_count {
+            let x = 16 + ((i % 8) as u32) * 24;
+            let y = 16 + ((i / 8) as u32) * 24;
+            paint_rect(&mut img, x, y, blob_w, blob_h, rgb);
+        }
+
+        let (report, _) = engine
+            .detect_sparkles(&img, None, &SparkleConfig::default())
+            .expect("sparkle detection succeeds");
+        assert_eq!(
+            report.passed, expect_ok,
+            "blobs: {:?}, reasons: {:?}",
+            report.flagged_blobs, report.reasons
+        );
+        if rgb != [255, 240, 20] {
+            assert!(
+                report.flagged_blobs.is_empty(),
+                "warm brown/gold shading {:?} must produce 0 flagged blobs, got {:?}",
+                rgb,
+                report.flagged_blobs
+            );
+        }
     }
 
     #[rstest]
