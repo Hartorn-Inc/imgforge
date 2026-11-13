@@ -245,6 +245,22 @@ pub fn validate_reference_sheet_structure(
     })
 }
 
+/// Compute exact horizontal width required to render `total_cells` calibration cells.
+fn required_strip_width(
+    total_cells: usize,
+    margin_x: u32,
+    cell_size: u32,
+    gap: u32,
+    group_gap: u32,
+) -> u64 {
+    let n = total_cells as u64;
+    let gaps = n.saturating_sub(2);
+    u64::from(margin_x) * 2
+        + n.saturating_mul(u64::from(cell_size))
+        + gaps.saturating_mul(u64::from(gap))
+        + u64::from(group_gap)
+}
+
 /// Composite the deterministic `#252830` bottom calibration strip onto an in-memory `RgbaImage`.
 ///
 /// Renders a 6-step `L*` neutral gray wedge (`48x48 px` when fitting in `width`) followed
@@ -268,25 +284,46 @@ pub fn composite_calibration_strip(
     let total_cells = wedge.len() + palette_lock.swatches.len();
 
     // Use exact 48x48 cells whenever they fit inside the sheet width; otherwise scale cells
-    // proportionally so arbitrary swatch counts never clip or panic.
-    let required_48 = margin_x * 2
-        + (total_cells as u32) * CALIBRATION_CELL_SIZE_PX
-        + ((total_cells.saturating_sub(2)) as u32) * gap
-        + group_gap;
-    let cell_size = if required_48 <= width {
-        CALIBRATION_CELL_SIZE_PX
+    // down to at least 8 px and fail closed if the required strip width still exceeds `width`.
+    let required_48 = required_strip_width(
+        total_cells,
+        margin_x,
+        CALIBRATION_CELL_SIZE_PX,
+        gap,
+        group_gap,
+    );
+    let (cell_size, effective_gap, effective_group_gap) = if required_48 <= u64::from(width) {
+        (CALIBRATION_CELL_SIZE_PX, gap, group_gap)
     } else {
-        let usable =
-            width.saturating_sub(margin_x * 2 + ((total_cells.saturating_sub(2)) as u32) * 4 + 12);
-        (usable / (total_cells as u32).max(1)).clamp(8, CALIBRATION_CELL_SIZE_PX)
+        let compact_gap = 4u32;
+        let compact_group_gap = 12u32;
+        let fixed_overhead = u64::from(margin_x) * 2
+            + (total_cells as u64).saturating_sub(2) * u64::from(compact_gap)
+            + u64::from(compact_group_gap);
+        let usable = u64::from(width).saturating_sub(fixed_overhead);
+        let scaled =
+            ((usable / (total_cells as u64).max(1)) as u32).clamp(8, CALIBRATION_CELL_SIZE_PX);
+        (scaled, compact_gap, compact_group_gap)
     };
-    let effective_gap = if required_48 <= width { gap } else { 4 };
-    let effective_group_gap = if required_48 <= width { group_gap } else { 12 };
+
+    let required_width = required_strip_width(
+        total_cells,
+        margin_x,
+        cell_size,
+        effective_gap,
+        effective_group_gap,
+    );
+    if required_width > u64::from(width) {
+        return Err(CoreError::ReferencePackFailed(format!(
+            "calibration strip requires {required_width}px width for {total_cells} cells (cell_size={cell_size}px), exceeding sheet width {width}px"
+        )));
+    }
+
     let pad_y = 12u32;
     let strip_height = cell_size + pad_y * 2;
-    if height <= strip_height || width < margin_x * 2 + cell_size {
+    if height <= strip_height {
         return Err(CoreError::ReferencePackFailed(format!(
-            "sheet {width}x{height} is too small for calibration strip ({strip_height}px tall)"
+            "sheet {width}x{height} is too short for calibration strip ({strip_height}px tall)"
         )));
     }
     let strip_y = height - strip_height;
@@ -496,5 +533,29 @@ mod tests {
             &StructuralValidationConfig::default(),
         );
         assert_eq!(res.is_ok(), expect_ok);
+    }
+
+    #[rstest]
+    #[case::excessive_swatch_count_on_standard_sheet(1536, 1024, 140)]
+    #[case::narrow_sheet_with_multiple_swatches(128, 256, 8)]
+    #[case::too_narrow_even_for_minimum_cells(96, 256, 1)]
+    fn composite_calibration_strip_fails_closed_without_panicking_when_width_exceeded(
+        #[case] width: u32,
+        #[case] height: u32,
+        #[case] swatch_count: usize,
+    ) {
+        let raw_png = make_sheet_png(width, height, STUDIO_BG_RGB, Some((32, 32, [180, 120, 90])));
+        let swatches = (0..swatch_count)
+            .map(|idx| PaletteSwatch {
+                name: format!("swatch_{idx}"),
+                color_hex: "#2C3E50".to_string(),
+                surface_slot: None,
+            })
+            .collect();
+        let palette_lock = PaletteLock { swatches };
+
+        let err = composite_calibration_strip_png(&raw_png, &palette_lock)
+            .expect_err("overflowing calibration strip must fail closed");
+        assert!(matches!(err, CoreError::ReferencePackFailed(_)));
     }
 }

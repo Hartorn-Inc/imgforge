@@ -22,18 +22,13 @@
 //! 3. Any backward, skipped, or post-`Superseded` transition fails closed with
 //!    `CoreError::LifecycleTransitionInvalid`.
 
-use std::fs::{self, OpenOptions};
-use std::io::Read;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::backend::PNG_SIGNATURE;
 use crate::error::CoreError;
 
 /// Strict five-state asset lifecycle progression (`GLOSSARY.md`).
@@ -138,36 +133,6 @@ pub struct SeedInput {
     pub label: Option<String>,
 }
 
-impl SeedInput {
-    /// Load and validate a `SeedInput` from a regular non-symlink PNG file on disk.
-    pub fn from_png_path(path: &Path, label: Option<String>) -> Result<Self, CoreError> {
-        let bytes = read_regular_png_bytes_nofollow(path)?;
-        if bytes.len() < PNG_SIGNATURE.len() || bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
-            return Err(CoreError::InvalidPng {
-                path: path.to_path_buf(),
-                reason: "SeedInput file does not start with valid 8-byte PNG signature".to_string(),
-            });
-        }
-        image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).map_err(|err| {
-            CoreError::InvalidPng {
-                path: path.to_path_buf(),
-                reason: format!("SeedInput PNG decode failed: {err}"),
-            }
-        })?;
-
-        let sha256 = sha256_hex(&bytes);
-        let cleaned_label = label
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            sha256,
-            label: cleaned_label,
-        })
-    }
-}
-
 /// Compute lowercase hexadecimal SHA-256 digest of `bytes`.
 #[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -226,88 +191,9 @@ pub(crate) fn normalize_hex_color(raw: &str, field_name: &str) -> Result<String,
     Ok(trimmed.to_ascii_uppercase())
 }
 
-/// Read a regular non-symlink file using `O_NOFOLLOW` on Unix to prevent symlink races.
-pub(crate) fn read_regular_file_nofollow(
-    path: &Path,
-    context_label: &str,
-) -> Result<Vec<u8>, CoreError> {
-    let lstat_meta = fs::symlink_metadata(path).map_err(|err| CoreError::Io {
-        context: format!("inspecting {context_label} at {}", path.display()),
-        source: err,
-    })?;
-    if lstat_meta.file_type().is_symlink() || !lstat_meta.is_file() {
-        return Err(CoreError::Io {
-            context: format!("reading {context_label} at {}", path.display()),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("refusing symlink or non-regular {context_label}"),
-            ),
-        });
-    }
-
-    #[cfg(unix)]
-    {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|err| CoreError::Io {
-                context: format!("opening {context_label} at {}", path.display()),
-                source: err,
-            })?;
-        let meta = file.metadata().map_err(|err| CoreError::Io {
-            context: format!("inspecting opened {context_label} at {}", path.display()),
-            source: err,
-        })?;
-        if !meta.is_file() {
-            return Err(CoreError::Io {
-                context: format!("reading {context_label} at {}", path.display()),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("{context_label} is not a regular file"),
-                ),
-            });
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|err| CoreError::Io {
-            context: format!("reading {context_label} at {}", path.display()),
-            source: err,
-        })?;
-        Ok(bytes)
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::read(path).map_err(|err| CoreError::Io {
-            context: format!("reading {context_label} at {}", path.display()),
-            source: err,
-        })
-    }
-}
-
-fn read_regular_png_bytes_nofollow(path: &Path) -> Result<Vec<u8>, CoreError> {
-    let lstat_meta = fs::symlink_metadata(path).map_err(|err| CoreError::Io {
-        context: format!("inspecting PNG at {}", path.display()),
-        source: err,
-    })?;
-    if lstat_meta.file_type().is_symlink() || !lstat_meta.is_file() {
-        return Err(CoreError::InvalidPng {
-            path: path.to_path_buf(),
-            reason: "refusing symlink or non-regular PNG file".to_string(),
-        });
-    }
-    read_regular_file_nofollow(path, "PNG file")
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    #[cfg(unix)]
-    use std::os::unix::fs::symlink;
-
-    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use rstest::rstest;
-    use tempfile::TempDir;
 
     use super::*;
 
@@ -350,32 +236,6 @@ mod tests {
     fn enforces_canonical_immutability_guard(#[case] state: Lifecycle, #[case] expect_ok: bool) {
         let res = state.ensure_mutable("run:courier-ren/v001");
         assert_eq!(res.is_ok(), expect_ok);
-    }
-
-    #[test]
-    fn seed_input_computes_sha256_and_rejects_symlinks() {
-        let dir = TempDir::new().expect("tempdir");
-        let seed_path = dir.path().join("seed.png");
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_pixel(32, 32, Rgba([100, 120, 140, 255]));
-        let mut buf = Vec::new();
-        DynamicImage::ImageRgba8(img)
-            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
-            .unwrap();
-        fs::write(&seed_path, &buf).unwrap();
-
-        let seed =
-            SeedInput::from_png_path(&seed_path, Some("parchment-portrait".to_string())).unwrap();
-        assert_eq!(seed.sha256, sha256_hex(&buf));
-        assert_eq!(seed.label.as_deref(), Some("parchment-portrait"));
-
-        #[cfg(unix)]
-        {
-            let link = dir.path().join("seed_link.png");
-            symlink(&seed_path, &link).unwrap();
-            let err = SeedInput::from_png_path(&link, None).expect_err("symlink seed rejected");
-            assert!(matches!(err, CoreError::InvalidPng { .. }));
-        }
     }
 
     #[rstest]

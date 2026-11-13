@@ -86,7 +86,7 @@ pub use slicer::{
     SlicesManifest, slice_sheet_image, slice_sheet_to_dir,
 };
 pub use store::{
-    MANIFEST_LOCK_FILENAME, ManifestEntityKind, ManifestEntry, ManifestLock, ManifestLockStore,
+    MANIFEST_LOCK_FILENAME, ManifestEntry, ManifestEntryKind, ManifestLock, ManifestLockStore,
     RecordRunParams, RecordedRun, RunBackendMetadata, RunMetadata, RunQaReports, RunStore,
 };
 pub use style::{MAX_STYLE_EXEMPLARS, MIN_STYLE_EXEMPLARS, Style};

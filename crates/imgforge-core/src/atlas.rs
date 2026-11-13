@@ -21,7 +21,6 @@
 //!    verifying zero clipping and zero overlap.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -31,10 +30,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::calibration::STUDIO_BG_RGBA;
 use crate::error::CoreError;
-use crate::lifecycle::read_regular_file_nofollow;
 use crate::registry::LibraryRegistry;
 use crate::scene_spec::{MAX_FOREGROUND_SLOTS, Visibility, check_visibility_compatibility};
 use crate::slicer::{PixelRect, SlicesManifest};
+use crate::store::{
+    read_regular_file_nofollow, validate_strict_relative_path, verify_contained_path_no_symlinks,
+};
 
 /// Maximum number of distinct focal `Subject`s allowed in a single `Atlas`.
 pub const MAX_ATLAS_SUBJECTS: usize = MAX_FOREGROUND_SLOTS;
@@ -188,12 +189,22 @@ pub fn pack_dynamic_atlas(
             )],
         )?;
 
-        let pack_dir = library_dir
-            .join("subjects")
+        let rel_pack_dir = Path::new("subjects")
             .join(&resolved_subject.subject.slug)
             .join("packs")
             .join(&sel.style_slug);
-        let slices_json_path = pack_dir.join("slices.json");
+        let pack_dir = verify_contained_path_no_symlinks(
+            library_dir,
+            &rel_pack_dir,
+            true,
+            "ReferencePack directory",
+        )?;
+        let slices_json_path = verify_contained_path_no_symlinks(
+            &pack_dir,
+            Path::new("slices.json"),
+            false,
+            "ReferencePack slices.json",
+        )?;
         let manifest_bytes =
             read_regular_file_nofollow(&slices_json_path, "ReferencePack slices.json").map_err(
                 |err| {
@@ -217,11 +228,6 @@ pub fn pack_dynamic_atlas(
             .map(|r| (r.id.as_str(), r))
             .collect();
 
-        let canonical_pack_dir = fs::canonicalize(&pack_dir).map_err(|err| CoreError::Io {
-            context: format!("canonicalizing pack directory {}", pack_dir.display()),
-            source: err,
-        })?;
-
         let mut seen_slices = HashSet::with_capacity(sel.slice_ids.len());
         for slice_id in &sel.slice_ids {
             if !seen_slices.insert(slice_id.as_str()) {
@@ -236,19 +242,16 @@ pub fn pack_dynamic_atlas(
                     sel.subject_slug, sel.style_slug
                 ))
             })?;
-            let slice_path = pack_dir.join(&record.file);
-            let canonical_slice = fs::canonicalize(&slice_path).map_err(|err| {
-                CoreError::AtlasPackFailed(format!(
-                    "missing slice PNG '{}' for '{slice_id}': {err}",
-                    slice_path.display()
-                ))
-            })?;
-            if !canonical_slice.starts_with(&canonical_pack_dir) {
-                return Err(CoreError::AtlasPackFailed(format!(
-                    "slice path '{}' escapes pack directory",
-                    record.file
-                )));
-            }
+            let rel_slice = validate_strict_relative_path(&record.file, "slice file")
+                .map_err(CoreError::AtlasPackFailed)?;
+            let slice_path =
+                verify_contained_path_no_symlinks(&pack_dir, &rel_slice, false, "slice PNG")
+                    .map_err(|err| {
+                        CoreError::AtlasPackFailed(format!(
+                            "invalid slice path '{}' for '{slice_id}': {err}",
+                            record.file
+                        ))
+                    })?;
 
             let png_bytes = read_regular_file_nofollow(&slice_path, "slice PNG")?;
             let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)
@@ -398,6 +401,10 @@ fn verify_page_placements(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
     use rstest::rstest;
     use tempfile::TempDir;
 
@@ -637,5 +644,112 @@ visibility: {visibility}
         let err = pack_dynamic_atlas(&registry, &library_dir, &req)
             .expect_err("visibility leak must fail closed");
         assert!(matches!(err, CoreError::VisibilityViolation { .. }));
+    }
+
+    #[rstest]
+    #[case::parent_dir_traversal("../outside.png")]
+    #[case::backslash_path("slices\\s1.png")]
+    #[case::absolute_path("/tmp/outside.png")]
+    #[case::cur_dir_path("./slices/s1.png")]
+    fn rejects_unsafe_slice_record_paths_in_atlas(#[case] bad_file: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let library_dir = root.path().join("library");
+        seed_subject_and_slices(
+            &library_dir,
+            "courier-ren",
+            "franco-belgian-line",
+            "public",
+            &[("s1", 64, 64, [150, 150, 150])],
+        );
+
+        let outside_img: RgbaImage = ImageBuffer::from_pixel(64, 64, Rgba([200, 100, 100, 255]));
+        let mut buf = Vec::new();
+        DynamicImage::ImageRgba8(outside_img)
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        fs::write(
+            library_dir.join("subjects/courier-ren/packs/outside.png"),
+            buf,
+        )
+        .unwrap();
+
+        let slices_json_path =
+            library_dir.join("subjects/courier-ren/packs/franco-belgian-line/slices.json");
+        let mut manifest: SlicesManifest =
+            serde_json::from_slice(&fs::read(&slices_json_path).unwrap()).unwrap();
+        manifest.slices[0].file = bad_file.to_string();
+        fs::write(
+            &slices_json_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let req = AtlasPackRequest::new(
+            vec![AtlasSliceSelection {
+                subject_slug: "courier-ren".to_string(),
+                style_slug: "franco-belgian-line".to_string(),
+                slice_ids: vec!["s1".to_string()],
+            }],
+            Visibility::Public,
+        );
+        let err = pack_dynamic_atlas(&registry, &library_dir, &req)
+            .expect_err("unsafe record.file path must fail closed");
+        assert!(matches!(err, CoreError::AtlasPackFailed(_)));
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::symlinked_pack_dir("pack_dir")]
+    #[case::symlinked_slices_dir("slices_dir")]
+    #[case::symlinked_slice_file("slice_file")]
+    fn rejects_symlink_escapes_in_atlas(#[case] mode: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let library_dir = root.path().join("library");
+        seed_subject_and_slices(
+            &library_dir,
+            "courier-ren",
+            "franco-belgian-line",
+            "public",
+            &[("s1", 64, 64, [150, 150, 150])],
+        );
+
+        let pack_dir = library_dir.join("subjects/courier-ren/packs/franco-belgian-line");
+        let escape_dir = root.path().join("escape_pack");
+        fs::create_dir_all(&escape_dir).unwrap();
+
+        match mode {
+            "pack_dir" => {
+                fs::rename(&pack_dir, escape_dir.join("real_pack")).unwrap();
+                symlink(escape_dir.join("real_pack"), &pack_dir).unwrap();
+            }
+            "slices_dir" => {
+                let slices_dir = pack_dir.join("slices");
+                fs::rename(&slices_dir, escape_dir.join("real_slices")).unwrap();
+                symlink(escape_dir.join("real_slices"), &slices_dir).unwrap();
+            }
+            "slice_file" => {
+                let slice_file = pack_dir.join("slices/s1.png");
+                fs::rename(&slice_file, escape_dir.join("real_s1.png")).unwrap();
+                symlink(escape_dir.join("real_s1.png"), &slice_file).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let req = AtlasPackRequest::new(
+            vec![AtlasSliceSelection {
+                subject_slug: "courier-ren".to_string(),
+                style_slug: "franco-belgian-line".to_string(),
+                slice_ids: vec!["s1".to_string()],
+            }],
+            Visibility::Public,
+        );
+        let err = pack_dynamic_atlas(&registry, &library_dir, &req)
+            .expect_err("symlink escape in Atlas must fail closed");
+        assert!(matches!(
+            err,
+            CoreError::AtlasPackFailed(_) | CoreError::Io { .. }
+        ));
     }
 }

@@ -173,7 +173,7 @@ struct StatusArgs {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum LibraryEntityKind {
+enum LibraryResourceKind {
     Subject,
     Style,
     Atmosphere,
@@ -187,21 +187,21 @@ struct LibraryArgs {
 
 #[derive(Debug, Subcommand)]
 enum LibrarySubcommand {
-    /// List resolved Subject, Style, and Atmosphere entities across project > user > builtin.
+    /// List resolved Subject, Style, and Atmosphere resources across project > user > builtin.
     List {
-        /// Filter to a single entity kind.
+        /// Filter to a single library resource kind.
         #[arg(long, value_enum)]
-        kind: Option<LibraryEntityKind>,
+        kind: Option<LibraryResourceKind>,
         /// Emit machine-readable JSON output.
         #[arg(long)]
         json: bool,
     },
     /// Show a single resolved Subject, Style, or Atmosphere card.
     Show {
-        /// Entity kind to inspect.
+        /// Library resource kind to inspect.
         #[arg(value_enum)]
-        kind: LibraryEntityKind,
-        /// Entity slug.
+        kind: LibraryResourceKind,
+        /// Resource slug.
         slug: String,
         /// Emit machine-readable JSON output.
         #[arg(long)]
@@ -536,7 +536,7 @@ async fn main() -> anyhow::Result<()> {
             match args.action {
                 LibrarySubcommand::List { kind, json } => {
                     let mut rows = Vec::new();
-                    if kind.is_none() || matches!(kind, Some(LibraryEntityKind::Subject)) {
+                    if kind.is_none() || matches!(kind, Some(LibraryResourceKind::Subject)) {
                         for s in registry.list_subjects()? {
                             rows.push(LibrarySummaryRow {
                                 kind: "subject",
@@ -546,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
                             });
                         }
                     }
-                    if kind.is_none() || matches!(kind, Some(LibraryEntityKind::Style)) {
+                    if kind.is_none() || matches!(kind, Some(LibraryResourceKind::Style)) {
                         for s in registry.list_styles()? {
                             rows.push(LibrarySummaryRow {
                                 kind: "style",
@@ -556,7 +556,7 @@ async fn main() -> anyhow::Result<()> {
                             });
                         }
                     }
-                    if kind.is_none() || matches!(kind, Some(LibraryEntityKind::Atmosphere)) {
+                    if kind.is_none() || matches!(kind, Some(LibraryResourceKind::Atmosphere)) {
                         for a in registry.list_atmospheres()? {
                             rows.push(LibrarySummaryRow {
                                 kind: "atmosphere",
@@ -581,7 +581,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 LibrarySubcommand::Show { kind, slug, json } => match kind {
-                    LibraryEntityKind::Subject => {
+                    LibraryResourceKind::Subject => {
                         let resolved = registry.resolve_subject(&slug)?;
                         if json {
                             println!("{}", serde_json::to_string_pretty(&resolved.subject)?);
@@ -589,7 +589,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("{}", resolved.subject.to_yaml_string()?);
                         }
                     }
-                    LibraryEntityKind::Style => {
+                    LibraryResourceKind::Style => {
                         let resolved = registry.resolve_style(&slug)?;
                         if json {
                             println!("{}", serde_json::to_string_pretty(&resolved.style)?);
@@ -597,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
                             println!("{}", resolved.style.to_yaml_string()?);
                         }
                     }
-                    LibraryEntityKind::Atmosphere => {
+                    LibraryResourceKind::Atmosphere => {
                         let resolved = registry.resolve_atmosphere(&slug)?;
                         if json {
                             println!("{}", serde_json::to_string_pretty(&resolved.atmosphere)?);

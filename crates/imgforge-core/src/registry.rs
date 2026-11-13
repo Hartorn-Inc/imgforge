@@ -31,11 +31,12 @@ use crate::atmosphere::Atmosphere;
 use crate::backend::PNG_SIGNATURE;
 use crate::config::ResolvedWorkspace;
 use crate::error::CoreError;
-use crate::lifecycle::{read_regular_file_nofollow, validate_slug};
+use crate::lifecycle::validate_slug;
 use crate::presets::{
     builtin_atmosphere, builtin_atmospheres, builtin_style, builtin_style_exemplar_png,
     builtin_styles,
 };
+use crate::store::{read_regular_file_nofollow, verify_optional_contained_dir_no_symlinks};
 use crate::style::Style;
 use crate::subject::Subject;
 
@@ -226,9 +227,13 @@ impl LibraryRegistry {
             (LibrarySource::User, self.user_config_dir.as_deref()),
         ] {
             let Some(root) = root_opt else { continue };
-            let dir = root.join("subjects").join(slug);
+            let rel = Path::new("subjects").join(slug);
+            let Some(dir) = verify_optional_contained_dir_no_symlinks(root, &rel, "Subject")?
+            else {
+                continue;
+            };
             let card_path = dir.join(CARD_FILENAME);
-            if let Some(raw) = read_optional_card_yaml(&dir, &card_path, "Subject")? {
+            if let Some(raw) = read_optional_card_yaml(&card_path, "Subject")? {
                 let subject = Subject::from_yaml_str(&raw)?;
                 if subject.slug != slug {
                     return Err(CoreError::SubjectInvalid(format!(
@@ -261,9 +266,12 @@ impl LibraryRegistry {
             (LibrarySource::User, self.user_config_dir.as_deref()),
         ] {
             let Some(root) = root_opt else { continue };
-            let dir = root.join("styles").join(slug);
+            let rel = Path::new("styles").join(slug);
+            let Some(dir) = verify_optional_contained_dir_no_symlinks(root, &rel, "Style")? else {
+                continue;
+            };
             let card_path = dir.join(CARD_FILENAME);
-            if let Some(raw) = read_optional_card_yaml(&dir, &card_path, "Style")? {
+            if let Some(raw) = read_optional_card_yaml(&card_path, "Style")? {
                 let style = Style::from_yaml_str(&raw)?;
                 if style.slug != slug {
                     return Err(CoreError::StyleInvalid(format!(
@@ -311,9 +319,13 @@ impl LibraryRegistry {
             (LibrarySource::User, self.user_config_dir.as_deref()),
         ] {
             let Some(root) = root_opt else { continue };
-            let dir = root.join("atmospheres").join(slug);
+            let rel = Path::new("atmospheres").join(slug);
+            let Some(dir) = verify_optional_contained_dir_no_symlinks(root, &rel, "Atmosphere")?
+            else {
+                continue;
+            };
             let card_path = dir.join(CARD_FILENAME);
-            if let Some(raw) = read_optional_card_yaml(&dir, &card_path, "Atmosphere")? {
+            if let Some(raw) = read_optional_card_yaml(&card_path, "Atmosphere")? {
                 let atmosphere = Atmosphere::from_yaml_str(&raw)?;
                 if atmosphere.slug != slug {
                     return Err(CoreError::AtmosphereInvalid(format!(
@@ -353,7 +365,7 @@ impl LibraryRegistry {
             self.project_library_dir.as_deref(),
         ] {
             let Some(root) = root_opt else { continue };
-            for slug in collect_entity_slugs(&root.join("subjects"), "Subject")? {
+            for slug in collect_resource_slugs(root, "subjects", "Subject")? {
                 let resolved = self.resolve_subject(&slug)?;
                 by_slug.insert(slug, resolved);
             }
@@ -372,7 +384,7 @@ impl LibraryRegistry {
             self.project_library_dir.as_deref(),
         ] {
             let Some(root) = root_opt else { continue };
-            for slug in collect_entity_slugs(&root.join("styles"), "Style")? {
+            for slug in collect_resource_slugs(root, "styles", "Style")? {
                 slugs.insert(slug, ());
             }
         }
@@ -395,7 +407,7 @@ impl LibraryRegistry {
             self.project_library_dir.as_deref(),
         ] {
             let Some(root) = root_opt else { continue };
-            for slug in collect_entity_slugs(&root.join("atmospheres"), "Atmosphere")? {
+            for slug in collect_resource_slugs(root, "atmospheres", "Atmosphere")? {
                 slugs.insert(slug, ());
             }
         }
@@ -408,29 +420,17 @@ impl LibraryRegistry {
     }
 }
 
-fn collect_entity_slugs(parent: &Path, kind: &'static str) -> Result<Vec<String>, CoreError> {
-    match fs::symlink_metadata(parent) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(CoreError::Io {
-                    context: format!("inspecting {kind} directory {}", parent.display()),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("{kind} container directory must not be a symlink"),
-                    ),
-                });
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(CoreError::Io {
-                context: format!("inspecting {kind} directory {}", parent.display()),
-                source: err,
-            });
-        }
-    }
+fn collect_resource_slugs(
+    root: &Path,
+    container: &str,
+    kind: &'static str,
+) -> Result<Vec<String>, CoreError> {
+    let Some(parent) = verify_optional_contained_dir_no_symlinks(root, Path::new(container), kind)?
+    else {
+        return Ok(Vec::new());
+    };
 
-    let entries = fs::read_dir(parent).map_err(|err| CoreError::Io {
+    let entries = fs::read_dir(&parent).map_err(|err| CoreError::Io {
         context: format!("listing {kind} directory {}", parent.display()),
         source: err,
     })?;
@@ -453,31 +453,9 @@ fn collect_entity_slugs(parent: &Path, kind: &'static str) -> Result<Vec<String>
 }
 
 fn read_optional_card_yaml(
-    entity_dir: &Path,
     card_path: &Path,
     kind: &'static str,
 ) -> Result<Option<String>, CoreError> {
-    match fs::symlink_metadata(entity_dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(CoreError::Io {
-                    context: format!("inspecting {kind} directory {}", entity_dir.display()),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("refusing symlink or non-directory {kind} directory"),
-                    ),
-                });
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(CoreError::Io {
-                context: format!("inspecting {kind} directory {}", entity_dir.display()),
-                source: err,
-            });
-        }
-    }
-
     match fs::symlink_metadata(card_path) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -750,5 +728,80 @@ exemplars:
             .resolve_style("custom-ink")
             .expect_err("symlink exemplar must be rejected fail-closed");
         assert!(matches!(err, CoreError::StyleInvalid(_)));
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::symlinked_subjects_container("subject", true)]
+    #[case::symlinked_subject_dir("subject", false)]
+    #[case::symlinked_styles_container("style", true)]
+    #[case::symlinked_style_dir("style", false)]
+    #[case::symlinked_atmospheres_container("atmosphere", true)]
+    #[case::symlinked_atmosphere_dir("atmosphere", false)]
+    fn rejects_symlinked_container_or_resource_directories_fail_closed(
+        #[case] kind: &str,
+        #[case] symlink_container: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let project_lib = root.path().join("project/library");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&project_lib).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        match (kind, symlink_container) {
+            ("subject", true) => {
+                let real_subjects = outside.join("subjects");
+                let slug_dir = real_subjects.join("courier-ren");
+                fs::create_dir_all(&slug_dir).unwrap();
+                fs::write(
+                    slug_dir.join("card.yaml"),
+                    "schema_version: 1\nkind: prop\nslug: courier-ren\ndisplay_name: Courier\nexclusive_surface_map:\n  bindings:\n    - slot: body\n      material: wood\n      color_hex: \"#2C3E50\"\npalette_lock:\n  swatches:\n    - name: body\n      color_hex: \"#2C3E50\"\nvisibility: public\n",
+                )
+                .unwrap();
+                symlink(&real_subjects, project_lib.join("subjects")).unwrap();
+            }
+            ("subject", false) => {
+                let real_slug = outside.join("courier-ren");
+                fs::create_dir_all(&real_slug).unwrap();
+                fs::create_dir_all(project_lib.join("subjects")).unwrap();
+                symlink(&real_slug, project_lib.join("subjects/courier-ren")).unwrap();
+            }
+            ("style", true) => {
+                write_style_dir(&outside, "franco-belgian-line", "Outside Style");
+                symlink(outside.join("styles"), project_lib.join("styles")).unwrap();
+            }
+            ("style", false) => {
+                write_style_dir(&outside, "franco-belgian-line", "Outside Style");
+                fs::create_dir_all(project_lib.join("styles")).unwrap();
+                symlink(
+                    outside.join("styles/franco-belgian-line"),
+                    project_lib.join("styles/franco-belgian-line"),
+                )
+                .unwrap();
+            }
+            ("atmosphere", true) => {
+                write_atmosphere_dir(&outside, "golden-dawn", "Outside Dawn");
+                symlink(outside.join("atmospheres"), project_lib.join("atmospheres")).unwrap();
+            }
+            ("atmosphere", false) => {
+                write_atmosphere_dir(&outside, "golden-dawn", "Outside Dawn");
+                fs::create_dir_all(project_lib.join("atmospheres")).unwrap();
+                symlink(
+                    outside.join("atmospheres/golden-dawn"),
+                    project_lib.join("atmospheres/golden-dawn"),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let reg = LibraryRegistry::new(Some(project_lib), None);
+        let err = match kind {
+            "subject" => reg.resolve_subject("courier-ren").unwrap_err(),
+            "style" => reg.resolve_style("franco-belgian-line").unwrap_err(),
+            "atmosphere" => reg.resolve_atmosphere("golden-dawn").unwrap_err(),
+            _ => unreachable!(),
+        };
+        assert!(matches!(err, CoreError::Io { .. }));
     }
 }

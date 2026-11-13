@@ -25,7 +25,7 @@
 //! 4. Validate `#252830` structure, composite host calibration strip, slice
 //!    components, and persist `pack.json` + `slices.json` atomically.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,11 +39,14 @@ use crate::calibration::{
     composite_calibration_strip_png, validate_reference_sheet_structure,
 };
 use crate::error::CoreError;
-use crate::lifecycle::{Lifecycle, SeedInput, now_utc_iso, read_regular_file_nofollow, sha256_hex};
+use crate::lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex};
 use crate::registry::{LibraryRegistry, ResolvedStyle, ResolvedSubject};
 use crate::scene_spec::Visibility;
-use crate::slicer::{SliceRecord, SlicerConfig, SlicesManifest, slice_sheet_image};
-use crate::store::write_atomic;
+use crate::slicer::{RectOverride, SliceRecord, SlicerConfig, SlicesManifest, slice_sheet_image};
+use crate::store::{
+    read_regular_file_nofollow, verify_contained_path_no_symlinks,
+    verify_existing_dir_prefix_no_symlinks, write_atomic,
+};
 use crate::style::Style;
 use crate::subject::{Subject, SubjectKind};
 
@@ -61,7 +64,7 @@ fn default_pack_version() -> u32 {
 }
 
 /// Role of an individual sheet inside a style-scoped `ReferencePack`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceSheetRole {
     /// Step 1 anchor turnaround sheet (`turnaround.png`) for `character`/`creature`.
@@ -164,6 +167,8 @@ pub struct ReferencePackRequest {
     pub structural_config: StructuralValidationConfig,
     /// Base slicer options (`exclude_bottom_rows` and `id_prefix` are populated automatically per sheet).
     pub slicer_config: SlicerConfig,
+    /// Optional per-sheet `RectOverride` lists keyed by `ReferenceSheetRole`.
+    pub sheet_overrides: BTreeMap<ReferenceSheetRole, Vec<RectOverride>>,
 }
 
 impl ReferencePackRequest {
@@ -177,6 +182,7 @@ impl ReferencePackRequest {
             seed_label: None,
             structural_config: StructuralValidationConfig::default(),
             slicer_config: SlicerConfig::default(),
+            sheet_overrides: BTreeMap::new(),
         }
     }
 }
@@ -225,6 +231,8 @@ impl<'a> ReferencePackPipeline<'a> {
             self.registry.resolve_subject(&request.subject_slug)?;
         let resolved_style: ResolvedStyle = self.registry.resolve_style(&request.style_slug)?;
 
+        validate_request_overrides(resolved_subject.subject.kind, request)?;
+
         let seed = match request.seed_path {
             Some(ref path) => Some(SeedInput::from_png_path(path, request.seed_label.clone())?),
             None => None,
@@ -236,28 +244,56 @@ impl<'a> ReferencePackPipeline<'a> {
         })?;
         let exemplar_paths = resolved_style.materialize_exemplars(temp_exemplars.path())?;
 
-        let pack_dir = self
-            .library_dir
-            .join("subjects")
+        let rel_pack_dir = Path::new("subjects")
             .join(&resolved_subject.subject.slug)
             .join("packs")
             .join(&resolved_style.style.slug);
+        let rel_slices_dir = rel_pack_dir.join("slices");
+        verify_existing_dir_prefix_no_symlinks(
+            &self.library_dir,
+            &rel_slices_dir,
+            "ReferencePack slices directory",
+        )?;
+
+        let pack_dir = self.library_dir.join(&rel_pack_dir);
         let pack_manifest_path = pack_dir.join("pack.json");
         let mut next_version = 1u32;
-        if pack_manifest_path.is_file() {
-            let existing_bytes = read_regular_file_nofollow(&pack_manifest_path, "pack.json")?;
-            let existing: ReferencePackManifest = serde_json::from_slice(&existing_bytes)
-                .map_err(|err| CoreError::ReferencePackFailed(err.to_string()))?;
-            existing.lifecycle.ensure_mutable(&format!(
-                "pack:{}/{}",
-                resolved_subject.subject.slug, resolved_style.style.slug
-            ))?;
-            next_version = existing.version.saturating_add(1);
+        match fs::symlink_metadata(&pack_manifest_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(CoreError::ReferencePackFailed(format!(
+                        "existing pack.json at {} must be a regular non-symlink file",
+                        pack_manifest_path.display()
+                    )));
+                }
+                let existing_bytes = read_regular_file_nofollow(&pack_manifest_path, "pack.json")?;
+                let existing: ReferencePackManifest = serde_json::from_slice(&existing_bytes)
+                    .map_err(|err| CoreError::ReferencePackFailed(err.to_string()))?;
+                existing.lifecycle.ensure_mutable(&format!(
+                    "pack:{}/{}",
+                    resolved_subject.subject.slug, resolved_style.style.slug
+                ))?;
+                next_version = existing.version.saturating_add(1);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!("inspecting pack.json at {}", pack_manifest_path.display()),
+                    source: err,
+                });
+            }
         }
+
         fs::create_dir_all(pack_dir.join("slices")).map_err(|err| CoreError::Io {
             context: format!("creating ReferencePack directory {}", pack_dir.display()),
             source: err,
         })?;
+        verify_contained_path_no_symlinks(
+            &self.library_dir,
+            &rel_slices_dir,
+            true,
+            "ReferencePack slices directory",
+        )?;
 
         let mut sheet_records = Vec::new();
         let mut all_slices = Vec::new();
@@ -345,6 +381,17 @@ impl<'a> ReferencePackPipeline<'a> {
                     .await?;
                 sheet_records.push(rec);
                 all_slices.extend(slices);
+            }
+        }
+
+        // Ensure no slice ID collided across sheets before writing slices.json.
+        let mut seen_slice_ids = HashSet::with_capacity(all_slices.len());
+        for slice in &all_slices {
+            if !seen_slice_ids.insert(slice.id.as_str()) {
+                return Err(CoreError::ReferencePackFailed(format!(
+                    "duplicate slice_id '{}' produced across ReferencePack sheets",
+                    slice.id
+                )));
             }
         }
 
@@ -445,6 +492,9 @@ impl<'a> ReferencePackPipeline<'a> {
         let mut slice_cfg = request.slicer_config.clone();
         slice_cfg.exclude_bottom_rows = calibration_strip.strip_height;
         slice_cfg.id_prefix = Some(role.slice_prefix().to_string());
+        if let Some(role_overrides) = request.sheet_overrides.get(&role) {
+            slice_cfg.overrides = role_overrides.clone();
+        }
 
         let extracted = slice_sheet_image(&decoded, &slice_cfg)?;
         let mut slice_records = Vec::with_capacity(extracted.len());
@@ -468,6 +518,62 @@ impl<'a> ReferencePackPipeline<'a> {
             sheet_path,
         ))
     }
+}
+
+fn validate_request_overrides(
+    subject_kind: SubjectKind,
+    request: &ReferencePackRequest,
+) -> Result<(), CoreError> {
+    match subject_kind {
+        SubjectKind::Character | SubjectKind::Creature => {
+            if !request.slicer_config.overrides.is_empty() {
+                return Err(CoreError::ReferencePackFailed(
+                    "multi-sheet Character/Creature ReferencePack cannot use unkeyed slicer_config.overrides; key overrides by ReferenceSheetRole via sheet_overrides".to_string(),
+                ));
+            }
+            if request
+                .sheet_overrides
+                .contains_key(&ReferenceSheetRole::SingleSheet)
+            {
+                return Err(CoreError::ReferencePackFailed(
+                    "Character/Creature ReferencePack cannot use SingleSheet overrides".to_string(),
+                ));
+            }
+        }
+        SubjectKind::Prop | SubjectKind::Location => {
+            if request
+                .sheet_overrides
+                .keys()
+                .any(|role| *role != ReferenceSheetRole::SingleSheet)
+            {
+                return Err(CoreError::ReferencePackFailed(
+                    "Prop/Location ReferencePack only supports SingleSheet overrides".to_string(),
+                ));
+            }
+            if !request.slicer_config.overrides.is_empty()
+                && request
+                    .sheet_overrides
+                    .contains_key(&ReferenceSheetRole::SingleSheet)
+            {
+                return Err(CoreError::ReferencePackFailed(
+                    "specify overrides in either slicer_config.overrides or sheet_overrides[SingleSheet], not both".to_string(),
+                ));
+            }
+        }
+    }
+
+    let mut seen_override_ids = HashSet::new();
+    for (role, overrides) in &request.sheet_overrides {
+        for ov in overrides {
+            let trimmed = ov.id.trim();
+            if !seen_override_ids.insert(trimmed.to_string()) {
+                return Err(CoreError::ReferencePackFailed(format!(
+                    "sheet_overrides for {role:?} reuses slice override id '{trimmed}' from another sheet"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a positive-only, domain-agnostic prompt for a specific `ReferencePack` sheet role.
@@ -545,6 +651,8 @@ pub fn compile_pack_sheet_prompt(
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -555,6 +663,7 @@ mod tests {
     use super::*;
     use crate::backend::ImageGenerationOutput;
     use crate::calibration::{STUDIO_BG_RGB, parse_hex_rgb};
+    use crate::slicer::PixelRect;
 
     #[derive(Clone)]
     struct MockPackBackend {
@@ -758,5 +867,144 @@ visibility: public
             overwrite_err,
             CoreError::CanonicalImmutable { .. }
         ));
+    }
+
+    #[rstest]
+    #[case::character_unkeyed_overrides_rejected("character", true)]
+    #[case::creature_unkeyed_overrides_rejected("creature", true)]
+    #[case::prop_unkeyed_overrides_allowed("prop", false)]
+    #[tokio::test]
+    async fn rejects_unkeyed_slicer_overrides_for_multi_sheet_packs(
+        #[case] kind: &str,
+        #[case] expect_err: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let library_dir = root.path().join("library");
+        write_subject_card(&library_dir, "test-subject", kind);
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let backend = MockPackBackend::new();
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+
+        let mut req = ReferencePackRequest::new("test-subject", "franco-belgian-line");
+        req.slicer_config.overrides = vec![RectOverride {
+            id: "front".to_string(),
+            rect: PixelRect {
+                x: 180,
+                y: 120,
+                width: 260,
+                height: 640,
+            },
+            label: None,
+        }];
+
+        let res = pipeline.generate(&req).await;
+        assert_eq!(res.is_err(), expect_err);
+        if expect_err {
+            assert!(matches!(
+                res.unwrap_err(),
+                CoreError::ReferencePackFailed(_)
+            ));
+            assert!(
+                backend.calls.lock().unwrap().is_empty(),
+                "invalid override configuration must fail before invoking backend"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn character_pack_supports_role_keyed_sheet_overrides_without_collisions() {
+        let root = TempDir::new().expect("tempdir");
+        let library_dir = root.path().join("library");
+        write_subject_card(&library_dir, "courier-ren", "character");
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let backend = MockPackBackend::new();
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+
+        let mut req = ReferencePackRequest::new("courier-ren", "franco-belgian-line");
+        let sample_rect = PixelRect {
+            x: 180,
+            y: 120,
+            width: 260,
+            height: 640,
+        };
+        req.sheet_overrides.insert(
+            ReferenceSheetRole::Turnaround,
+            vec![RectOverride {
+                id: "turn_front".to_string(),
+                rect: sample_rect,
+                label: Some("front".to_string()),
+            }],
+        );
+        req.sheet_overrides.insert(
+            ReferenceSheetRole::PosesExpressions,
+            vec![RectOverride {
+                id: "pose_action".to_string(),
+                rect: sample_rect,
+                label: Some("action".to_string()),
+            }],
+        );
+
+        let generated = pipeline.generate(&req).await.expect("keyed overrides pass");
+        let ids: HashSet<&str> = generated
+            .manifest
+            .slices
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert!(ids.contains("turn_front"));
+        assert!(ids.contains("pose_action"));
+        assert_eq!(ids.len(), generated.manifest.slices.len());
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::symlinked_packs_dir("packs")]
+    #[case::symlinked_style_pack_dir("style_pack")]
+    #[case::symlinked_slices_dir("slices")]
+    #[tokio::test]
+    async fn rejects_symlinked_pack_or_slices_directories_fail_closed(#[case] target: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let library_dir = root.path().join("library");
+        write_subject_card(&library_dir, "brass-lantern", "prop");
+
+        let outside = root.path().join("outside_escape");
+        fs::create_dir_all(&outside).unwrap();
+
+        let subject_dir = library_dir.join("subjects/brass-lantern");
+        let packs_dir = subject_dir.join("packs");
+        let style_pack_dir = packs_dir.join("franco-belgian-line");
+        let slices_dir = style_pack_dir.join("slices");
+
+        match target {
+            "packs" => {
+                symlink(&outside, &packs_dir).unwrap();
+            }
+            "style_pack" => {
+                fs::create_dir_all(&packs_dir).unwrap();
+                symlink(&outside, &style_pack_dir).unwrap();
+            }
+            "slices" => {
+                fs::create_dir_all(&style_pack_dir).unwrap();
+                symlink(&outside, &slices_dir).unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let backend = MockPackBackend::new();
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+        let req = ReferencePackRequest::new("brass-lantern", "franco-belgian-line");
+
+        let err = pipeline
+            .generate(&req)
+            .await
+            .expect_err("symlinked pack directory must fail closed");
+        assert!(matches!(err, CoreError::Io { .. }));
+        assert!(
+            backend.calls.lock().unwrap().is_empty(),
+            "symlink check must run before invoking backend"
+        );
     }
 }

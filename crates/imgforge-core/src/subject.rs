@@ -107,15 +107,15 @@ impl PaletteLock {
         }
         let mut seen_names = HashSet::with_capacity(self.swatches.len());
         for (idx, swatch) in self.swatches.iter_mut().enumerate() {
+            if swatch.name.chars().any(char::is_control) {
+                return Err(CoreError::SubjectInvalid(format!(
+                    "palette_lock.swatches[{idx}].name must not contain control characters"
+                )));
+            }
             let trimmed_name = swatch.name.trim();
             if trimmed_name.is_empty() {
                 return Err(CoreError::SubjectInvalid(format!(
                     "palette_lock.swatches[{idx}].name must not be empty"
-                )));
-            }
-            if trimmed_name.chars().any(char::is_control) {
-                return Err(CoreError::SubjectInvalid(format!(
-                    "palette_lock.swatches[{idx}].name must not contain control characters"
                 )));
             }
             let key = trimmed_name.to_ascii_lowercase();
@@ -133,6 +133,11 @@ impl PaletteLock {
             .map_err(CoreError::SubjectInvalid)?;
 
             if let Some(ref mut slot) = swatch.surface_slot {
+                if slot.chars().any(char::is_control) {
+                    return Err(CoreError::SubjectInvalid(format!(
+                        "palette_lock.swatches[{idx}].surface_slot must not contain control characters"
+                    )));
+                }
                 let trimmed_slot = slot.trim();
                 if trimmed_slot.is_empty() {
                     return Err(CoreError::SubjectInvalid(format!(
@@ -216,9 +221,9 @@ impl Subject {
         }
         validate_slug(&self.slug, "Subject").map_err(CoreError::SubjectInvalid)?;
 
-        if self.display_name.trim().is_empty() {
+        if self.display_name.trim().is_empty() || self.display_name.chars().any(char::is_control) {
             return Err(CoreError::SubjectInvalid(
-                "display_name must not be empty".to_string(),
+                "display_name must be non-empty without control characters".to_string(),
             ));
         }
 
@@ -257,15 +262,28 @@ impl Subject {
         }
         let mut seen_slots = HashSet::with_capacity(self.exclusive_surface_map.bindings.len());
         for (idx, binding) in self.exclusive_surface_map.bindings.iter_mut().enumerate() {
-            let trimmed_slot = binding.slot.trim();
-            if trimmed_slot.is_empty() || trimmed_slot.chars().any(char::is_control) {
+            if binding.slot.chars().any(char::is_control) {
                 return Err(CoreError::SubjectInvalid(format!(
-                    "exclusive_surface_map.bindings[{idx}].slot must be non-empty without control chars"
+                    "exclusive_surface_map.bindings[{idx}].slot must not contain control characters"
                 )));
             }
-            if binding.material.trim().is_empty() {
+            let trimmed_slot = binding.slot.trim();
+            if trimmed_slot.is_empty() {
                 return Err(CoreError::SubjectInvalid(format!(
-                    "exclusive_surface_map.bindings[{idx}].material must not be empty"
+                    "exclusive_surface_map.bindings[{idx}].slot must not be empty"
+                )));
+            }
+            if binding.material.trim().is_empty() || binding.material.chars().any(char::is_control)
+            {
+                return Err(CoreError::SubjectInvalid(format!(
+                    "exclusive_surface_map.bindings[{idx}].material must be non-empty without control characters"
+                )));
+            }
+            if let Some(ref finish) = binding.finish
+                && (finish.trim().is_empty() || finish.chars().any(char::is_control))
+            {
+                return Err(CoreError::SubjectInvalid(format!(
+                    "exclusive_surface_map.bindings[{idx}].finish must be non-empty without control characters when provided"
                 )));
             }
             let key = trimmed_slot.to_ascii_lowercase();
@@ -289,16 +307,16 @@ impl Subject {
 }
 
 fn validate_hand_binding(prefix: &str, hand: &HandBinding) -> Result<(), CoreError> {
-    if hand.action.trim().is_empty() {
+    if hand.action.trim().is_empty() || hand.action.chars().any(char::is_control) {
         return Err(CoreError::SubjectInvalid(format!(
-            "{prefix}.action must not be empty"
+            "{prefix}.action must be non-empty without control characters"
         )));
     }
     if let Some(ref item) = hand.item
-        && item.trim().is_empty()
+        && (item.trim().is_empty() || item.chars().any(char::is_control))
     {
         return Err(CoreError::SubjectInvalid(format!(
-            "{prefix}.item must not be empty when provided"
+            "{prefix}.item must be non-empty without control characters when provided"
         )));
     }
     Ok(())
@@ -415,6 +433,25 @@ tags:
         }
 
         let err = Subject::from_yaml_str(&yaml).expect_err("invalid Subject must fail closed");
+        assert!(matches!(err, CoreError::SubjectInvalid(_)));
+    }
+
+    #[rstest]
+    #[case::display_name_control_char(|s: &mut Subject| s.display_name = "Courier\n[STYLE]".to_string())]
+    #[case::display_name_empty(|s: &mut Subject| s.display_name = "   ".to_string())]
+    #[case::left_hand_action_control_char(|s: &mut Subject| s.hand_bindings.as_mut().unwrap().left.as_mut().unwrap().action = "holding\0lamp".to_string())]
+    #[case::left_hand_item_control_char(|s: &mut Subject| s.hand_bindings.as_mut().unwrap().left.as_mut().unwrap().item = Some("brass\nlantern".to_string()))]
+    #[case::right_hand_action_empty(|s: &mut Subject| s.hand_bindings.as_mut().unwrap().right.as_mut().unwrap().action = " ".to_string())]
+    #[case::surface_material_control_char(|s: &mut Subject| s.exclusive_surface_map.bindings[0].material = "wool\rcanvas".to_string())]
+    #[case::surface_finish_control_char(|s: &mut Subject| s.exclusive_surface_map.bindings[0].finish = Some("matte\n[PROMPT]".to_string()))]
+    #[case::surface_finish_empty(|s: &mut Subject| s.exclusive_surface_map.bindings[0].finish = Some("  ".to_string()))]
+    #[case::swatch_surface_slot_control_char(|s: &mut Subject| s.palette_lock.swatches[0].surface_slot = Some("coat\n".to_string()))]
+    fn rejects_empty_or_control_chars_in_subject_fields(#[case] mutate: fn(&mut Subject)) {
+        let mut subject = Subject::from_yaml_str(sample_character_yaml()).unwrap();
+        mutate(&mut subject);
+        let err = subject
+            .validate_and_normalize()
+            .expect_err("control characters or empty values must fail closed");
         assert!(matches!(err, CoreError::SubjectInvalid(_)));
     }
 }

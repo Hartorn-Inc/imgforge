@@ -224,6 +224,13 @@ pub fn slice_sheet_image(
             config.exclude_bottom_rows
         )));
     }
+    let validated_prefix = match config.id_prefix {
+        Some(ref raw_prefix) => Some(validate_slice_identifier(
+            raw_prefix,
+            "SlicerConfig::id_prefix",
+        )?),
+        None => None,
+    };
     let active_height = height - config.exclude_bottom_rows;
 
     let mut planned: Vec<(String, PixelRect, SliceSource, Option<String>)> = Vec::new();
@@ -243,15 +250,10 @@ pub fn slice_sheet_image(
         }
     } else {
         let auto_rects = detect_foreground_components(sheet, active_height, config)?;
-        let prefix = config
-            .id_prefix
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
 
         for (idx, rect) in auto_rects.into_iter().enumerate() {
-            let id = match prefix {
-                Some(p) => format!("{p}_{:03}", idx + 1),
+            let id = match validated_prefix {
+                Some(ref p) => format!("{p}_{:03}", idx + 1),
                 None => format!("slice_{:03}", idx + 1),
             };
             planned.push((id, rect, SliceSource::Auto, None));
@@ -366,6 +368,20 @@ pub fn slice_sheet_to_dir(
         .map_err(|err| CoreError::SlicerFailed(err.to_string()))?;
     write_atomic(&out_dir.join("slices.json"), &manifest_bytes, "slices.json")?;
     Ok(manifest)
+}
+
+fn validate_slice_identifier(raw: &str, field_name: &str) -> Result<String, CoreError> {
+    if raw.is_empty()
+        || raw != raw.trim()
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(CoreError::SlicerFailed(format!(
+            "{field_name} '{raw}' must be non-empty ASCII alphanumeric, '-', or '_'"
+        )));
+    }
+    Ok(raw.to_string())
 }
 
 fn validate_rect_override(
@@ -735,5 +751,32 @@ mod tests {
         .expect("grid prior slicing succeeds");
         assert_eq!(slices.len(), 2);
         assert!(slices[0].record.rect.height >= 130);
+    }
+
+    #[rstest]
+    #[case::traversal_prefix("../evil", false)]
+    #[case::slash_prefix("sub/dir", false)]
+    #[case::backslash_prefix("sub\\dir", false)]
+    #[case::whitespace_in_prefix("bad prefix", false)]
+    #[case::leading_whitespace(" turnaround", false)]
+    #[case::empty_prefix("", false)]
+    #[case::whitespace_only_prefix("   ", false)]
+    #[case::control_char_prefix("turn\naround", false)]
+    #[case::valid_prefix("turnaround-01_a", true)]
+    fn validates_slicer_id_prefix_allowlist(#[case] prefix: &str, #[case] expect_ok: bool) {
+        let mut img: RgbaImage = ImageBuffer::from_pixel(200, 200, Rgba(STUDIO_BG_RGBA));
+        paint_box(&mut img, 40, 40, 60, 60, [200, 160, 120]);
+
+        let res = slice_sheet_image(
+            &img,
+            &SlicerConfig {
+                id_prefix: Some(prefix.to_string()),
+                ..SlicerConfig::default()
+            },
+        );
+        assert_eq!(res.is_ok(), expect_ok);
+        if !expect_ok {
+            assert!(matches!(res.unwrap_err(), CoreError::SlicerFailed(_)));
+        }
     }
 }
