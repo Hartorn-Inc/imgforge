@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/imgforge-core",
+    "crates/imgforge-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+http-body-util = "0.1.5"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+mime_guess = "2.0.5"
+rstest = "0.28.0"
+rust-embed = { version = "8.14.0", features = ["debug-embed"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "fs", "io-util"] }
+toml = "1.2.1"
+tower = { version = "0.5.3", features = ["util"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+yaml_serde = "0.10.7"

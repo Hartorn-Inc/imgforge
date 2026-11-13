@@ -1,0 +1,21 @@
+[package]
+name = "imgforge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Core domain schemas, deterministic PromptCompiler, isolated CodexNativeBackend, SceneComposer, and VisionCritic for imgforge."
+
+[dependencies]
+async-trait.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+yaml_serde.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
