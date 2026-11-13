@@ -47,7 +47,7 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x
 /// Maximum permitted relative aspect-ratio deviation (`5%`).
 pub const MAX_ASPECT_RATIO_ERROR: f64 = 0.05;
 
-/// Maximum character count for sanitized JSONL diagnostic summaries on missing-PNG errors.
+/// Maximum character count for sanitized subprocess stderr and JSONL diagnostic summaries.
 pub const MAX_FAILURE_DETAIL_CHARS: usize = 300;
 
 /// Input parameters for a single `ImageBackend::generate` call.
@@ -113,16 +113,19 @@ pub fn format_aspect_ratio(width: u32, height: u32) -> String {
 #[must_use]
 pub fn build_generation_prompt(request: &ImageGenerationRequest) -> String {
     let aspect = format_aspect_ratio(request.width, request.height);
-    let ref_clause = if request.reference_images.is_empty() {
-        "Render the image faithfully"
+    let (tool_scope, ref_clause) = if request.reference_images.is_empty() {
+        ("only this specification", "Render the image faithfully")
     } else {
-        "Render the image faithfully matching the attached reference image(s)"
+        (
+            "only the attached reference image(s) and this specification",
+            "Render the image faithfully matching the attached reference image(s)",
+        )
     };
     format!(
         "[RENDER_TARGET]\n\
          dimensions: {}x{}\n\
          aspect_ratio: {}\n\
-         tool: image_gen (required; invoke the built-in image_gen tool directly to generate and save a raster PNG image; never reply with text-only commentary, clarifying questions, or code, and do not inspect repository files)\n\
+         tool: image_gen (required; invoke the built-in image_gen tool immediately using {tool_scope} to generate and save the raster PNG output directly)\n\
          instruction: {} at {}x{} ({}) framing via image_gen as purely visual artwork with clean, unlabeled surfaces and zero rendered text or labels.\n\n\
          {}",
         request.width,
@@ -230,20 +233,25 @@ impl ImageBackend for CodexNativeBackend {
                 reason: format!("failed to spawn '{}': {err}", self.codex_bin),
             })?;
 
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let detail = if stderr.is_empty() {
-                format!("exit status {}", output.status)
+            let stderr_raw = String::from_utf8_lossy(&output.stderr);
+            let sanitized_stderr = sanitize_single_line(&stderr_raw);
+            let diagnostic = if sanitized_stderr.is_empty() {
+                extract_failure_detail_from_jsonl(&stdout_str)
             } else {
-                format!("exit status {}: {stderr}", output.status)
+                Some(truncate_detail(&sanitized_stderr, MAX_FAILURE_DETAIL_CHARS))
+            };
+            let reason = match diagnostic {
+                Some(detail) => format!("exit status {}: {detail}", output.status),
+                None => format!("exit status {}", output.status),
             };
             return Err(CoreError::SubprocessFailed {
                 stage: "CodexNativeBackend",
-                reason: detail,
+                reason,
             });
         }
 
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
         let thread_id = extract_thread_id_from_jsonl(&stdout_str);
 
         let generated_root = temp_codex_home.path().join("generated_images");
@@ -1020,6 +1028,125 @@ printf '{{"type":"thread.started","thread_id":"thr_err"}}\n'
         assert!(prompt.contains("image_gen"));
         assert!(prompt.contains("unlabeled surfaces"));
         assert_eq!(prompt.contains("attached reference"), expect_ref_phrase);
+
+        let header = prompt
+            .split("\n\n")
+            .next()
+            .expect("generated prompt must include [RENDER_TARGET] header");
+        let lower = header.to_ascii_lowercase();
+        let tokens: Vec<&str> = lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+            .map(|tok| tok.trim_matches('\''))
+            .filter(|tok| !tok.is_empty())
+            .collect();
+        for forbidden in [
+            "no", "not", "never", "without", "don't", "avoid", "avoiding",
+        ] {
+            assert!(
+                !tokens.contains(&forbidden),
+                "generated header must remain positive-only (found '{forbidden}'): {header}"
+            );
+        }
+        assert!(
+            !tokens
+                .windows(2)
+                .any(|pair| pair == ["do", "not"] || pair == ["free", "of"]),
+            "generated header must remain positive-only (found negation phrase): {header}"
+        );
+    }
+
+    #[rstest]
+    #[case::stderr_multiline_control_chars_and_bounded(
+        format!("line1\t\x07line2\n{}", "a".repeat(350)),
+        r#"{"type":"error","message":"ignored when stderr present"}"#,
+        Some("line1 line2 "),
+        true,
+    )]
+    #[case::empty_stderr_falls_back_to_jsonl(
+        String::new(),
+        r#"{"type":"turn.failed","error":{"message":"image_gen quota exhausted"}}"#,
+        Some("turn.failed: image_gen quota exhausted"),
+        false
+    )]
+    #[case::whitespace_only_stderr_falls_back_to_jsonl(
+        "  \n\t\x07 ".to_string(),
+        r#"{"type":"error","message":"auth session expired"}"#,
+        Some("error: auth session expired"),
+        false,
+    )]
+    #[case::empty_stderr_and_no_jsonl_diagnostic(
+        String::new(),
+        r#"{"type":"turn.completed"}"#,
+        None,
+        false
+    )]
+    #[tokio::test]
+    async fn codex_native_backend_sanitizes_stderr_and_falls_back_to_jsonl_on_nonzero_exit(
+        #[case] stderr_payload: String,
+        #[case] stdout_payload: &str,
+        #[case] expected_substring: Option<&str>,
+        #[case] expect_bounded_stderr: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let auth_dir = root.path().join("auth");
+        create_secure_auth_dir(&auth_dir);
+
+        let stderr_file = root.path().join("stderr.bin");
+        let stdout_file = root.path().join("stdout.bin");
+        fs::write(&stderr_file, stderr_payload.as_bytes()).unwrap();
+        fs::write(&stdout_file, stdout_payload.as_bytes()).unwrap();
+
+        let stub_bin = root.path().join("codex-fail");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+cat "{stdout_file}"
+cat "{stderr_file}" >&2
+exit 7
+"#,
+            stdout_file = stdout_file.display(),
+            stderr_file = stderr_file.display(),
+        );
+        fs::write(&stub_bin, script).unwrap();
+        fs::set_permissions(&stub_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend =
+            CodexNativeBackend::with_codex_bin(auth_dir, stub_bin.to_string_lossy().into_owned());
+        let err = backend
+            .generate(&ImageGenerationRequest {
+                prompt: "harbor lantern".to_string(),
+                width: 512,
+                height: 512,
+                reference_images: Vec::new(),
+            })
+            .await
+            .expect_err("non-zero exit must fail closed");
+
+        match err {
+            CoreError::SubprocessFailed { stage, reason } => {
+                assert_eq!(stage, "CodexNativeBackend");
+                assert!(
+                    !reason.chars().any(char::is_control),
+                    "reason must not contain control characters: {reason:?}"
+                );
+                if let Some(substr) = expected_substring {
+                    assert!(
+                        reason.contains(substr),
+                        "expected {substr:?} in reason {reason:?}"
+                    );
+                } else {
+                    assert_eq!(reason, "exit status exit status: 7");
+                }
+                if expect_bounded_stderr {
+                    let detail = reason
+                        .strip_prefix("exit status exit status: 7: ")
+                        .expect("reason should contain sanitized stderr detail");
+                    assert_eq!(detail.chars().count(), MAX_FAILURE_DETAIL_CHARS);
+                    assert!(detail.ends_with("..."));
+                }
+            }
+            other => panic!("expected SubprocessFailed, got {other:?}"),
+        }
     }
 
     #[rstest]
