@@ -67,7 +67,15 @@ export async function fetchHealthStatus(
       requestInit.signal = signal;
     }
     const response = await fetchImpl('/api/health', requestInit);
-    const body = (await response.json()) as unknown;
+    let body: unknown = null;
+    try {
+      body = (await response.json()) as unknown;
+    } catch (err) {
+      if (signal?.aborted) {
+        throw err;
+      }
+      body = null;
+    }
     const health = parseHealthPayload(body);
 
     if (!response.ok) {

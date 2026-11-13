@@ -58,6 +58,7 @@ describe('GET /api/health client', () => {
     mockFetch: typeof fetch;
     expectedOk: boolean;
     expectedHttpStatus: number | null;
+    expectedError: string | null;
   }>([
     {
       id: 'returns-health-on-200-ok',
@@ -75,6 +76,7 @@ describe('GET /api/health client', () => {
         ),
       expectedOk: true,
       expectedHttpStatus: null,
+      expectedError: null,
     },
     {
       id: 'returns-error-on-503-degraded',
@@ -92,6 +94,27 @@ describe('GET /api/health client', () => {
         ),
       expectedOk: false,
       expectedHttpStatus: 503,
+      expectedError: 'Server reported degraded health (HTTP 503)',
+    },
+    {
+      id: 'returns-error-on-plain-text-502-proxy-error',
+      mockFetch: () =>
+        Promise.resolve(
+          new Response('Bad Gateway', {
+            status: 502,
+            headers: { 'Content-Type': 'text/plain' },
+          }),
+        ),
+      expectedOk: false,
+      expectedHttpStatus: 502,
+      expectedError: 'Health check failed with HTTP 502',
+    },
+    {
+      id: 'returns-error-on-empty-500-response',
+      mockFetch: () => Promise.resolve(new Response(null, { status: 500 })),
+      expectedOk: false,
+      expectedHttpStatus: 500,
+      expectedError: 'Health check failed with HTTP 500',
     },
     {
       id: 'returns-error-on-malformed-200-body',
@@ -104,18 +127,23 @@ describe('GET /api/health client', () => {
         ),
       expectedOk: false,
       expectedHttpStatus: 200,
+      expectedError: 'Malformed payload from GET /api/health',
     },
     {
       id: 'returns-error-on-network-rejection',
       mockFetch: () => Promise.reject(new Error('Connection refused')),
       expectedOk: false,
       expectedHttpStatus: null,
+      expectedError: 'Connection refused',
     },
-  ])('$id', async ({ mockFetch, expectedOk, expectedHttpStatus }) => {
+  ])('$id', async ({ mockFetch, expectedOk, expectedHttpStatus, expectedError }) => {
     const result = await fetchHealthStatus(undefined, mockFetch);
     expect(result.ok).toBe(expectedOk);
     if (!result.ok) {
       expect(result.httpStatus).toBe(expectedHttpStatus);
+      if (expectedError !== null) {
+        expect(result.error).toBe(expectedError);
+      }
     }
   });
 });

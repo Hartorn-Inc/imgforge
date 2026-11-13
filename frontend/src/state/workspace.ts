@@ -31,7 +31,7 @@ export const WORKSPACE_TABS: readonly WorkspaceTabDefinition[] = [
     id: 'style_atmosphere',
     label: 'Style & Atmosphere',
     summary:
-      'Inspect Subject PaletteLock swatches, Style exemplars, Atmosphere mood, and ReferencePack sheets.',
+      'Inspect Subject PaletteLock swatches, Style exemplars, Atmosphere parameters, and ReferencePack sheets.',
   },
   {
     id: 'spatial_guide',
@@ -89,6 +89,17 @@ export const LIFECYCLE_ORDER: readonly LifecycleState[] = [
   'canonical',
   'superseded',
 ] as const;
+
+/** Narrow an arbitrary string to `LifecycleState`. */
+export function isLifecycleState(value: string): value is LifecycleState {
+  return (
+    value === 'draft' ||
+    value === 'candidate' ||
+    value === 'validated' ||
+    value === 'canonical' ||
+    value === 'superseded'
+  );
+}
 
 /** Determine whether `Export` actions are unlocked for a given `Lifecycle` state. */
 export function isExportEligible(lifecycle: LifecycleState): boolean {

@@ -144,10 +144,22 @@ export class GuideSpecValidationException extends Error {
 }
 
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
-const DEPTH_PLANES: ReadonlySet<string> = new Set(['background', 'midground', 'foreground']);
-const MANNEQUIN_FACINGS: ReadonlySet<string> = new Set(['left', 'right', 'front', 'back']);
-const VECTOR_STYLES: ReadonlySet<string> = new Set(['solid', 'dashed']);
-const REGION_KINDS: ReadonlySet<string> = new Set(['rect', 'ellipse', 'polyline']);
+
+function isDepthPlane(value: unknown): value is DepthPlane {
+  return value === 'background' || value === 'midground' || value === 'foreground';
+}
+
+function isMannequinFacing(value: unknown): value is MannequinFacing {
+  return value === 'left' || value === 'right' || value === 'front' || value === 'back';
+}
+
+function isVectorStrokeStyle(value: unknown): value is VectorStrokeStyle {
+  return value === 'solid' || value === 'dashed';
+}
+
+function isOverlayRegionKind(value: unknown): value is OverlayRegionKind {
+  return value === 'rect' || value === 'ellipse' || value === 'polyline';
+}
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -236,7 +248,10 @@ function validateDepthBand(
   const id = readNonEmptyString(item, 'id', `${basePath}.id`, errors);
   const label = readNonEmptyString(item, 'label', `${basePath}.label`, errors);
   const rawPlane = item['plane'];
-  if (typeof rawPlane !== 'string' || !DEPTH_PLANES.has(rawPlane)) {
+  let plane: DepthPlane = 'midground';
+  if (isDepthPlane(rawPlane)) {
+    plane = rawPlane;
+  } else {
     errors.push({
       path: `${basePath}.plane`,
       message: 'must be one of background | midground | foreground',
@@ -254,9 +269,7 @@ function validateDepthBand(
   return {
     id,
     label,
-    plane: (typeof rawPlane === 'string' && DEPTH_PLANES.has(rawPlane)
-      ? rawPlane
-      : 'midground') as DepthPlane,
+    plane,
     yStartRatio,
     yEndRatio,
     fillHex,
@@ -291,7 +304,10 @@ function validateMannequin(
     errors,
   );
   const rawFacing = item['facing'];
-  if (typeof rawFacing !== 'string' || !MANNEQUIN_FACINGS.has(rawFacing)) {
+  let facing: MannequinFacing = 'front';
+  if (isMannequinFacing(rawFacing)) {
+    facing = rawFacing;
+  } else {
     errors.push({
       path: `${basePath}.facing`,
       message: 'must be one of left | right | front | back',
@@ -310,9 +326,7 @@ function validateMannequin(
     yRatio,
     heightMeters,
     scaleFactor,
-    facing: (typeof rawFacing === 'string' && MANNEQUIN_FACINGS.has(rawFacing)
-      ? rawFacing
-      : 'front') as MannequinFacing,
+    facing,
     poseHint,
     paletteHex,
   };
@@ -343,7 +357,10 @@ function validateActionVector(
     errors,
   );
   const rawStyle = item['style'];
-  if (typeof rawStyle !== 'string' || !VECTOR_STYLES.has(rawStyle)) {
+  let style: VectorStrokeStyle = 'solid';
+  if (isVectorStrokeStyle(rawStyle)) {
+    style = rawStyle;
+  } else {
     errors.push({ path: `${basePath}.style`, message: 'must be one of solid | dashed' });
   }
   return {
@@ -356,9 +373,7 @@ function validateActionVector(
     strokeHex,
     haloHex,
     strokeWidthPx,
-    style: (typeof rawStyle === 'string' && VECTOR_STYLES.has(rawStyle)
-      ? rawStyle
-      : 'solid') as VectorStrokeStyle,
+    style,
   };
 }
 
@@ -375,7 +390,10 @@ function validateOverlayRegion(
   const id = readNonEmptyString(item, 'id', `${basePath}.id`, errors);
   const label = readNonEmptyString(item, 'label', `${basePath}.label`, errors);
   const rawKind = item['kind'];
-  if (typeof rawKind !== 'string' || !REGION_KINDS.has(rawKind)) {
+  let kind: OverlayRegionKind = 'rect';
+  if (isOverlayRegionKind(rawKind)) {
+    kind = rawKind;
+  } else {
     errors.push({
       path: `${basePath}.kind`,
       message: 'must be one of rect | ellipse | polyline',
@@ -405,9 +423,7 @@ function validateOverlayRegion(
   return {
     id,
     label,
-    kind: (typeof rawKind === 'string' && REGION_KINDS.has(rawKind)
-      ? rawKind
-      : 'rect') as OverlayRegionKind,
+    kind,
     points,
     strokeHex,
     haloHex,
@@ -513,7 +529,7 @@ export function validateGuideSpec(input: unknown): GuideSpecParseResult {
     return { ok: false, errors };
   }
 
-  if (rawVariant === 'OverlayGuide') {
+  if (rawVariant === 'OverlayGuide' && typeof rawTargetImagePath === 'string') {
     return {
       ok: true,
       value: {
@@ -521,7 +537,7 @@ export function validateGuideSpec(input: unknown): GuideSpecParseResult {
         id,
         title,
         variant: 'OverlayGuide',
-        targetImagePath: rawTargetImagePath as string,
+        targetImagePath: rawTargetImagePath,
         canvasWidth,
         canvasHeight,
         depthBands,

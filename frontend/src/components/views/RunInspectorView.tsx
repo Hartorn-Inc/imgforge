@@ -14,7 +14,7 @@
 
 import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
-import { LIFECYCLE_ORDER, isExportEligible } from '../../state/workspace';
+import { LIFECYCLE_ORDER, isExportEligible, isLifecycleState } from '../../state/workspace';
 import type { AsyncViewState, LifecycleState, RunRecord } from '../../types/domain';
 import { StatePanel } from '../StatePanel';
 
@@ -161,10 +161,10 @@ export function RunInspectorView(): JSX.Element {
                 value={viewState.data.lifecycle}
                 disabled={viewState.data.lifecycle === 'canonical'}
                 onChange={(event) => {
-                  handleLifecycleChange(
-                    viewState.data.runId,
-                    event.currentTarget.value as LifecycleState,
-                  );
+                  const value = event.currentTarget.value;
+                  if (isLifecycleState(value)) {
+                    handleLifecycleChange(viewState.data.runId, value);
+                  }
                 }}
               >
                 {LIFECYCLE_ORDER.map((state) => (
@@ -192,7 +192,7 @@ export function RunInspectorView(): JSX.Element {
                 class="btn btn--primary"
                 disabled={!isExportEligible(viewState.data.lifecycle)}
               >
-                Export Derived Asset
+                Export Deliverable
               </button>
             </div>
             {!isExportEligible(viewState.data.lifecycle) && (

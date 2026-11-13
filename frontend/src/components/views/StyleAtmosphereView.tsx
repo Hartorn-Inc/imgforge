@@ -71,6 +71,16 @@ const SAMPLE_PAYLOAD: StyleAtmospherePayload = {
 
 type StatePreviewMode = 'ready' | 'loading' | 'empty' | 'error' | 'disabled';
 
+function isStatePreviewMode(value: string): value is StatePreviewMode {
+  return (
+    value === 'ready' ||
+    value === 'loading' ||
+    value === 'empty' ||
+    value === 'error' ||
+    value === 'disabled'
+  );
+}
+
 function buildViewState(mode: StatePreviewMode): AsyncViewState<StyleAtmospherePayload> {
   switch (mode) {
     case 'ready':
@@ -125,7 +135,10 @@ export function StyleAtmosphereView(): JSX.Element {
             class="select-input"
             value={previewMode}
             onChange={(event) => {
-              setPreviewMode(event.currentTarget.value as StatePreviewMode);
+              const value = event.currentTarget.value;
+              if (isStatePreviewMode(value)) {
+                setPreviewMode(value);
+              }
             }}
           >
             <option value="ready">Ready (Sample Catalog)</option>

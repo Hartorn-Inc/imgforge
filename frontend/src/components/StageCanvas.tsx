@@ -36,18 +36,58 @@ const GRID_DIVISIONS = 8;
 export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [canvasUnavailable, setCanvasUnavailable] = useState<string | null>(null);
+  const [viewportSize, setViewportSize] = useState<number>(STAGE_VIEWPORT_SIZE);
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || disabled) {
+    if (!container) {
+      return;
+    }
+
+    const updateViewportSize = (measuredWidth: number): void => {
+      if (!Number.isFinite(measuredWidth) || measuredWidth <= 0) {
+        return;
+      }
+      const clamped = Math.max(1, Math.min(STAGE_VIEWPORT_SIZE, Math.floor(measuredWidth)));
+      setViewportSize((prev) => (prev === clamped ? prev : clamped));
+    };
+
+    if (container.clientWidth > 0) {
+      updateViewportSize(container.clientWidth);
+    }
+
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        updateViewportSize(entry.contentRect.width);
+      }
+    });
+    observer.observe(container);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (disabled) {
+      setCanvasUnavailable(null);
+      return;
+    }
+
+    const container = containerRef.current;
+    if (!container) {
       return;
     }
 
     const aspectRatio = spec.canvasWidth / spec.canvasHeight;
     const stageWidth =
-      aspectRatio >= 1 ? STAGE_VIEWPORT_SIZE : Math.round(STAGE_VIEWPORT_SIZE * aspectRatio);
+      aspectRatio >= 1 ? viewportSize : Math.max(1, Math.round(viewportSize * aspectRatio));
     const stageHeight =
-      aspectRatio >= 1 ? Math.round(STAGE_VIEWPORT_SIZE / aspectRatio) : STAGE_VIEWPORT_SIZE;
+      aspectRatio >= 1 ? Math.max(1, Math.round(viewportSize / aspectRatio)) : viewportSize;
 
     let stage: Konva.Stage;
     try {
@@ -176,6 +216,38 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
               cornerRadius: 4,
             }),
           );
+        } else if (first && second && region.kind === 'ellipse') {
+          const x0 = first.xRatio * stageWidth;
+          const y0 = first.yRatio * stageHeight;
+          const x1 = second.xRatio * stageWidth;
+          const y1 = second.yRatio * stageHeight;
+          const centerX = (x0 + x1) / 2;
+          const centerY = (y0 + y1) / 2;
+          const radiusX = Math.abs(x1 - x0) / 2;
+          const radiusY = Math.abs(y1 - y0) / 2;
+
+          guideLayer.add(
+            new Konva.Ellipse({
+              x: centerX,
+              y: centerY,
+              radiusX,
+              radiusY,
+              stroke: region.haloHex,
+              strokeWidth: 6,
+            }),
+          );
+          guideLayer.add(
+            new Konva.Ellipse({
+              x: centerX,
+              y: centerY,
+              radiusX,
+              radiusY,
+              fill: region.fillHex,
+              opacity: region.opacity,
+              stroke: region.strokeHex,
+              strokeWidth: 2,
+            }),
+          );
         } else {
           const flatPoints = region.points.flatMap((pt) => [
             pt.xRatio * stageWidth,
@@ -289,7 +361,9 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
     return () => {
       stage.destroy();
     };
-  }, [spec, showGrid, disabled]);
+  }, [spec, showGrid, disabled, viewportSize]);
+
+  const isCanvasHidden = disabled || canvasUnavailable !== null;
 
   return (
     <div class="stage-frame">
@@ -304,18 +378,20 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
         <div class="stage-frame__placeholder" role="status">
           Konva canvas stage is disabled in the current view state.
         </div>
-      ) : canvasUnavailable !== null ? (
-        <div class="stage-frame__placeholder" role="alert">
-          Canvas preview unavailable in this browser context: {canvasUnavailable}
-        </div>
       ) : (
-        <div
-          ref={containerRef}
-          class="stage-frame__canvas"
-          role="img"
-          aria-label={`Konva SpatialGuide stage for ${spec.title} (${spec.variant}, ${String(spec.canvasWidth)} by ${String(spec.canvasHeight)} pixels)`}
-        />
+        canvasUnavailable !== null && (
+          <div class="stage-frame__placeholder" role="alert">
+            Canvas preview unavailable in this browser context: {canvasUnavailable}
+          </div>
+        )
       )}
+      <div
+        ref={containerRef}
+        hidden={isCanvasHidden}
+        class="stage-frame__canvas"
+        role="img"
+        aria-label={`Konva SpatialGuide stage for ${spec.title} (${spec.variant}, ${String(spec.canvasWidth)} by ${String(spec.canvasHeight)} pixels)`}
+      />
     </div>
   );
 }

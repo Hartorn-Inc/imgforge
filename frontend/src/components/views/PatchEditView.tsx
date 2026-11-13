@@ -26,6 +26,10 @@ const DEFAULT_PATCH_DRAFT: PatchEditDraft = {
   collarWidthPx: 32,
 };
 
+function isPatchRegionMode(value: string): value is PatchRegionMode {
+  return value === 'roi' || value === 'mask';
+}
+
 /** `PatchEdit Cropper` tab view. */
 export function PatchEditView(): JSX.Element {
   const [hasTargetRun, setHasTargetRun] = useState<boolean>(true);
@@ -87,8 +91,10 @@ export function PatchEditView(): JSX.Element {
                   class="select-input"
                   value={viewState.data.mode}
                   onChange={(event) => {
-                    const mode = event.currentTarget.value as PatchRegionMode;
-                    setDraft((prev) => ({ ...prev, mode }));
+                    const value = event.currentTarget.value;
+                    if (isPatchRegionMode(value)) {
+                      setDraft((prev) => ({ ...prev, mode: value }));
+                    }
                   }}
                 >
                   <option value="roi">ROI Square Crop</option>
@@ -186,7 +192,7 @@ export function PatchEditView(): JSX.Element {
               </button>
             </div>
             <p id="patchedit-submit-note" class="muted-note">
-              Run execution binds once the Rust job endpoint is connected in Phase 2+.
+              Run execution binds once the Rust Run endpoint is connected in Phase 2+.
             </p>
           </article>
         </div>

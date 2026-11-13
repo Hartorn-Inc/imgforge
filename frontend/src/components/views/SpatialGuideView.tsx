@@ -24,6 +24,10 @@ import {
 import { StageCanvas } from '../StageCanvas';
 import { StatePanel } from '../StatePanel';
 
+function isSpatialGuideVariant(value: string): value is SpatialGuideVariant {
+  return value === 'Blockout' || value === 'OverlayGuide';
+}
+
 /** `SpatialGuide Studio` tab view. */
 export function SpatialGuideView(): JSX.Element {
   const [spec, setSpec] = useState<GuideSpec>(() => createDefaultGuideSpec('Blockout'));
@@ -86,7 +90,10 @@ export function SpatialGuideView(): JSX.Element {
               class="select-input"
               value={spec.variant}
               onChange={(event) => {
-                handleVariantSwitch(event.currentTarget.value as SpatialGuideVariant);
+                const value = event.currentTarget.value;
+                if (isSpatialGuideVariant(value)) {
+                  handleVariantSwitch(value);
+                }
               }}
             >
               <option value="Blockout">Blockout</option>

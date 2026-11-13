@@ -168,7 +168,7 @@ body {
   margin: 0 auto;
 }
 
-.tabpanel:focus {
+.tabpanel:focus:not(:focus-visible) {
   outline: none;
 }
 
@@ -422,6 +422,10 @@ body {
   justify-content: center;
   align-items: center;
   min-height: 320px;
+}
+
+.stage-frame__canvas[hidden] {
+  display: none;
 }
 
 .stage-frame__placeholder {

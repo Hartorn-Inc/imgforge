@@ -23,31 +23,59 @@ describe('GuideSpec defensive serialization and validation', () => {
     }
   });
 
-  test('normalizes lowercase hex colors during validation round-trip', () => {
-    const base = createDefaultGuideSpec('Blockout');
-    const withLowerHex: GuideSpec = {
-      ...base,
-      actionVectors: [
-        {
-          id: 'vec-lower',
-          label: 'Lowercase hex vector',
-          fromXRatio: 0.1,
-          fromYRatio: 0.2,
-          toXRatio: 0.8,
-          toYRatio: 0.7,
-          strokeHex: '#abcdef',
-          haloHex: '#112233',
-          strokeWidthPx: 3,
-          style: 'dashed',
-        },
-      ],
-    };
-
-    const parsed = parseGuideSpecJson(serializeGuideSpecJson(withLowerHex, false));
+  test.each<{
+    id: string;
+    buildSpec: () => GuideSpec;
+    readHexes: (spec: GuideSpec) => readonly (string | undefined)[];
+    expectedHexes: readonly string[];
+  }>([
+    {
+      id: 'normalizes-lowercase-action-vector-hex-colors',
+      buildSpec: () => {
+        const base = createDefaultGuideSpec('Blockout');
+        return {
+          ...base,
+          actionVectors: [
+            {
+              id: 'vec-lower',
+              label: 'Lowercase hex vector',
+              fromXRatio: 0.1,
+              fromYRatio: 0.2,
+              toXRatio: 0.8,
+              toYRatio: 0.7,
+              strokeHex: '#abcdef',
+              haloHex: '#112233',
+              strokeWidthPx: 3,
+              style: 'dashed',
+            },
+          ],
+        };
+      },
+      readHexes: (spec) => [spec.actionVectors[0]?.strokeHex, spec.actionVectors[0]?.haloHex],
+      expectedHexes: ['#ABCDEF', '#112233'],
+    },
+    {
+      id: 'normalizes-mixed-case-depth-band-and-mannequin-hex-colors',
+      buildSpec: () => {
+        const base = createDefaultGuideSpec('Blockout');
+        return {
+          ...base,
+          depthBands: base.depthBands.map((band, index) =>
+            index === 0 ? { ...band, fillHex: '#2c334a' } : band,
+          ),
+          mannequins: base.mannequins.map((mannequin, index) =>
+            index === 0 ? { ...mannequin, paletteHex: '#63b3ed' } : mannequin,
+          ),
+        };
+      },
+      readHexes: (spec) => [spec.depthBands[0]?.fillHex, spec.mannequins[0]?.paletteHex],
+      expectedHexes: ['#2C334A', '#63B3ED'],
+    },
+  ])('$id', ({ buildSpec, readHexes, expectedHexes }) => {
+    const parsed = parseGuideSpecJson(serializeGuideSpecJson(buildSpec(), false));
     expect(parsed.ok).toBe(true);
     if (parsed.ok) {
-      expect(parsed.value.actionVectors[0]?.strokeHex).toBe('#ABCDEF');
-      expect(parsed.value.actionVectors[0]?.haloHex).toBe('#112233');
+      expect(readHexes(parsed.value)).toEqual(expectedHexes);
     }
   });
 
@@ -185,12 +213,49 @@ describe('GuideSpec defensive serialization and validation', () => {
     }
   });
 
-  test('serializeGuideSpecJson fails closed on invalid in-memory GuideSpec', () => {
-    const invalidSpec = {
-      ...createDefaultGuideSpec('Blockout'),
-      canvasWidth: -100,
-    } as unknown as GuideSpec;
-
-    expect(() => serializeGuideSpecJson(invalidSpec)).toThrow(GuideSpecValidationException);
+  test.each<{
+    id: string;
+    buildInvalidSpec: () => GuideSpec;
+    expectedPath: string;
+  }>([
+    {
+      id: 'reject-negative-canvas-width-in-memory-serialization',
+      buildInvalidSpec: () => {
+        const base = createDefaultGuideSpec('Blockout');
+        if (base.variant !== 'Blockout') {
+          throw new Error('Expected Blockout default GuideSpec');
+        }
+        return {
+          ...base,
+          canvasWidth: -100,
+        };
+      },
+      expectedPath: 'canvasWidth',
+    },
+    {
+      id: 'reject-empty-overlay-target-image-in-memory-serialization',
+      buildInvalidSpec: () => {
+        const base = createDefaultGuideSpec('OverlayGuide');
+        if (base.variant !== 'OverlayGuide') {
+          throw new Error('Expected OverlayGuide default GuideSpec');
+        }
+        return {
+          ...base,
+          targetImagePath: '',
+        };
+      },
+      expectedPath: 'targetImagePath',
+    },
+  ])('$id', ({ buildInvalidSpec, expectedPath }) => {
+    let caught: unknown;
+    try {
+      serializeGuideSpecJson(buildInvalidSpec());
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(GuideSpecValidationException);
+    if (caught instanceof GuideSpecValidationException) {
+      expect(caught.errors.some((entry) => entry.path === expectedPath)).toBe(true);
+    }
   });
 });
