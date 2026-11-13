@@ -32,6 +32,7 @@ use tokio::process::Command;
 use crate::auth::{DEFAULT_CODEX_BIN, TempCodexHome};
 use crate::composer::read_structured_json_output;
 use crate::error::CoreError;
+use crate::store::{decode_png_checked, read_regular_file_nofollow};
 
 /// Opening delimiter marking untrusted trait checklist items inside `VisionCritic` prompts.
 pub const TRAIT_CHECKLIST_START: &str = "<<<TRAIT_CHECKLIST>>>";
@@ -199,19 +200,12 @@ impl VisionCritic {
 
     /// Evaluate `request.target_image` against `request.reference_images` using binary trait checks.
     pub async fn evaluate(&self, request: &VisionCriticRequest) -> Result<CriticReport, CoreError> {
-        if !request.target_image.is_file() {
-            return Err(CoreError::InvalidGenerationRequest(format!(
-                "target image does not exist or is not a regular file: {}",
-                request.target_image.display()
-            )));
-        }
+        let target_bytes =
+            read_regular_file_nofollow(&request.target_image, "VisionCritic target PNG")?;
+        let _ = decode_png_checked(&request.target_image, &target_bytes)?;
         for ref_path in &request.reference_images {
-            if !ref_path.is_file() {
-                return Err(CoreError::InvalidGenerationRequest(format!(
-                    "reference image does not exist or is not a regular file: {}",
-                    ref_path.display()
-                )));
-            }
+            let ref_bytes = read_regular_file_nofollow(ref_path, "VisionCritic reference PNG")?;
+            let _ = decode_png_checked(ref_path, &ref_bytes)?;
         }
         if request.traits.is_empty() {
             return Err(CoreError::InvalidGenerationRequest(
@@ -464,12 +458,24 @@ pub fn validate_critic_report_for_traits(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use rstest::rstest;
 
     use super::*;
+
+    fn make_tiny_png(w: u32, h: u32) -> Vec<u8> {
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(w, h, Rgba([90, 120, 150, 255]));
+        let mut buf = Vec::new();
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        buf
+    }
 
     fn create_secure_auth_dir(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
@@ -522,8 +528,8 @@ mod tests {
 
         let target_img = root.path().join("out.png");
         let ref_img = root.path().join("ref.png");
-        fs::write(&target_img, b"stub-target").unwrap();
-        fs::write(&ref_img, b"stub-ref").unwrap();
+        fs::write(&target_img, make_tiny_png(16, 16)).unwrap();
+        fs::write(&ref_img, make_tiny_png(16, 16)).unwrap();
 
         let args_log = root.path().join("critic_args.txt");
         let stub_bin = root.path().join("codex-critic");
@@ -674,7 +680,7 @@ JSON
         let root = TempDir::new().expect("tempdir");
         let auth_dir = root.path().join("auth");
         let target_img = root.path().join("out.png");
-        fs::write(&target_img, b"stub").unwrap();
+        fs::write(&target_img, make_tiny_png(16, 16)).unwrap();
 
         let critic = VisionCritic::with_codex_bin(auth_dir, "/nonexistent/codex");
         let err = critic
@@ -697,5 +703,73 @@ JSON
             .await
             .expect_err("duplicate trait_id must fail closed");
         assert!(matches!(err, CoreError::InvalidGenerationRequest(_)));
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::symlink_target("symlink_target")]
+    #[case::symlink_ref("symlink_ref")]
+    #[case::non_png_target("non_png_target")]
+    #[case::non_png_ref("non_png_ref")]
+    #[tokio::test]
+    async fn vision_critic_rejects_symlink_and_invalid_png_inputs_before_spawning_codex(
+        #[case] case_kind: &str,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let auth_dir = root.path().join("auth");
+        create_secure_auth_dir(&auth_dir);
+
+        let valid_png = root.path().join("valid.png");
+        fs::write(&valid_png, make_tiny_png(16, 16)).unwrap();
+        let bad_png = root.path().join("bad.png");
+        fs::write(&bad_png, b"NOT_A_PNG").unwrap();
+        let link_png = root.path().join("link.png");
+        std::os::unix::fs::symlink(&valid_png, &link_png).unwrap();
+
+        let spawned_marker = root.path().join("codex_spawned.marker");
+        let stub_bin = root.path().join("codex-sentinel");
+        fs::write(
+            &stub_bin,
+            format!(
+                "#!/usr/bin/env bash\ntouch \"{}\"\nexit 1\n",
+                spawned_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (target_image, reference_images) = match case_kind {
+            "symlink_target" => (link_png, Vec::new()),
+            "symlink_ref" => (valid_png, vec![link_png]),
+            "non_png_target" => (bad_png, Vec::new()),
+            "non_png_ref" => (valid_png, vec![bad_png]),
+            _ => unreachable!(),
+        };
+
+        let critic =
+            VisionCritic::with_codex_bin(auth_dir, stub_bin.to_string_lossy().into_owned());
+        let err = critic
+            .evaluate(&VisionCriticRequest {
+                target_image,
+                reference_images,
+                traits: vec![TraitCheckInput {
+                    trait_id: "t1".to_string(),
+                    category: TraitCategory::ZeroLeakedText,
+                    criterion: "No leaked text".to_string(),
+                }],
+            })
+            .await
+            .expect_err("symlink or non-PNG input must fail closed");
+        match case_kind {
+            "symlink_target" | "symlink_ref" => assert!(matches!(err, CoreError::Io { .. })),
+            "non_png_target" | "non_png_ref" => {
+                assert!(matches!(err, CoreError::InvalidPng { .. }))
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !spawned_marker.exists(),
+            "codex subprocess must not be spawned on invalid target/reference images"
+        );
     }
 }

@@ -18,7 +18,6 @@
 mod mcp;
 mod server;
 
-use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};
@@ -30,17 +29,17 @@ use imgforge_core::{
     DEFAULT_COLLAR_WIDTH_PX, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
     DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportSource, ExposureQaConfig,
     GenerateRequest, GenerateSceneInput, GenerationMode, GuideRenderer, GuideSpec, LibraryRegistry,
-    Lifecycle, ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi, PaletteQaConfig,
-    PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect, PromptCompiler,
+    Lifecycle, MAX_TEXT_FILE_BYTES, ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi,
+    PaletteQaConfig, PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect,
     ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore, SceneComposer,
     SceneSpec, SlicerConfig, SparkleConfig, SubjectRoiBinding, TraitCategory, TraitCheckInput,
     UntouchedDriftConfig, ValidateReferencePackRequest, ValidateRunRequest, Visibility,
     VisionCritic, VisionCriticRequest, VttMapOptions, VttTokenOptions, WholeImageEditRequest,
-    check_visibility_compatibility, execute_export, execute_generate, execute_patch_edit,
-    execute_whole_image_edit, inspect_workspace_status, pack_dynamic_atlas, promote_reference_pack,
-    promote_run, resolve_codex_auth_dir_from_env, resolve_user_config_dir_from_env,
-    resolve_workspace_from_env, slice_sheet_to_dir, validate_reference_pack, validate_run,
-    write_atomic,
+    check_visibility_compatibility, compile_scene_spec_with_registry, execute_export,
+    execute_generate, execute_patch_edit, execute_whole_image_edit, inspect_workspace_status,
+    pack_dynamic_atlas, promote_reference_pack, promote_run, read_text_file_nofollow_bounded,
+    resolve_codex_auth_dir_from_env, resolve_user_config_dir_from_env, resolve_workspace_from_env,
+    slice_sheet_to_dir, validate_reference_pack, validate_run, write_atomic,
 };
 use serde::Serialize;
 
@@ -857,8 +856,9 @@ async fn main() -> anyhow::Result<()> {
 
             let prose = match (args.prose, args.prose_file) {
                 (Some(inline), None) => inline,
-                (None, Some(path)) => fs::read_to_string(&path)
-                    .with_context(|| format!("reading prose file {}", path.display()))?,
+                (None, Some(path)) => {
+                    read_text_file_nofollow_bounded(&path, "prose file", MAX_TEXT_FILE_BYTES)?
+                }
                 (None, None) => bail!("either --prose or --prose-file must be provided"),
                 (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both"),
             };
@@ -871,7 +871,7 @@ async fn main() -> anyhow::Result<()> {
             };
 
             if let Some(out_path) = args.out {
-                fs::write(&out_path, &rendered)
+                write_atomic(&out_path, rendered.as_bytes(), "SceneSpec")
                     .with_context(|| format!("writing SceneSpec to {}", out_path.display()))?;
                 println!("Wrote validated SceneSpec to {}", out_path.display());
             } else {
@@ -882,16 +882,8 @@ async fn main() -> anyhow::Result<()> {
             (Some(scene_path), None, None) => {
                 let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
                 let spec = SceneSpec::load_from_path(&scene_path)?;
-                let mut overrides = std::collections::BTreeMap::new();
-                if let Some(resolved_ws) = ws.as_ref() {
-                    let registry = LibraryRegistry::from_workspace(resolved_ws);
-                    for slot in &spec.foreground_slots {
-                        if let Ok(resolved) = registry.resolve_subject(slot.subject_ref.trim()) {
-                            overrides.insert(resolved.subject.slug, resolved.subject.visibility);
-                        }
-                    }
-                }
-                let compiled = PromptCompiler::compile_with_subject_visibility(&spec, &overrides)?;
+                let registry = ws.as_ref().map(LibraryRegistry::from_workspace);
+                let compiled = compile_scene_spec_with_registry(&spec, registry.as_ref())?;
                 if args.json {
                     println!(
                         "{}",
@@ -1279,20 +1271,6 @@ async fn main() -> anyhow::Result<()> {
                         None => None,
                     };
                     let target_visibility: Visibility = visibility.into();
-                    let mut run_vis_checks: Vec<(String, Visibility)> = Vec::new();
-                    if let Some(run_vis) = run_store.inspect_run_image_visibility(&target)? {
-                        run_vis_checks.push((target.display().to_string(), run_vis));
-                    }
-                    for ref_path in &references {
-                        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
-                            run_vis_checks.push((ref_path.display().to_string(), run_vis));
-                        }
-                    }
-                    check_visibility_compatibility(
-                        target_visibility,
-                        "WholeImageEdit",
-                        run_vis_checks.iter().map(|(id, vis)| (id.as_str(), *vis)),
-                    )?;
                     let mut subject_rois = Vec::with_capacity(subjects.len());
                     for subj_slug in &subjects {
                         let resolved = registry.resolve_subject(subj_slug)?;
@@ -1311,6 +1289,7 @@ async fn main() -> anyhow::Result<()> {
                     let res = execute_whole_image_edit(
                         &backend,
                         &run_store,
+                        Some(&registry),
                         &WholeImageEditRequest {
                             slug,
                             visibility: target_visibility,
@@ -1361,20 +1340,6 @@ async fn main() -> anyhow::Result<()> {
                     json,
                 } => {
                     let target_visibility: Visibility = visibility.into();
-                    let mut run_vis_checks: Vec<(String, Visibility)> = Vec::new();
-                    if let Some(run_vis) = run_store.inspect_run_image_visibility(&target)? {
-                        run_vis_checks.push((target.display().to_string(), run_vis));
-                    }
-                    for ref_path in &references {
-                        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
-                            run_vis_checks.push((ref_path.display().to_string(), run_vis));
-                        }
-                    }
-                    check_visibility_compatibility(
-                        target_visibility,
-                        "PatchEdit",
-                        run_vis_checks.iter().map(|(id, vis)| (id.as_str(), *vis)),
-                    )?;
                     let target_mask = match (roi, mask) {
                         (Some(raw_roi), None) => PatchTargetMask::Roi(parse_roi_arg(&raw_roi)?),
                         (None, Some(mask_path)) => PatchTargetMask::MaskImagePath(mask_path),
@@ -1384,6 +1349,7 @@ async fn main() -> anyhow::Result<()> {
                     let res = execute_patch_edit(
                         &backend,
                         &run_store,
+                        Some(&registry),
                         &PatchEditRequest {
                             slug,
                             visibility: target_visibility,
@@ -1432,8 +1398,8 @@ async fn main() -> anyhow::Result<()> {
             let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
             match args.action {
                 GuideSubcommand::Validate { spec } => {
-                    let raw = fs::read_to_string(&spec)
-                        .with_context(|| format!("reading GuideSpec at {}", spec.display()))?;
+                    let raw =
+                        read_text_file_nofollow_bounded(&spec, "GuideSpec", MAX_TEXT_FILE_BYTES)?;
                     let parsed = GuideSpec::from_json_str(&raw)?;
                     println!(
                         "GuideSpec '{}' valid (variant={:?}, canvas={}x{}, bands={}, mannequins={}, vectors={}, regions={})",
@@ -1448,8 +1414,8 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 GuideSubcommand::Render { spec, out, json } => {
-                    let raw = fs::read_to_string(&spec)
-                        .with_context(|| format!("reading GuideSpec at {}", spec.display()))?;
+                    let raw =
+                        read_text_file_nofollow_bounded(&spec, "GuideSpec", MAX_TEXT_FILE_BYTES)?;
                     let parsed = GuideSpec::from_json_str(&raw)?;
                     let ws_root = match ws {
                         Some(resolved) => resolved.root,
@@ -1488,6 +1454,10 @@ async fn main() -> anyhow::Result<()> {
             let run_store = ws
                 .as_ref()
                 .map(|w| RunStore::new(w.root.join(&w.config.paths.runs_dir)));
+            let registry = match ws.as_ref() {
+                Some(resolved) => LibraryRegistry::from_workspace(resolved),
+                None => LibraryRegistry::new(None, resolve_user_config_dir_from_env()),
+            };
 
             let (source, default_slug) = match (args.run, args.input) {
                 (Some(run_ref), None) => {
@@ -1505,12 +1475,6 @@ async fn main() -> anyhow::Result<()> {
                     )
                 }
                 (None, Some(path)) => {
-                    let mut effective_source_vis: Visibility = args.source_visibility.into();
-                    if let Some(ref store) = run_store
-                        && let Some(run_vis) = store.inspect_run_image_visibility(&path)?
-                    {
-                        effective_source_vis = std::cmp::max(effective_source_vis, run_vis);
-                    }
                     let stem = path
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -1520,7 +1484,7 @@ async fn main() -> anyhow::Result<()> {
                         ExportSource::PngPath {
                             path,
                             asset_id: stem.clone(),
-                            visibility: effective_source_vis,
+                            visibility: args.source_visibility.into(),
                         },
                         stem,
                     )
@@ -1561,6 +1525,7 @@ async fn main() -> anyhow::Result<()> {
 
             let result = execute_export(
                 run_store.as_ref(),
+                Some(&registry),
                 &ExportRequest {
                     source,
                     output_slug,
@@ -1747,9 +1712,12 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
                 let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+                let run_store =
+                    RunStore::new(resolved_ws.root.join(&resolved_ws.config.paths.runs_dir));
                 let registry = LibraryRegistry::from_workspace(&resolved_ws);
                 let backend = CodexNativeBackend::with_codex_bin(auth_dir, codex_bin);
-                let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+                let pipeline =
+                    ReferencePackPipeline::new(&backend, &registry, Some(&run_store), library_dir);
                 let mut req = ReferencePackRequest::new(subject, style);
                 req.seed_path = seed;
                 req.seed_label = seed_label;
@@ -1816,13 +1784,6 @@ async fn main() -> anyhow::Result<()> {
                 };
                 let result = pack_dynamic_atlas(&registry, &library_dir, &req)?;
 
-                if let Some(parent) = out.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    fs::create_dir_all(parent).with_context(|| {
-                        format!("creating Atlas output directory {}", parent.display())
-                    })?;
-                }
                 for page in &result.pages {
                     let page_path = if result.pages.len() == 1 {
                         out.clone()
@@ -1830,7 +1791,7 @@ async fn main() -> anyhow::Result<()> {
                         let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("atlas");
                         out.with_file_name(format!("{stem}_p{}.png", page.page_index + 1))
                     };
-                    fs::write(&page_path, &page.png_bytes)
+                    write_atomic(&page_path, &page.png_bytes, "Atlas PNG")
                         .with_context(|| format!("writing Atlas PNG {}", page_path.display()))?;
                 }
 

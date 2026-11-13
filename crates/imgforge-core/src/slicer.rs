@@ -36,7 +36,10 @@ use serde::{Deserialize, Serialize};
 use crate::calibration::{STUDIO_BG_RGB, studio_bg_distance};
 use crate::error::CoreError;
 use crate::lifecycle::sha256_hex;
-use crate::store::{decode_png_checked, read_regular_file_nofollow, write_atomic};
+use crate::store::{
+    decode_png_checked, read_regular_file_nofollow, verify_contained_path_no_symlinks,
+    verify_existing_dir_prefix_no_symlinks, write_atomic,
+};
 
 /// Supported `SlicesManifest` schema version.
 pub const SUPPORTED_SLICES_SCHEMA_VERSION: u32 = 1;
@@ -329,15 +332,29 @@ pub fn slice_sheet_to_dir(
     let rgba = decoded.to_rgba8();
     let extracted = slice_sheet_image(&rgba, config)?;
 
+    ensure_out_dir_no_symlinks(out_dir)?;
+    verify_existing_dir_prefix_no_symlinks(
+        out_dir,
+        Path::new("slices"),
+        "slices output directory",
+    )?;
+
     let slices_dir = out_dir.join("slices");
     fs::create_dir_all(&slices_dir).map_err(|err| CoreError::Io {
         context: format!("creating slices directory {}", slices_dir.display()),
         source: err,
     })?;
+    verify_contained_path_no_symlinks(
+        out_dir,
+        Path::new("slices"),
+        true,
+        "slices output directory",
+    )?;
 
     let mut records = Vec::with_capacity(extracted.len());
     for slice in extracted {
         let dest = out_dir.join(&slice.record.file);
+        reject_existing_symlink(&dest, "slice PNG")?;
         write_atomic(&dest, &slice.png_bytes, "slice PNG")?;
         records.push(slice.record);
     }
@@ -356,10 +373,94 @@ pub fn slice_sheet_to_dir(
         slices: records,
     };
 
+    let manifest_path = out_dir.join("slices.json");
+    reject_existing_symlink(&manifest_path, "slices.json")?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|err| CoreError::SlicerFailed(err.to_string()))?;
-    write_atomic(&out_dir.join("slices.json"), &manifest_bytes, "slices.json")?;
+    write_atomic(&manifest_path, &manifest_bytes, "slices.json")?;
     Ok(manifest)
+}
+
+fn ensure_out_dir_no_symlinks(out_dir: &Path) -> Result<(), CoreError> {
+    match fs::symlink_metadata(out_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(CoreError::Io {
+                    context: format!("inspecting slicer out_dir {}", out_dir.display()),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "refusing symlink or non-directory slicer out_dir: {}",
+                            out_dir.display()
+                        ),
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(CoreError::Io {
+                context: format!("inspecting slicer out_dir {}", out_dir.display()),
+                source: err,
+            });
+        }
+    }
+
+    for ancestor in out_dir.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(ancestor) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(CoreError::Io {
+                        context: format!(
+                            "inspecting slicer out_dir ancestor {}",
+                            ancestor.display()
+                        ),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "refusing symlink or non-directory ancestor in slicer out_dir: {}",
+                                ancestor.display()
+                            ),
+                        ),
+                    });
+                }
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!("inspecting slicer out_dir ancestor {}", ancestor.display()),
+                    source: err,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_existing_symlink(path: &Path, label: &str) -> Result<(), CoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(CoreError::Io {
+            context: format!("inspecting {label} at {}", path.display()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing symlink at {label} destination: {}",
+                    path.display()
+                ),
+            ),
+        }),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CoreError::Io {
+            context: format!("inspecting {label} at {}", path.display()),
+            source: err,
+        }),
+    }
 }
 
 fn validate_slice_identifier(raw: &str, field_name: &str) -> Result<String, CoreError> {
@@ -770,5 +871,50 @@ mod tests {
         if !expect_ok {
             assert!(matches!(res.unwrap_err(), CoreError::SlicerFailed(_)));
         }
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::symlinked_out_dir("out_dir")]
+    #[case::symlinked_slices_subdir("slices_subdir")]
+    #[case::symlinked_parent_dir("parent_dir")]
+    fn slice_sheet_to_dir_rejects_symlinks_in_out_dir_and_slices(#[case] mode: &str) {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let mut img: RgbaImage = ImageBuffer::from_pixel(200, 200, Rgba(STUDIO_BG_RGBA));
+        paint_box(&mut img, 40, 40, 60, 60, [200, 160, 120]);
+        let sheet_path = root.path().join("sheet.png");
+        DynamicImage::ImageRgba8(img)
+            .save_with_format(&sheet_path, ImageFormat::Png)
+            .unwrap();
+
+        let escape_dir = root.path().join("escape");
+        fs::create_dir_all(&escape_dir).unwrap();
+
+        let out_dir = match mode {
+            "out_dir" => {
+                let link = root.path().join("out_link");
+                symlink(&escape_dir, &link).unwrap();
+                link
+            }
+            "slices_subdir" => {
+                let od = root.path().join("out_real");
+                fs::create_dir_all(&od).unwrap();
+                symlink(&escape_dir, od.join("slices")).unwrap();
+                od
+            }
+            "parent_dir" => {
+                let link_parent = root.path().join("parent_link");
+                symlink(&escape_dir, &link_parent).unwrap();
+                link_parent.join("nested_out")
+            }
+            _ => unreachable!(),
+        };
+
+        let err = slice_sheet_to_dir(&sheet_path, &out_dir, &SlicerConfig::default())
+            .expect_err("symlinked out_dir or slices dir must fail closed");
+        assert!(matches!(err, CoreError::Io { .. }));
+        assert!(fs::read_dir(&escape_dir).unwrap().next().is_none());
     }
 }

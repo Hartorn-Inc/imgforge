@@ -40,11 +40,13 @@ use crate::calibration::{
 };
 use crate::error::CoreError;
 use crate::lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex};
-use crate::registry::{LibraryRegistry, ResolvedStyle, ResolvedSubject};
-use crate::scene_spec::Visibility;
+use crate::registry::{
+    LibraryRegistry, ResolvedStyle, ResolvedSubject, inspect_asset_image_visibility,
+};
+use crate::scene_spec::{Visibility, check_visibility_compatibility};
 use crate::slicer::{RectOverride, SliceRecord, SlicerConfig, SlicesManifest, slice_sheet_image};
 use crate::store::{
-    decode_png_checked, read_regular_file_nofollow, verify_contained_path_no_symlinks,
+    RunStore, decode_png_checked, read_regular_file_nofollow, verify_contained_path_no_symlinks,
     verify_existing_dir_prefix_no_symlinks, write_atomic,
 };
 use crate::style::Style;
@@ -204,20 +206,24 @@ pub struct GeneratedReferencePack {
 pub struct ReferencePackPipeline<'a> {
     backend: &'a dyn ImageBackend,
     registry: &'a LibraryRegistry,
+    run_store: Option<&'a RunStore>,
     library_dir: PathBuf,
 }
 
 impl<'a> ReferencePackPipeline<'a> {
-    /// Construct a `ReferencePackPipeline` bound to a backend, library registry, and project `library_dir`.
+    /// Construct a `ReferencePackPipeline` bound to a backend, library registry, optional `RunStore`,
+    /// and project `library_dir`.
     #[must_use]
     pub fn new(
         backend: &'a dyn ImageBackend,
         registry: &'a LibraryRegistry,
+        run_store: Option<&'a RunStore>,
         library_dir: PathBuf,
     ) -> Self {
         Self {
             backend,
             registry,
+            run_store,
             library_dir,
         }
     }
@@ -234,7 +240,18 @@ impl<'a> ReferencePackPipeline<'a> {
         validate_request_overrides(resolved_subject.subject.kind, request)?;
 
         let seed = match request.seed_path {
-            Some(ref path) => Some(SeedInput::from_png_path(path, request.seed_label.clone())?),
+            Some(ref path) => {
+                if let Some(seed_vis) =
+                    inspect_asset_image_visibility(self.run_store, Some(self.registry), path)?
+                {
+                    check_visibility_compatibility(
+                        resolved_subject.subject.visibility,
+                        "ReferencePack Seed",
+                        [(path.display().to_string().as_str(), seed_vis)],
+                    )?;
+                }
+                Some(SeedInput::from_png_path(path, request.seed_label.clone())?)
+            }
             None => None,
         };
 
@@ -769,7 +786,7 @@ visibility: public
 
         let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
         let backend = MockPackBackend::new();
-        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir.clone());
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, None, library_dir.clone());
 
         let mut req = ReferencePackRequest::new(slug, "franco-belgian-line");
         req.seed_path = Some(seed_path.clone());
@@ -823,7 +840,7 @@ visibility: public
 
         let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
         let backend = MockPackBackend::new();
-        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir.clone());
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, None, library_dir.clone());
         let req = ReferencePackRequest::new("brass-lantern", "franco-belgian-line");
         let generated = pipeline.generate(&req).await.unwrap();
 
@@ -879,7 +896,7 @@ visibility: public
 
         let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
         let backend = MockPackBackend::new();
-        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, None, library_dir);
 
         let mut req = ReferencePackRequest::new("test-subject", "franco-belgian-line");
         req.slicer_config.overrides = vec![RectOverride {
@@ -915,7 +932,7 @@ visibility: public
 
         let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
         let backend = MockPackBackend::new();
-        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, None, library_dir);
 
         let mut req = ReferencePackRequest::new("courier-ren", "franco-belgian-line");
         let sample_rect = PixelRect {
@@ -989,7 +1006,7 @@ visibility: public
 
         let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
         let backend = MockPackBackend::new();
-        let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+        let pipeline = ReferencePackPipeline::new(&backend, &registry, None, library_dir);
         let req = ReferencePackRequest::new("brass-lantern", "franco-belgian-line");
 
         let err = pipeline
@@ -1001,5 +1018,99 @@ visibility: public
             backend.calls.lock().unwrap().is_empty(),
             "symlink check must run before invoking backend"
         );
+    }
+
+    #[rstest]
+    #[case::internal_run_seed_into_public_subject(true, "internal", "public", false)]
+    #[case::restricted_run_seed_into_public_subject(true, "restricted", "public", false)]
+    #[case::internal_pack_seed_into_public_subject(false, "internal", "public", false)]
+    #[case::internal_run_seed_into_internal_subject(true, "internal", "internal", true)]
+    #[tokio::test]
+    async fn enforces_seed_visibility_against_subject_visibility_before_backend(
+        #[case] seed_from_run: bool,
+        #[case] seed_vis_str: &str,
+        #[case] subject_vis_str: &str,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let library_dir = root.path().join("library");
+        write_subject_card(&library_dir, "target-prop", "prop");
+        let card_path = library_dir.join("subjects/target-prop/card.yaml");
+        let updated_card = fs::read_to_string(&card_path).unwrap().replace(
+            "visibility: public",
+            &format!("visibility: {subject_vis_str}"),
+        );
+        fs::write(&card_path, updated_card).unwrap();
+
+        let seed_vis = match seed_vis_str {
+            "internal" => Visibility::Internal,
+            "restricted" => Visibility::Restricted,
+            _ => Visibility::Public,
+        };
+
+        let run_store = RunStore::new(root.path().join("runs"));
+        let seed_path = if seed_from_run {
+            let img: RgbaImage = ImageBuffer::from_pixel(64, 64, Rgba([120, 100, 80, 255]));
+            let mut buf = Vec::new();
+            DynamicImage::ImageRgba8(img)
+                .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+                .unwrap();
+            let rec = run_store
+                .record_run(crate::store::RecordRunParams {
+                    slug: "secret-seed".to_string(),
+                    visibility: seed_vis,
+                    png_bytes: buf,
+                    input_hashes: BTreeMap::new(),
+                    compiled_prompt: "seed".to_string(),
+                    backend: crate::store::RunBackendMetadata {
+                        name: "stub".to_string(),
+                        width: 64,
+                        height: 64,
+                        raw_width: 64,
+                        raw_height: 64,
+                        thread_id: None,
+                    },
+                    seed: None,
+                    qa_reports: crate::store::RunQaReports::default(),
+                })
+                .unwrap();
+            rec.image_path
+        } else {
+            write_subject_card(&library_dir, "secret-source", "prop");
+            let src_card = library_dir.join("subjects/secret-source/card.yaml");
+            let updated_src = fs::read_to_string(&src_card)
+                .unwrap()
+                .replace("visibility: public", &format!("visibility: {seed_vis_str}"));
+            fs::write(&src_card, updated_src).unwrap();
+            let slices_dir =
+                library_dir.join("subjects/secret-source/packs/franco-belgian-line/slices");
+            fs::create_dir_all(&slices_dir).unwrap();
+            let slice_path = slices_dir.join("sheet_001.png");
+            let img: RgbaImage = ImageBuffer::from_pixel(64, 64, Rgba([120, 100, 80, 255]));
+            DynamicImage::ImageRgba8(img)
+                .save_with_format(&slice_path, ImageFormat::Png)
+                .unwrap();
+            slice_path
+        };
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let backend = MockPackBackend::new();
+        let pipeline =
+            ReferencePackPipeline::new(&backend, &registry, Some(&run_store), library_dir);
+        let mut req = ReferencePackRequest::new("target-prop", "franco-belgian-line");
+        req.seed_path = Some(seed_path);
+
+        let res = pipeline.generate(&req).await;
+        assert_eq!(res.is_ok(), expect_ok);
+        if !expect_ok {
+            assert!(matches!(
+                res.unwrap_err(),
+                CoreError::VisibilityViolation { .. }
+            ));
+            assert!(
+                backend.calls.lock().unwrap().is_empty(),
+                "backend must not be invoked on Seed visibility violation"
+            );
+        }
     }
 }

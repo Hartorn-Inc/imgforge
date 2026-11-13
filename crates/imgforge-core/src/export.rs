@@ -39,6 +39,7 @@ use crate::calibration::{STUDIO_BG_RGB, parse_hex_rgb};
 use crate::color_qa::srgb_u8_to_lab;
 use crate::error::CoreError;
 use crate::lifecycle::{sha256_hex, validate_slug};
+use crate::registry::{LibraryRegistry, inspect_asset_image_visibility};
 use crate::scene_spec::{Visibility, check_visibility_compatibility};
 use crate::store::{
     MAX_CUBE_LUT_BYTES, MAX_IMAGE_DIM, MAX_IMAGE_TOTAL_PIXELS, RunStore, decode_png_checked,
@@ -236,6 +237,7 @@ pub struct ExportResult {
 /// `Lifecycle` versions, enforcing `Visibility` boundaries fail-closed.
 pub fn execute_export(
     run_store: Option<&RunStore>,
+    registry: Option<&LibraryRegistry>,
     request: &ExportRequest,
 ) -> Result<ExportResult, CoreError> {
     validate_slug(&request.output_slug, "Export").map_err(CoreError::ExportFailed)?;
@@ -261,10 +263,8 @@ pub fn execute_export(
             visibility,
         } => {
             let mut effective_vis = *visibility;
-            if let Some(store) = run_store
-                && let Some(run_vis) = store.inspect_run_image_visibility(path)?
-            {
-                effective_vis = std::cmp::max(effective_vis, run_vis);
+            if let Some(asset_vis) = inspect_asset_image_visibility(run_store, registry, path)? {
+                effective_vis = std::cmp::max(effective_vis, asset_vis);
             }
             (asset_id.clone(), effective_vis, path.clone())
         }
@@ -1155,6 +1155,7 @@ mod tests {
         );
         let res = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::Run {
                     slug: "courier-ren".to_string(),
@@ -1189,6 +1190,7 @@ mod tests {
         );
         let res = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::Run {
                     slug: "courier-ren".to_string(),
@@ -1249,6 +1251,7 @@ mod tests {
 
         let map_res = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::Run {
                     slug: "harbor-dock".to_string(),
@@ -1276,6 +1279,7 @@ mod tests {
 
         let webp_res = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::Run {
                     slug: "harbor-dock".to_string(),
@@ -1293,6 +1297,7 @@ mod tests {
 
         let grid_res = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::Run {
                     slug: "harbor-dock".to_string(),
@@ -1339,6 +1344,7 @@ mod tests {
 
         let res = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::Run {
                     slug: "harbor".to_string(),
@@ -1449,6 +1455,7 @@ mod tests {
         );
         let err = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::Run {
                     slug: "harbor-dock".to_string(),
@@ -1500,6 +1507,7 @@ mod tests {
         // Programmatic caller specifies Visibility::Public on PngPath, but RunStore must raise it.
         let res = execute_export(
             Some(&store),
+            None,
             &ExportRequest {
                 source: ExportSource::PngPath {
                     path: run_png,
@@ -1516,6 +1524,66 @@ mod tests {
         assert_eq!(res.is_ok(), expect_ok);
         if let Ok(ok) = res {
             assert_eq!(ok.source_visibility, run_vis);
+        } else {
+            assert!(matches!(
+                res.unwrap_err(),
+                CoreError::VisibilityViolation { .. }
+            ));
+        }
+    }
+
+    #[rstest]
+    #[case::internal_pack_slice_blocked_for_public_export("internal", Visibility::Public, false)]
+    #[case::restricted_pack_slice_blocked_for_public_export(
+        "restricted",
+        Visibility::Public,
+        false
+    )]
+    #[case::internal_pack_slice_allowed_for_internal_export("internal", Visibility::Internal, true)]
+    fn export_png_path_raises_effective_visibility_from_library_registry(
+        #[case] subject_vis: &str,
+        #[case] export_vis: Visibility,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        let library_dir = root.path().join("library");
+        let slices_dir = library_dir.join("subjects/secret-envoy/packs/franco-belgian-line/slices");
+        fs::create_dir_all(&slices_dir).unwrap();
+        fs::write(
+            library_dir.join("subjects/secret-envoy/card.yaml"),
+            format!(
+                "schema_version: 1\nkind: prop\nslug: secret-envoy\ndisplay_name: Envoy\nexclusive_surface_map:\n  bindings:\n    - slot: body\n      material: wood\n      color_hex: \"#2C3E50\"\npalette_lock:\n  swatches:\n    - name: body\n      color_hex: \"#2C3E50\"\nvisibility: {subject_vis}\n"
+            ),
+        )
+        .unwrap();
+        let slice_png = slices_dir.join("sheet_001.png");
+        fs::write(&slice_png, make_test_png(64, 64, [90, 110, 130, 255])).unwrap();
+
+        let registry = LibraryRegistry::new(Some(library_dir), None);
+        let res = execute_export(
+            None,
+            Some(&registry),
+            &ExportRequest {
+                source: ExportSource::PngPath {
+                    path: slice_png,
+                    asset_id: "secret-slice".to_string(),
+                    visibility: Visibility::Public,
+                },
+                output_slug: "secret-slice".to_string(),
+                profile_visibility: export_vis,
+                out_dir: root.path().join("exports"),
+                profile: ExportProfile::WebWebp,
+                match_grade: None,
+            },
+        );
+        assert_eq!(res.is_ok(), expect_ok);
+        if let Ok(ok) = res {
+            let expected_vis = match subject_vis {
+                "internal" => Visibility::Internal,
+                "restricted" => Visibility::Restricted,
+                _ => Visibility::Public,
+            };
+            assert_eq!(ok.source_visibility, expected_vis);
         } else {
             assert!(matches!(
                 res.unwrap_err(),

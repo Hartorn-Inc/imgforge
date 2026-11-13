@@ -27,9 +27,11 @@ use std::fmt::Write as _;
 
 use crate::backend::format_aspect_ratio;
 use crate::error::CoreError;
+use crate::registry::LibraryRegistry;
 use crate::scene_spec::{
     MAX_FOREGROUND_SLOTS, SUPPORTED_SCENE_SPEC_SCHEMA_VERSION, SceneSpec, Visibility,
 };
+use crate::store::checked_pixel_count;
 
 /// Single-word negation tokens rejected in `SceneSpec` prose fields.
 const NEGATION_WORDS: &[&str] = &[
@@ -224,6 +226,34 @@ impl PromptCompiler {
     }
 }
 
+/// Resolve referenced `Subject` cards from `registry` (when available) and compile `spec`
+/// deterministically via `PromptCompiler`.
+///
+/// Propagates `SubjectInvalid` / `Io` errors fail-closed and only ignores
+/// `CoreError::RegistryResolutionFailed` so self-contained `SceneSpec`s still validate.
+pub fn compile_scene_spec_with_registry(
+    spec: &SceneSpec,
+    registry: Option<&LibraryRegistry>,
+) -> Result<CompiledPrompt, CoreError> {
+    let mut overrides = BTreeMap::new();
+    if let Some(reg) = registry {
+        for slot in &spec.foreground_slots {
+            let slug = slot.subject_ref.trim();
+            if overrides.contains_key(slug) {
+                continue;
+            }
+            match reg.resolve_subject(slug) {
+                Ok(resolved) => {
+                    overrides.insert(resolved.subject.slug, resolved.subject.visibility);
+                }
+                Err(CoreError::RegistryResolutionFailed { .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    PromptCompiler::compile_with_subject_visibility(spec, &overrides)
+}
+
 fn collapse_prose(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -335,6 +365,10 @@ fn validate_scene_spec(
             "height must be greater than 0".to_string(),
         ));
     }
+    let effective_w = spec.width.unwrap_or(1024);
+    let effective_h = spec.height.unwrap_or(1024);
+    checked_pixel_count(effective_w, effective_h, "SceneSpec output")
+        .map_err(|err| CoreError::PromptCompilationFailed(err.to_string()))?;
 
     if spec.depth_bands.is_empty() {
         return Err(CoreError::PromptCompilationFailed(
@@ -725,5 +759,40 @@ unexpected_field: 123
 "#;
         let err = SceneSpec::from_yaml_str(raw).expect_err("unknown field must fail closed");
         assert!(matches!(err, CoreError::SceneSpecInvalid(_)));
+    }
+
+    #[rstest]
+    #[case::exceeds_max_dim(Some(16_385), Some(1024))]
+    #[case::exceeds_total_pixels(Some(16_384), Some(16_384))]
+    fn rejects_oversized_scene_spec_dimensions(
+        #[case] width: Option<u32>,
+        #[case] height: Option<u32>,
+    ) {
+        let mut spec = sample_valid_scene();
+        spec.width = width;
+        spec.height = height;
+        let err = PromptCompiler::compile(&spec)
+            .expect_err("oversized SceneSpec dimensions must fail closed");
+        assert!(matches!(err, CoreError::PromptCompilationFailed(_)));
+    }
+
+    #[test]
+    fn compile_scene_spec_with_registry_propagates_subject_invalid_and_ignores_missing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let lib_dir = root.path().join("library");
+        let bad_subj = lib_dir.join("subjects/navigator-kael");
+        std::fs::create_dir_all(&bad_subj).unwrap();
+        std::fs::write(bad_subj.join("card.yaml"), "schema_version: 99\n").unwrap();
+
+        let registry = LibraryRegistry::new(Some(lib_dir), None);
+        let spec = sample_valid_scene();
+        let err = compile_scene_spec_with_registry(&spec, Some(&registry))
+            .expect_err("malformed Subject card must propagate instead of silently ignoring");
+        assert!(matches!(err, CoreError::SubjectInvalid(_)));
+
+        // Missing subjects (RegistryResolutionFailed) are ignored for self-contained SceneSpecs.
+        let compiled = compile_scene_spec_with_registry(&spec, None)
+            .expect("self-contained SceneSpec compiles without registry");
+        assert_eq!(compiled.foreground_slot_count, 2);
     }
 }

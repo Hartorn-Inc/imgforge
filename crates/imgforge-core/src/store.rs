@@ -49,6 +49,9 @@ pub const MANIFEST_LOCK_FILENAME: &str = "manifest.lock.json";
 /// Maximum file size permitted by `read_regular_file_nofollow` (`128 MiB`).
 pub const MAX_REGULAR_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// Maximum UTF-8 text specification / prose file size (`16 MiB`).
+pub const MAX_TEXT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Maximum `.cube` 3D LUT file size permitted during `Export` (`16 MiB`).
 pub const MAX_CUBE_LUT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -1331,7 +1334,7 @@ pub(crate) fn read_regular_file_nofollow(
 }
 
 /// Read a regular non-symlink file using `O_NOFOLLOW` on Unix with an explicit byte-size cap.
-pub(crate) fn read_regular_file_nofollow_bounded(
+pub fn read_regular_file_nofollow_bounded(
     path: &Path,
     context_label: &str,
     max_bytes: u64,
@@ -1456,6 +1459,19 @@ pub(crate) fn read_regular_file_nofollow_bounded(
         }
         Ok(bytes)
     }
+}
+
+/// Read a regular non-symlink UTF-8 text file using `O_NOFOLLOW` on Unix with an explicit byte cap.
+pub fn read_text_file_nofollow_bounded(
+    path: &Path,
+    context_label: &str,
+    max_bytes: u64,
+) -> Result<String, CoreError> {
+    let bytes = read_regular_file_nofollow_bounded(path, context_label, max_bytes)?;
+    String::from_utf8(bytes).map_err(|err| CoreError::Io {
+        context: format!("decoding UTF-8 {context_label} at {}", path.display()),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+    })
 }
 
 fn read_regular_png_bytes_nofollow(path: &Path) -> Result<Vec<u8>, CoreError> {

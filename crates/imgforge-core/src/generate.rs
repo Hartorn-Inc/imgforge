@@ -52,12 +52,15 @@ use crate::error::CoreError;
 use crate::lifecycle::{Lifecycle, sha256_hex, validate_slug};
 use crate::prompt_compiler::{CompiledPrompt, PromptCompiler};
 use crate::reference_pack::ReferencePackManifest;
-use crate::registry::{CARD_FILENAME, LibraryRegistry, ResolvedSubject};
+use crate::registry::{
+    CARD_FILENAME, LibraryRegistry, ResolvedSubject, inspect_asset_image_visibility,
+};
 use crate::scene_spec::{SceneSpec, Visibility, check_visibility_compatibility};
 use crate::slicer::{PixelRect, SlicesManifest};
 use crate::store::{
-    RecordRunParams, RecordedRun, RunBackendMetadata, RunQaReports, RunStore, decode_png_checked,
-    read_regular_file_nofollow, verify_contained_path_no_symlinks, write_atomic,
+    RecordRunParams, RecordedRun, RunBackendMetadata, RunQaReports, RunStore, checked_pixel_count,
+    decode_png_checked, read_regular_file_nofollow, verify_contained_path_no_symlinks,
+    verify_optional_contained_dir_no_symlinks, write_atomic,
 };
 use crate::style::Style;
 
@@ -253,6 +256,11 @@ pub async fn execute_generate(
         effective_spec.height = Some(h);
     }
 
+    let target_w = effective_spec.width.unwrap_or(1024);
+    let target_h = effective_spec.height.unwrap_or(1024);
+    checked_pixel_count(target_w, target_h, "Generate output")
+        .map_err(|err| CoreError::InvalidGenerationRequest(err.to_string()))?;
+
     let run_slug = request
         .slug
         .clone()
@@ -414,41 +422,52 @@ pub async fn execute_generate(
                     .join(&sel.subject_slug)
                     .join("packs")
                     .join(&sel.style_slug);
-                if let Ok(pack_dir) = verify_contained_path_no_symlinks(
+                if let Some(pack_dir) = verify_optional_contained_dir_no_symlinks(
                     library_dir,
                     &rel_pack,
-                    true,
                     "ReferencePack directory",
-                ) {
+                )? {
                     let pack_json_path = pack_dir.join("pack.json");
-                    if pack_json_path.exists() {
-                        let verified_pack_json = verify_contained_path_no_symlinks(
-                            &pack_dir,
-                            Path::new("pack.json"),
-                            false,
-                            "pack.json",
-                        )?;
-                        let pack_bytes =
-                            read_regular_file_nofollow(&verified_pack_json, "pack.json")?;
-                        let pack_manifest: ReferencePackManifest =
-                            serde_json::from_slice(&pack_bytes).map_err(|err| {
-                                CoreError::ReferencePackFailed(format!(
-                                    "parsing {}: {err}",
-                                    verified_pack_json.display()
-                                ))
-                            })?;
-                        check_visibility_compatibility(
-                            effective_spec.visibility,
-                            "Generate ReferencePack",
-                            [(
-                                format!("{}/{}", sel.subject_slug, sel.style_slug).as_str(),
-                                pack_manifest.visibility,
-                            )],
-                        )?;
-                        input_hashes.insert(
-                            format!("pack:{}/{}", sel.subject_slug, sel.style_slug),
-                            sha256_hex(&pack_bytes),
-                        );
+                    match fs::symlink_metadata(&pack_json_path) {
+                        Ok(_) => {
+                            let verified_pack_json = verify_contained_path_no_symlinks(
+                                &pack_dir,
+                                Path::new("pack.json"),
+                                false,
+                                "pack.json",
+                            )?;
+                            let pack_bytes =
+                                read_regular_file_nofollow(&verified_pack_json, "pack.json")?;
+                            let pack_manifest: ReferencePackManifest =
+                                serde_json::from_slice(&pack_bytes).map_err(|err| {
+                                    CoreError::ReferencePackFailed(format!(
+                                        "parsing {}: {err}",
+                                        verified_pack_json.display()
+                                    ))
+                                })?;
+                            check_visibility_compatibility(
+                                effective_spec.visibility,
+                                "Generate ReferencePack",
+                                [(
+                                    format!("{}/{}", sel.subject_slug, sel.style_slug).as_str(),
+                                    pack_manifest.visibility,
+                                )],
+                            )?;
+                            input_hashes.insert(
+                                format!("pack:{}/{}", sel.subject_slug, sel.style_slug),
+                                sha256_hex(&pack_bytes),
+                            );
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(CoreError::Io {
+                                context: format!(
+                                    "inspecting ReferencePack manifest {}",
+                                    pack_json_path.display()
+                                ),
+                                source: err,
+                            });
+                        }
                     }
                 }
             }
@@ -510,15 +529,17 @@ pub async fn execute_generate(
         }
     }
 
-    // 3. Validate & attach explicit reference images (checked against RunStore Visibility).
+    // 3. Validate & attach explicit reference images (checked against RunStore + LibraryRegistry Visibility).
     for (idx, ref_path) in request.reference_images.iter().enumerate() {
         let bytes = read_regular_file_nofollow(ref_path, "reference PNG")?;
         let _ = decode_png_checked(ref_path, &bytes)?;
-        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
+        if let Some(asset_vis) =
+            inspect_asset_image_visibility(Some(run_store), Some(registry), ref_path)?
+        {
             check_visibility_compatibility(
                 effective_spec.visibility,
                 "Generate Reference",
-                [(ref_path.display().to_string().as_str(), run_vis)],
+                [(ref_path.display().to_string().as_str(), asset_vis)],
             )?;
         }
         input_hashes.insert(format!("ref_{idx}"), sha256_hex(&bytes));
@@ -532,11 +553,13 @@ pub async fn execute_generate(
     if let Some(ref guide_path) = request.spatial_guide_path {
         let guide_bytes = read_regular_file_nofollow(guide_path, "SpatialGuide PNG")?;
         let _ = decode_png_checked(guide_path, &guide_bytes)?;
-        if let Some(run_vis) = run_store.inspect_run_image_visibility(guide_path)? {
+        if let Some(asset_vis) =
+            inspect_asset_image_visibility(Some(run_store), Some(registry), guide_path)?
+        {
             check_visibility_compatibility(
                 effective_spec.visibility,
                 "Generate SpatialGuide",
-                [(guide_path.display().to_string().as_str(), run_vis)],
+                [(guide_path.display().to_string().as_str(), asset_vis)],
             )?;
         }
         input_hashes.insert("spatial_guide".to_string(), sha256_hex(&guide_bytes));
@@ -1028,7 +1051,8 @@ visibility: {visibility}
 
         let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
         let backend = StubGenerateBackend::new([150, 155, 160, 255]);
-        let pack_pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir.clone());
+        let pack_pipeline =
+            ReferencePackPipeline::new(&backend, &registry, None, library_dir.clone());
         pack_pipeline
             .generate(&ReferencePackRequest::new(
                 "courier-ren",
@@ -1227,5 +1251,90 @@ JSON
             (Some(384), Some(384))
         );
         assert!(res.compiled_prompt.contains("dimensions: 384x384"));
+    }
+
+    #[rstest]
+    #[case::internal_pack_slice_via_ref("internal", false, true)]
+    #[case::restricted_pack_sheet_via_ref("restricted", false, false)]
+    #[case::internal_pack_slice_via_spatial_guide("internal", true, true)]
+    #[tokio::test]
+    async fn generate_blocks_library_reference_pack_visibility_leaks_on_refs_and_guides(
+        #[case] subj_vis: &str,
+        #[case] as_spatial_guide: bool,
+        #[case] use_slice: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        let library_dir = root.path().join("library");
+        write_subject(&library_dir, "secret-envoy", subj_vis, "#969BA0");
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let backend = StubGenerateBackend::new([150, 155, 160, 255]);
+        let pack_pipeline =
+            ReferencePackPipeline::new(&backend, &registry, None, library_dir.clone());
+        let generated_pack = pack_pipeline
+            .generate(&ReferencePackRequest::new(
+                "secret-envoy",
+                "franco-belgian-line",
+            ))
+            .await
+            .unwrap();
+
+        let leaked_path = if use_slice {
+            generated_pack
+                .pack_dir
+                .join(&generated_pack.manifest.slices[0].file)
+        } else {
+            generated_pack
+                .pack_dir
+                .join(&generated_pack.manifest.sheets[0].filename)
+        };
+
+        backend.calls.lock().unwrap().clear();
+        let run_store = RunStore::new(root.path().join("runs"));
+        let scene = sample_scene("pub-leak-check", Visibility::Public, Vec::new());
+        let mut req = GenerateRequest::from_spec(scene);
+        req.mode = GenerationMode::Explore;
+        if as_spatial_guide {
+            req.spatial_guide_path = Some(leaked_path);
+        } else {
+            req.reference_images = vec![leaked_path];
+        }
+
+        let err = execute_generate(&backend, None, &registry, &run_store, &req)
+            .await
+            .expect_err("ReferencePack slice/sheet visibility leak must fail closed");
+        assert!(matches!(err, CoreError::VisibilityViolation { .. }));
+        assert!(
+            backend.calls.lock().unwrap().is_empty(),
+            "backend must not be called on visibility leak"
+        );
+    }
+
+    #[rstest]
+    #[case::width_exceeds_max_dim(Some(16_385), Some(512))]
+    #[case::total_pixels_exceeds_cap(Some(16_384), Some(16_384))]
+    #[tokio::test]
+    async fn generate_rejects_oversized_dimensions_before_invoking_backend(
+        #[case] w: Option<u32>,
+        #[case] h: Option<u32>,
+    ) {
+        let root = TempDir::new().unwrap();
+        let library_dir = root.path().join("library");
+        fs::create_dir_all(&library_dir).unwrap();
+        let registry = LibraryRegistry::new(Some(library_dir), None);
+        let run_store = RunStore::new(root.path().join("runs"));
+        let backend = StubGenerateBackend::new([150, 155, 160, 255]);
+
+        let spec = sample_scene("oversized-gen", Visibility::Public, Vec::new());
+        let mut req = GenerateRequest::from_spec(spec);
+        req.mode = GenerationMode::Explore;
+        req.width_override = w;
+        req.height_override = h;
+
+        let err = execute_generate(&backend, None, &registry, &run_store, &req)
+            .await
+            .expect_err("oversized dimensions must fail closed");
+        assert!(matches!(err, CoreError::InvalidGenerationRequest(_)));
+        assert!(backend.calls.lock().unwrap().is_empty());
     }
 }

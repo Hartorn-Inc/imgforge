@@ -17,12 +17,12 @@
 //! 2. `PromptCompiler::compile` validates all domain, geometry, `Visibility`, and
 //!    positive-only phrasing invariants before any `ImageBackend` invocation.
 
-use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
+use crate::store::{MAX_TEXT_FILE_BYTES, read_text_file_nofollow_bounded};
 
 /// Supported `SceneSpec` schema version.
 pub const SUPPORTED_SCENE_SPEC_SCHEMA_VERSION: u32 = 1;
@@ -293,12 +293,9 @@ impl SceneSpec {
             .map_err(|err| CoreError::SceneSpecInvalid(err.to_string()))
     }
 
-    /// Load a `SceneSpec` from a `.json`, `.yaml`, or `.yml` file path.
+    /// Load a `SceneSpec` from a `.json`, `.yaml`, or `.yml` file path via bounded `O_NOFOLLOW` read.
     pub fn load_from_path(path: &Path) -> Result<Self, CoreError> {
-        let raw = fs::read_to_string(path).map_err(|err| CoreError::Io {
-            context: format!("reading SceneSpec at {}", path.display()),
-            source: err,
-        })?;
+        let raw = read_text_file_nofollow_bounded(path, "SceneSpec", MAX_TEXT_FILE_BYTES)?;
         let ext = path
             .extension()
             .and_then(|s| s.to_str())

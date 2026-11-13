@@ -21,6 +21,7 @@
 //!    verifying zero clipping and zero overlap.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -30,12 +31,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::calibration::STUDIO_BG_RGBA;
 use crate::error::CoreError;
+use crate::reference_pack::ReferencePackManifest;
 use crate::registry::LibraryRegistry;
 use crate::scene_spec::{MAX_FOREGROUND_SLOTS, Visibility, check_visibility_compatibility};
 use crate::slicer::{PixelRect, SlicesManifest};
 use crate::store::{
-    decode_png_checked, read_regular_file_nofollow, validate_strict_relative_path,
-    verify_contained_path_no_symlinks,
+    checked_pixel_count, decode_png_checked, read_regular_file_nofollow,
+    validate_strict_relative_path, verify_contained_path_no_symlinks,
 };
 
 /// Maximum number of distinct focal `Subject`s allowed in a single `Atlas`.
@@ -161,6 +163,8 @@ pub fn pack_dynamic_atlas(
             "Atlas canvas_width and canvas_height must be greater than 0".to_string(),
         ));
     }
+    checked_pixel_count(request.canvas_width, request.canvas_height, "Atlas canvas")
+        .map_err(|err| CoreError::AtlasPackFailed(err.to_string()))?;
 
     let mut seen_subjects = HashSet::with_capacity(request.selections.len());
     let mut loaded_items = Vec::new();
@@ -200,6 +204,43 @@ pub fn pack_dynamic_atlas(
             true,
             "ReferencePack directory",
         )?;
+        let pack_json_candidate = pack_dir.join("pack.json");
+        match fs::symlink_metadata(&pack_json_candidate) {
+            Ok(_) => {
+                let pack_json_path = verify_contained_path_no_symlinks(
+                    &pack_dir,
+                    Path::new("pack.json"),
+                    false,
+                    "pack.json",
+                )?;
+                let pack_bytes = read_regular_file_nofollow(&pack_json_path, "pack.json")?;
+                let pack_manifest: ReferencePackManifest = serde_json::from_slice(&pack_bytes)
+                    .map_err(|err| {
+                        CoreError::AtlasPackFailed(format!(
+                            "invalid pack.json for ({}, {}): {err}",
+                            sel.subject_slug, sel.style_slug
+                        ))
+                    })?;
+                check_visibility_compatibility(
+                    request.target_visibility,
+                    "Atlas ReferencePack",
+                    [(
+                        format!("{}/{}", sel.subject_slug, sel.style_slug).as_str(),
+                        pack_manifest.visibility,
+                    )],
+                )?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!(
+                        "inspecting ReferencePack manifest {}",
+                        pack_json_candidate.display()
+                    ),
+                    source: err,
+                });
+            }
+        }
         let slices_json_path = verify_contained_path_no_symlinks(
             &pack_dir,
             Path::new("slices.json"),
@@ -748,5 +789,90 @@ visibility: {visibility}
             err,
             CoreError::AtlasPackFailed(_) | CoreError::Io { .. }
         ));
+    }
+
+    #[rstest]
+    #[case::internal_pack_blocks_public_atlas("internal", Visibility::Public)]
+    #[case::restricted_pack_blocks_public_atlas("restricted", Visibility::Public)]
+    #[case::internal_pack_blocks_restricted_atlas("internal", Visibility::Restricted)]
+    fn rejects_pack_json_visibility_leaks_even_when_subject_card_is_public(
+        #[case] pack_vis: &str,
+        #[case] target_vis: Visibility,
+    ) {
+        let root = TempDir::new().unwrap();
+        let library_dir = root.path().join("library");
+        seed_subject_and_slices(
+            &library_dir,
+            "courier-ren",
+            "franco-belgian-line",
+            "public",
+            &[("s1", 64, 64, [150, 150, 150])],
+        );
+
+        let pack_json = serde_json::json!({
+            "schema_version": 1,
+            "version": 1,
+            "subject_slug": "courier-ren",
+            "style_slug": "franco-belgian-line",
+            "subject_kind": "character",
+            "visibility": pack_vis,
+            "lifecycle": "draft",
+            "seed": null,
+            "sheets": [],
+            "slices": [],
+            "artifact_hashes": {},
+            "created_at_iso": "2026-01-01T00:00:00Z"
+        });
+        fs::write(
+            library_dir.join("subjects/courier-ren/packs/franco-belgian-line/pack.json"),
+            serde_json::to_vec_pretty(&pack_json).unwrap(),
+        )
+        .unwrap();
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let req = AtlasPackRequest::new(
+            vec![AtlasSliceSelection {
+                subject_slug: "courier-ren".to_string(),
+                style_slug: "franco-belgian-line".to_string(),
+                slice_ids: vec!["s1".to_string()],
+            }],
+            target_vis,
+        );
+        let err = pack_dynamic_atlas(&registry, &library_dir, &req)
+            .expect_err("pack.json visibility leak must fail closed");
+        assert!(matches!(err, CoreError::VisibilityViolation { .. }));
+    }
+
+    #[rstest]
+    #[case::width_exceeds_max_dim(16_385, 512)]
+    #[case::total_pixels_exceeds_cap(16_384, 16_384)]
+    fn rejects_oversized_atlas_canvas_dimensions_before_allocating(
+        #[case] canvas_width: u32,
+        #[case] canvas_height: u32,
+    ) {
+        let root = TempDir::new().unwrap();
+        let library_dir = root.path().join("library");
+        seed_subject_and_slices(
+            &library_dir,
+            "courier-ren",
+            "franco-belgian-line",
+            "public",
+            &[("s1", 64, 64, [150, 150, 150])],
+        );
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let req = AtlasPackRequest {
+            selections: vec![AtlasSliceSelection {
+                subject_slug: "courier-ren".to_string(),
+                style_slug: "franco-belgian-line".to_string(),
+                slice_ids: vec!["s1".to_string()],
+            }],
+            target_visibility: Visibility::Public,
+            canvas_width,
+            canvas_height,
+            padding_px: 16,
+        };
+        let err = pack_dynamic_atlas(&registry, &library_dir, &req)
+            .expect_err("oversized Atlas canvas must fail closed before buffer allocation");
+        assert!(matches!(err, CoreError::AtlasPackFailed(_)));
     }
 }

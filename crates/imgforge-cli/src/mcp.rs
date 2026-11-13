@@ -15,8 +15,8 @@
 //!    the resolved workspace root with symlink-free directory checks before any
 //!    read or atomic write.
 //! 2. Optional HTTP transport (`--http`) refuses non-loopback bind addresses fail-closed
-//!    and relies on `rmcp`'s loopback `Host` header validation to prevent DNS
-//!    rebinding or LAN exposure.
+//!    and enables `rmcp`'s `Host` and `Origin` validation to prevent DNS rebinding,
+//!    cross-origin browser attacks, or LAN exposure.
 //! 3. Tool handlers delegate directly to `imgforge-core` using `Arc<dyn ImageBackend>`
 //!    so deterministic test backends exercise the real MCP protocol surface
 //!    without spawning live `codex exec`.
@@ -28,7 +28,6 @@
 //! 3. `serve_mcp_stdio` / `serve_mcp_http` runs the `rmcp` transport loop until EOF
 //!    or Ctrl+C shutdown.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
@@ -36,25 +35,23 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use axum::Router;
-use imgforge_core::guide_renderer::{
-    ActionVector, DepthBand, GuideDepthPlane, MannequinFacing, SubjectMannequin, VectorStrokeStyle,
-};
 use imgforge_core::{
     AtlasPackRequest, AtlasSliceSelection, AuthManager, CodexNativeBackend, CoreError,
     DEFAULT_ATLAS_HEIGHT, DEFAULT_ATLAS_PADDING_PX, DEFAULT_ATLAS_WIDTH, DEFAULT_CDF_DAMP_STRENGTH,
     DEFAULT_COLLAR_WIDTH_PX, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
-    DEFAULT_VTT_TOKEN_SIZE_PX, DepthPlane, ExportProfile, ExportRequest, ExportSource,
-    ExposureQaConfig, GenerateRequest, GenerateSceneInput, GenerationMode, GuideRenderer,
-    GuideSpec, ImageBackend, LibraryRegistry, Lifecycle, ManifestLockStore, MatchGradeOptions,
+    DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportSource, ExposureQaConfig,
+    GenerateRequest, GenerateSceneInput, GenerationMode, GuideRenderer, GuideSpec, ImageBackend,
+    LibraryRegistry, Lifecycle, MAX_TEXT_FILE_BYTES, ManifestLockStore, MatchGradeOptions,
     PaletteQaConfig, PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect,
-    PromptCompiler, ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore,
-    SUPPORTED_GUIDE_SPEC_SCHEMA_VERSION, SceneComposer, SceneSpec, SlicerConfig, SparkleConfig,
-    SpatialGuideVariant, SubjectRoiBinding, TraitCategory, TraitCheckInput, UntouchedDriftConfig,
-    ValidateReferencePackRequest, ValidateRunRequest, Visibility, VisionCritic, VttMapOptions,
-    VttTokenOptions, WholeImageEditRequest, check_visibility_compatibility, execute_export,
-    execute_generate, execute_patch_edit, execute_whole_image_edit, inspect_workspace_status,
-    pack_dynamic_atlas, promote_reference_pack, promote_run, resolve_workspace_from_env,
-    slice_sheet_to_dir, validate_reference_pack, validate_run, write_atomic,
+    ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore, SceneComposer,
+    SceneSpec, SlicerConfig, SparkleConfig, SubjectRoiBinding, TraitCategory, TraitCheckInput,
+    UntouchedDriftConfig, ValidateReferencePackRequest, ValidateRunRequest, Visibility,
+    VisionCritic, VttMapOptions, VttTokenOptions, WholeImageEditRequest,
+    build_recommended_blockout, check_visibility_compatibility, compile_scene_spec_with_registry,
+    execute_export, execute_generate, execute_patch_edit, execute_whole_image_edit,
+    inspect_workspace_status, pack_dynamic_atlas, promote_reference_pack, promote_run,
+    read_text_file_nofollow_bounded, resolve_workspace_from_env, slice_sheet_to_dir,
+    validate_reference_pack, validate_run, write_atomic,
 };
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -681,8 +678,13 @@ impl ImgforgeMcpServer {
                     )?);
                 }
                 req.seed_label = params.seed_label;
-                let pipeline =
-                    ReferencePackPipeline::new(self.backend.as_ref(), &registry, library_dir);
+                let run_store = RunStore::new(ws.root.join(&ws.config.paths.runs_dir));
+                let pipeline = ReferencePackPipeline::new(
+                    self.backend.as_ref(),
+                    &registry,
+                    Some(&run_store),
+                    library_dir,
+                );
                 let generated = pipeline
                     .generate(&req)
                     .await
@@ -792,29 +794,6 @@ impl ImgforgeMcpServer {
             )?);
         }
 
-        // Cross-check target & reference Run visibility explicitly.
-        let mut run_vis_checks: Vec<(String, Visibility)> = Vec::new();
-        if let Some(vis) = run_store
-            .inspect_run_image_visibility(&target_image_path)
-            .map_err(core_err_to_mcp_error)?
-        {
-            run_vis_checks.push((target_image_path.display().to_string(), vis));
-        }
-        for ref_path in &reference_images {
-            if let Some(vis) = run_store
-                .inspect_run_image_visibility(ref_path)
-                .map_err(core_err_to_mcp_error)?
-            {
-                run_vis_checks.push((ref_path.display().to_string(), vis));
-            }
-        }
-        check_visibility_compatibility(
-            target_visibility,
-            "McpEdit",
-            run_vis_checks.iter().map(|(id, vis)| (id.as_str(), *vis)),
-        )
-        .map_err(core_err_to_mcp_error)?;
-
         match params.mode.as_str() {
             "whole" => {
                 let exposure_floor = match params.atmosphere_slug {
@@ -851,6 +830,7 @@ impl ImgforgeMcpServer {
                 let res = execute_whole_image_edit(
                     self.backend.as_ref(),
                     &run_store,
+                    Some(&registry),
                     &WholeImageEditRequest {
                         slug: params.slug,
                         visibility: target_visibility,
@@ -914,6 +894,7 @@ impl ImgforgeMcpServer {
                 let res = execute_patch_edit(
                     self.backend.as_ref(),
                     &run_store,
+                    Some(&registry),
                     &PatchEditRequest {
                         slug: params.slug,
                         visibility: target_visibility,
@@ -965,14 +946,8 @@ impl ImgforgeMcpServer {
         let spec = match (params.spec_path, params.guide_spec) {
             (Some(path_raw), None) => {
                 let path = resolve_workspace_read_path(&ws.root, &path_raw, "spec_path")?;
-                let bytes = imgforge_core::store::MAX_REGULAR_FILE_BYTES;
-                let _ = bytes;
-                let raw = fs::read_to_string(&path).map_err(|err| {
-                    McpError::invalid_params(
-                        format!("reading GuideSpec {}: {err}", path.display()),
-                        None,
-                    )
-                })?;
+                let raw = read_text_file_nofollow_bounded(&path, "GuideSpec", MAX_TEXT_FILE_BYTES)
+                    .map_err(core_err_to_mcp_error)?;
                 GuideSpec::from_json_str(&raw).map_err(core_err_to_mcp_error)?
             }
             (None, Some(val)) => {
@@ -1138,8 +1113,10 @@ impl ImgforgeMcpServer {
             None
         };
 
+        let registry = LibraryRegistry::from_workspace(&ws);
         let result = execute_export(
             Some(&run_store),
+            Some(&registry),
             &ExportRequest {
                 source,
                 output_slug: params.output_slug.unwrap_or(default_slug),
@@ -1206,13 +1183,7 @@ impl ImgforgeMcpServer {
                         ));
                     }
                 };
-                let mut overrides = BTreeMap::new();
-                for slot in &spec.foreground_slots {
-                    if let Ok(resolved) = registry.resolve_subject(slot.subject_ref.trim()) {
-                        overrides.insert(resolved.subject.slug, resolved.subject.visibility);
-                    }
-                }
-                let compiled = PromptCompiler::compile_with_subject_visibility(&spec, &overrides)
+                let compiled = compile_scene_spec_with_registry(&spec, Some(&registry))
                     .map_err(core_err_to_mcp_error)?;
                 json_tool_result(&serde_json::json!({
                     "valid": true,
@@ -1518,6 +1489,21 @@ pub async fn serve_mcp_stdio(server: ImgforgeMcpServer) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn mcp_http_server_config() -> StreamableHttpServerConfig {
+    let mut config = StreamableHttpServerConfig::default().enforce_origin_validation();
+    config.json_response = true;
+    config
+}
+
+fn build_mcp_http_router(server: ImgforgeMcpServer, config: StreamableHttpServerConfig) -> Router {
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+    Router::new().nest_service("/mcp", mcp_service)
+}
+
 /// Serve the `imgforge` MCP server over Streamable HTTP strictly on a loopback address (`127.0.0.1:<port>`).
 pub async fn serve_mcp_http(server: ImgforgeMcpServer, bind_addr: &str) -> anyhow::Result<()> {
     let addr: SocketAddr = bind_addr
@@ -1533,16 +1519,9 @@ pub async fn serve_mcp_http(server: ImgforgeMcpServer, bind_addr: &str) -> anyho
     let bound_addr = listener.local_addr()?;
     tracing::info!("imgforge MCP Streamable HTTP listening on http://{bound_addr}/mcp");
 
-    let mut config = StreamableHttpServerConfig::default();
-    config.json_response = true;
+    let config = mcp_http_server_config();
     let cancel_token = config.cancellation_token.clone();
-    let mcp_service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
-        config,
-    );
-
-    let router = Router::new().nest_service("/mcp", mcp_service);
+    let router = build_mcp_http_router(server, config);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
@@ -1804,88 +1783,6 @@ fn resolve_workspace_write_dir(
     Ok(cursor)
 }
 
-fn build_recommended_blockout(spec: &SceneSpec) -> GuideSpec {
-    let w = spec.width.unwrap_or(1024);
-    let h = spec.height.unwrap_or(1024);
-
-    let mut depth_bands = Vec::with_capacity(spec.depth_bands.len());
-    let n_bands = spec.depth_bands.len().max(1);
-    for (idx, b) in spec.depth_bands.iter().enumerate() {
-        let y0 = (idx as f64) / (n_bands as f64);
-        let y1 = ((idx + 1) as f64) / (n_bands as f64);
-        let (plane, fill_hex) = match b.plane {
-            DepthPlane::Background => (GuideDepthPlane::Background, "#2C3344".to_string()),
-            DepthPlane::Midground => (GuideDepthPlane::Midground, "#3B4254".to_string()),
-            DepthPlane::Foreground => (GuideDepthPlane::Foreground, "#4A5164".to_string()),
-        };
-        depth_bands.push(DepthBand {
-            id: format!("band-{}", idx + 1),
-            label: b.plane.as_str().to_string(),
-            plane,
-            y_start_ratio: y0,
-            y_end_ratio: y1,
-            fill_hex,
-        });
-    }
-
-    let mannequins = spec
-        .foreground_slots
-        .iter()
-        .enumerate()
-        .map(|(idx, slot)| {
-            let palette_hex = slot
-                .exclusive_surface_map
-                .bindings
-                .first()
-                .map(|b| b.color_hex.clone())
-                .unwrap_or_else(|| "#63B3ED".to_string());
-            SubjectMannequin {
-                id: format!("mannequin-{}", idx + 1),
-                subject_slug: slot.subject_ref.clone(),
-                label: slot.subject_ref.clone(),
-                x_ratio: slot.position_x_ratio,
-                y_ratio: 0.85,
-                height_meters: slot.height_meters,
-                scale_factor: 1.0,
-                facing: MannequinFacing::Front,
-                pose_hint: slot.pose.clone(),
-                palette_hex,
-            }
-        })
-        .collect();
-
-    let action_vectors = if spec.foreground_slots.len() >= 2 {
-        vec![ActionVector {
-            id: "vector-1".to_string(),
-            label: "Primary interaction".to_string(),
-            from_x_ratio: spec.foreground_slots[0].position_x_ratio,
-            from_y_ratio: 0.65,
-            to_x_ratio: spec.foreground_slots[1].position_x_ratio,
-            to_y_ratio: 0.65,
-            stroke_hex: "#F6AD55".to_string(),
-            halo_hex: "#1A1D24".to_string(),
-            stroke_width_px: 4.0,
-            style: VectorStrokeStyle::Solid,
-        }]
-    } else {
-        Vec::new()
-    };
-
-    GuideSpec {
-        schema_version: SUPPORTED_GUIDE_SPEC_SCHEMA_VERSION.to_string(),
-        id: format!("{}-blockout", spec.id),
-        title: format!("{} Blockout", spec.title),
-        variant: SpatialGuideVariant::Blockout,
-        target_image_path: None,
-        canvas_width: w,
-        canvas_height: h,
-        depth_bands,
-        mannequins,
-        action_vectors,
-        overlay_regions: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -1893,10 +1790,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode, header};
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
     use rmcp::ServiceExt;
     use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
+    use rstest::rstest;
     use tempfile::TempDir;
+    use tower::ServiceExt as _;
 
     use super::*;
     use imgforge_core::ImageGenerationOutput;
@@ -2320,5 +2221,87 @@ JSON
 
         client.cancel().await.unwrap();
         let _ = server_task.await;
+    }
+
+    #[rstest]
+    #[case::wildcard_ipv4("0.0.0.0:3001")]
+    #[case::lan_ipv4("192.168.1.50:3001")]
+    #[case::wildcard_ipv6("[::]:3001")]
+    #[case::invalid_addr("not-an-address")]
+    #[tokio::test]
+    async fn serve_mcp_http_rejects_non_loopback_and_invalid_bind_addresses(
+        #[case] bind_addr: &str,
+    ) {
+        let (_root, ws, auth_dir, codex_stub) = setup_mcp_test_workspace();
+        let server = ImgforgeMcpServer::with_backend(
+            Some(ws),
+            auth_dir,
+            codex_stub.to_string_lossy().into_owned(),
+            Arc::new(StubMcpBackend),
+        );
+        let err = serve_mcp_http(server, bind_addr)
+            .await
+            .expect_err("non-loopback or invalid bind address must fail closed");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[rstest]
+    #[case::get_cross_origin_rejected(
+        Method::GET,
+        "127.0.0.1:3001",
+        Some("https://evil.example"),
+        true
+    )]
+    #[case::delete_cross_origin_rejected(
+        Method::DELETE,
+        "127.0.0.1:3001",
+        Some("https://evil.example"),
+        true
+    )]
+    #[case::post_null_origin_rejected(Method::POST, "127.0.0.1:3001", Some("null"), true)]
+    #[case::post_localhost_browser_origin_rejected(
+        Method::POST,
+        "127.0.0.1:3001",
+        Some("http://localhost:8080"),
+        true
+    )]
+    #[case::bad_host_header_rejected(Method::GET, "evil.example:3001", None, true)]
+    #[case::suffix_spoof_host_rejected(Method::POST, "localhost.evil.example:3001", None, true)]
+    #[case::non_browser_get_without_origin_permitted(Method::GET, "127.0.0.1:3001", None, false)]
+    #[case::non_browser_post_without_origin_permitted(Method::POST, "localhost:3001", None, false)]
+    #[tokio::test]
+    async fn mcp_http_router_enforces_host_and_origin_validation(
+        #[case] method: Method,
+        #[case] host: &str,
+        #[case] origin: Option<&str>,
+        #[case] expect_forbidden: bool,
+    ) {
+        let (_root, ws, auth_dir, codex_stub) = setup_mcp_test_workspace();
+        let server = ImgforgeMcpServer::with_backend(
+            Some(ws),
+            auth_dir,
+            codex_stub.to_string_lossy().into_owned(),
+            Arc::new(StubMcpBackend),
+        );
+        let router = build_mcp_http_router(server, mcp_http_server_config());
+
+        let mut req_builder = Request::builder()
+            .method(method)
+            .uri("/mcp")
+            .header(header::HOST, host)
+            .header(header::ACCEPT, "application/json, text/event-stream");
+        if let Some(orig) = origin {
+            req_builder = req_builder.header(header::ORIGIN, orig);
+        }
+        let resp = router
+            .oneshot(req_builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        if expect_forbidden {
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        } else {
+            assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+        }
     }
 }

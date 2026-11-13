@@ -50,7 +50,8 @@ use crate::error::CoreError;
 use crate::generate::SubjectRoiBinding;
 use crate::lifecycle::{Lifecycle, sha256_hex, validate_slug};
 use crate::reference_pack::{REFERENCE_SHEET_HEIGHT, REFERENCE_SHEET_WIDTH, ReferencePackManifest};
-use crate::registry::LibraryRegistry;
+use crate::registry::{LibraryRegistry, inspect_asset_image_visibility};
+use crate::scene_spec::check_visibility_compatibility;
 use crate::slicer::SlicesManifest;
 use crate::store::{
     ManifestLock, ManifestLockStore, RunMetadata, RunStore, decode_png_checked,
@@ -238,6 +239,27 @@ pub async fn validate_run(
             palette_lock: resolved.subject.palette_lock,
             rois: binding.rois.clone(),
         });
+    }
+    check_visibility_compatibility(
+        meta.visibility,
+        "ValidateRun Subject",
+        owned_rois
+            .iter()
+            .map(|s| (s.subject_slug.as_str(), s.visibility)),
+    )?;
+
+    for ref_path in &request.reference_images {
+        let ref_bytes = read_regular_file_nofollow(ref_path, "ValidateRun reference PNG")?;
+        let _ = decode_png_checked(ref_path, &ref_bytes)?;
+        if let Some(asset_vis) =
+            inspect_asset_image_visibility(Some(run_store), Some(registry), ref_path)?
+        {
+            check_visibility_compatibility(
+                meta.visibility,
+                "ValidateRun Reference",
+                [(ref_path.display().to_string().as_str(), asset_vis)],
+            )?;
+        }
     }
     let subject_specs: Vec<SubjectRoiSpec<'_>> = owned_rois
         .iter()
@@ -854,7 +876,8 @@ visibility: public
         .unwrap();
 
         let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
-        let pipeline = ReferencePackPipeline::new(&MockPackBackend, &registry, library_dir.clone());
+        let pipeline =
+            ReferencePackPipeline::new(&MockPackBackend, &registry, None, library_dir.clone());
         let lock_store = ManifestLockStore::new(&library_dir);
 
         // v1: generate -> validate -> promote canonical
@@ -932,5 +955,120 @@ visibility: public
         assert_eq!(lock2.superseded[0].version, 1);
         assert_eq!(lock2.superseded[0].lifecycle, Lifecycle::Superseded);
         lock_store.verify_canonical_checksums(ws).unwrap();
+    }
+
+    #[rstest]
+    #[case::symlinked_ref_rejected("symlink")]
+    #[case::invalid_png_ref_rejected("invalid_png")]
+    #[case::internal_run_ref_rejected("internal_run")]
+    #[case::internal_pack_ref_rejected("internal_pack")]
+    #[tokio::test]
+    async fn validate_run_rejects_unsafe_invalid_or_leaking_reference_images(
+        #[case] case_kind: &str,
+    ) {
+        let root = TempDir::new().unwrap();
+        let ws = root.path();
+        let library_dir = ws.join("library");
+        fs::create_dir_all(&library_dir).unwrap();
+        let run_store = RunStore::new(ws.join("runs"));
+
+        let pub_run = run_store
+            .record_run(RecordRunParams {
+                slug: "harbor-pub".to_string(),
+                visibility: Visibility::Public,
+                png_bytes: make_png(64, 64, [150, 155, 160, 255]),
+                input_hashes: BTreeMap::new(),
+                compiled_prompt: "harbor pier".to_string(),
+                backend: RunBackendMetadata {
+                    name: "stub".to_string(),
+                    width: 64,
+                    height: 64,
+                    raw_width: 64,
+                    raw_height: 64,
+                    thread_id: None,
+                },
+                seed: None,
+                qa_reports: RunQaReports::default(),
+            })
+            .unwrap();
+
+        let ref_path = match case_kind {
+            "symlink" => {
+                #[cfg(unix)]
+                {
+                    let real = ws.join("real.png");
+                    fs::write(&real, make_png(32, 32, [100, 110, 120, 255])).unwrap();
+                    let link = ws.join("ref_link.png");
+                    std::os::unix::fs::symlink(&real, &link).unwrap();
+                    link
+                }
+                #[cfg(not(unix))]
+                {
+                    ws.join("missing.png")
+                }
+            }
+            "invalid_png" => {
+                let bad = ws.join("not_a_png.png");
+                fs::write(&bad, b"NOT_PNG_DATA").unwrap();
+                bad
+            }
+            "internal_run" => {
+                let secret = run_store
+                    .record_run(RecordRunParams {
+                        slug: "secret-run".to_string(),
+                        visibility: Visibility::Internal,
+                        png_bytes: make_png(32, 32, [100, 110, 120, 255]),
+                        input_hashes: BTreeMap::new(),
+                        compiled_prompt: "secret".to_string(),
+                        backend: RunBackendMetadata {
+                            name: "stub".to_string(),
+                            width: 32,
+                            height: 32,
+                            raw_width: 32,
+                            raw_height: 32,
+                            thread_id: None,
+                        },
+                        seed: None,
+                        qa_reports: RunQaReports::default(),
+                    })
+                    .unwrap();
+                secret.image_path
+            }
+            "internal_pack" => {
+                let slices_dir =
+                    library_dir.join("subjects/secret-envoy/packs/franco-belgian-line/slices");
+                fs::create_dir_all(&slices_dir).unwrap();
+                fs::write(
+                    library_dir.join("subjects/secret-envoy/card.yaml"),
+                    "schema_version: 1\nkind: prop\nslug: secret-envoy\ndisplay_name: Envoy\nexclusive_surface_map:\n  bindings:\n    - slot: body\n      material: wood\n      color_hex: \"#2C3E50\"\npalette_lock:\n  swatches:\n    - name: body\n      color_hex: \"#2C3E50\"\nvisibility: internal\n",
+                )
+                .unwrap();
+                let p = slices_dir.join("sheet_001.png");
+                fs::write(&p, make_png(32, 32, [100, 110, 120, 255])).unwrap();
+                p
+            }
+            _ => unreachable!(),
+        };
+
+        let registry = LibraryRegistry::new(Some(library_dir), None);
+        let (auth_dir, stub_bin) = write_stub_critic_codex(ws, true);
+        let critic =
+            VisionCritic::with_codex_bin(auth_dir, stub_bin.to_string_lossy().into_owned());
+
+        let mut req = ValidateRunRequest::new("harbor-pub", pub_run.metadata.version);
+        req.reference_images = vec![ref_path];
+        req.run_critic = true;
+
+        let err = validate_run(&run_store, &registry, Some(&critic), &req)
+            .await
+            .expect_err("unsafe or leaking reference image must fail closed");
+        match case_kind {
+            "symlink" => assert!(matches!(err, CoreError::Io { .. })),
+            "invalid_png" => assert!(matches!(err, CoreError::InvalidPng { .. })),
+            "internal_run" | "internal_pack" => {
+                assert!(matches!(err, CoreError::VisibilityViolation { .. }))
+            }
+            _ => unreachable!(),
+        }
     }
 }

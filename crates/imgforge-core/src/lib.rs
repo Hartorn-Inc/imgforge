@@ -100,13 +100,14 @@ pub use guide_renderer::{
     ActionVector, DepthBand, GuideDepthPlane, GuideRenderer, GuideSpec, MAX_GUIDE_CANVAS_DIM,
     MannequinFacing, NormalizedPoint, OverlayRegion, OverlayRegionKind, RenderedSpatialGuide,
     SUPPORTED_GUIDE_SPEC_SCHEMA_VERSION, SpatialGuideVariant, SubjectMannequin, VectorStrokeStyle,
+    build_recommended_blockout,
 };
 pub use lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex};
 pub use presets::{
     BUILTIN_ATMOSPHERE_SLUGS, BUILTIN_STYLE_SLUGS, builtin_atmosphere, builtin_atmospheres,
     builtin_style, builtin_style_exemplar_png, builtin_styles,
 };
-pub use prompt_compiler::{CompiledPrompt, PromptCompiler};
+pub use prompt_compiler::{CompiledPrompt, PromptCompiler, compile_scene_spec_with_registry};
 pub use reference_pack::{
     GeneratedReferencePack, GeneratedSheetRecord, REFERENCE_SHEET_HEIGHT, REFERENCE_SHEET_WIDTH,
     ReferencePackManifest, ReferencePackPipeline, ReferencePackRequest, ReferenceSheetRole,
@@ -114,7 +115,8 @@ pub use reference_pack::{
 };
 pub use registry::{
     CARD_FILENAME, LibraryRegistry, LibrarySource, ResolvedAtmosphere, ResolvedStyle,
-    ResolvedSubject, resolve_user_config_dir, resolve_user_config_dir_from_env,
+    ResolvedSubject, inspect_asset_image_visibility, resolve_user_config_dir,
+    resolve_user_config_dir_from_env,
 };
 pub use scene_spec::{
     CameraSpec, DepthBandSpec, DepthPlane, ExclusiveSurfaceMap, ForegroundSlot, HandBinding,
@@ -126,9 +128,10 @@ pub use slicer::{
 };
 pub use store::{
     MANIFEST_LOCK_FILENAME, MAX_CUBE_LUT_BYTES, MAX_IMAGE_DECODE_ALLOC_BYTES, MAX_IMAGE_DIM,
-    MAX_IMAGE_TOTAL_PIXELS, MAX_REGULAR_FILE_BYTES, ManifestEntry, ManifestEntryKind, ManifestLock,
-    ManifestLockStore, RecordRunParams, RecordedRun, RunBackendMetadata, RunMetadata, RunQaReports,
-    RunStore, write_atomic,
+    MAX_IMAGE_TOTAL_PIXELS, MAX_REGULAR_FILE_BYTES, MAX_TEXT_FILE_BYTES, ManifestEntry,
+    ManifestEntryKind, ManifestLock, ManifestLockStore, RecordRunParams, RecordedRun,
+    RunBackendMetadata, RunMetadata, RunQaReports, RunStore, read_regular_file_nofollow_bounded,
+    read_text_file_nofollow_bounded, write_atomic,
 };
 pub use style::{MAX_STYLE_EXEMPLARS, MIN_STYLE_EXEMPLARS, Style};
 pub use subject::{PaletteLock, PaletteSwatch, Subject, SubjectHandBindings, SubjectKind};

@@ -42,6 +42,7 @@ use tiny_skia::{
 use crate::calibration::{STUDIO_BG_RGB, parse_hex_rgb};
 use crate::error::CoreError;
 use crate::lifecycle::normalize_hex_color;
+use crate::scene_spec::{DepthPlane, SceneSpec};
 use crate::store::{
     checked_pixel_count, decode_png_checked, read_regular_file_nofollow,
     validate_strict_relative_path, verify_contained_path_no_symlinks,
@@ -432,6 +433,91 @@ pub struct RenderedSpatialGuide {
 /// Deterministic vector-to-raster `SpatialGuide` renderer (`tiny-skia` + `resvg`).
 #[derive(Debug, Clone, Default)]
 pub struct GuideRenderer;
+
+/// Build a recommended `Blockout` `GuideSpec` scaffold from a validated `SceneSpec`
+/// so CLI, MCP, and Web Canvas UI share one deterministic layout projection.
+#[must_use]
+pub fn build_recommended_blockout(spec: &SceneSpec) -> GuideSpec {
+    let w = spec.width.unwrap_or(1024);
+    let h = spec.height.unwrap_or(1024);
+
+    let mut depth_bands = Vec::with_capacity(spec.depth_bands.len());
+    let n_bands = spec.depth_bands.len().max(1);
+    for (idx, b) in spec.depth_bands.iter().enumerate() {
+        let y0 = (idx as f64) / (n_bands as f64);
+        let y1 = ((idx + 1) as f64) / (n_bands as f64);
+        let (plane, fill_hex) = match b.plane {
+            DepthPlane::Background => (GuideDepthPlane::Background, "#2C3344".to_string()),
+            DepthPlane::Midground => (GuideDepthPlane::Midground, "#3B4254".to_string()),
+            DepthPlane::Foreground => (GuideDepthPlane::Foreground, "#4A5164".to_string()),
+        };
+        depth_bands.push(DepthBand {
+            id: format!("band-{}", idx + 1),
+            label: b.plane.as_str().to_string(),
+            plane,
+            y_start_ratio: y0,
+            y_end_ratio: y1,
+            fill_hex,
+        });
+    }
+
+    let mannequins = spec
+        .foreground_slots
+        .iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            let palette_hex = slot
+                .exclusive_surface_map
+                .bindings
+                .first()
+                .map(|b| b.color_hex.clone())
+                .unwrap_or_else(|| "#63B3ED".to_string());
+            SubjectMannequin {
+                id: format!("mannequin-{}", idx + 1),
+                subject_slug: slot.subject_ref.clone(),
+                label: slot.subject_ref.clone(),
+                x_ratio: slot.position_x_ratio,
+                y_ratio: 0.85,
+                height_meters: slot.height_meters,
+                scale_factor: 1.0,
+                facing: MannequinFacing::Front,
+                pose_hint: slot.pose.clone(),
+                palette_hex,
+            }
+        })
+        .collect();
+
+    let action_vectors = if spec.foreground_slots.len() >= 2 {
+        vec![ActionVector {
+            id: "vector-1".to_string(),
+            label: "Primary interaction".to_string(),
+            from_x_ratio: spec.foreground_slots[0].position_x_ratio,
+            from_y_ratio: 0.65,
+            to_x_ratio: spec.foreground_slots[1].position_x_ratio,
+            to_y_ratio: 0.65,
+            stroke_hex: "#F6AD55".to_string(),
+            halo_hex: "#1A1D24".to_string(),
+            stroke_width_px: 4.0,
+            style: VectorStrokeStyle::Solid,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    GuideSpec {
+        schema_version: SUPPORTED_GUIDE_SPEC_SCHEMA_VERSION.to_string(),
+        id: format!("{}-blockout", spec.id),
+        title: format!("{} Blockout", spec.title),
+        variant: SpatialGuideVariant::Blockout,
+        target_image_path: None,
+        canvas_width: w,
+        canvas_height: h,
+        depth_bands,
+        mannequins,
+        action_vectors,
+        overlay_regions: Vec::new(),
+    }
+}
 
 impl GuideRenderer {
     /// Construct a new `GuideRenderer`.

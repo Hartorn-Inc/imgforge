@@ -23,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,8 +36,11 @@ use crate::presets::{
     builtin_atmosphere, builtin_atmospheres, builtin_style, builtin_style_exemplar_png,
     builtin_styles,
 };
+use crate::reference_pack::ReferencePackManifest;
+use crate::scene_spec::Visibility;
 use crate::store::{
-    decode_png_checked, read_regular_file_nofollow, verify_optional_contained_dir_no_symlinks,
+    RunStore, decode_png_checked, read_regular_file_nofollow,
+    verify_optional_contained_dir_no_symlinks,
 };
 use crate::style::Style;
 use crate::subject::Subject;
@@ -420,6 +423,133 @@ impl LibraryRegistry {
         }
         Ok(out)
     }
+
+    /// Inspect whether `path` resides inside a configured library root (`project_library_dir`
+    /// or `user_config_dir`) under `subjects/<slug>/...` or `subjects/<slug>/packs/<style>/...`,
+    /// returning the strictest `Visibility` declared in `card.yaml` and/or `pack.json`.
+    pub fn inspect_library_image_visibility(
+        &self,
+        path: &Path,
+    ) -> Result<Option<Visibility>, CoreError> {
+        let canon_input = match fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!("canonicalizing library image path {}", path.display()),
+                    source: err,
+                });
+            }
+        };
+
+        let mut strictest: Option<Visibility> = None;
+
+        for root_opt in [
+            self.project_library_dir.as_deref(),
+            self.user_config_dir.as_deref(),
+        ] {
+            let Some(root) = root_opt else { continue };
+            let canon_root = match fs::canonicalize(root) {
+                Ok(p) => p,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(CoreError::Io {
+                        context: format!("canonicalizing library root {}", root.display()),
+                        source: err,
+                    });
+                }
+            };
+            let Ok(rel) = canon_input.strip_prefix(&canon_root) else {
+                continue;
+            };
+
+            let mut segments = Vec::new();
+            for comp in rel.components() {
+                if let Component::Normal(seg) = comp {
+                    let Some(s) = seg.to_str() else {
+                        segments.clear();
+                        break;
+                    };
+                    segments.push(s);
+                }
+            }
+            if segments.len() < 2 || segments[0] != "subjects" {
+                continue;
+            }
+            let subject_slug = segments[1];
+            let subj_rel = Path::new("subjects").join(subject_slug);
+            if let Some(subj_dir) =
+                verify_optional_contained_dir_no_symlinks(root, &subj_rel, "Subject")?
+                && let Some(raw) =
+                    read_optional_card_yaml(&subj_dir.join(CARD_FILENAME), "Subject")?
+            {
+                let subject = Subject::from_yaml_str(&raw)?;
+                strictest =
+                    Some(strictest.map_or(subject.visibility, |cur| cur.max(subject.visibility)));
+            }
+
+            if segments.len() >= 4 && segments[2] == "packs" {
+                let style_slug = segments[3];
+                let pack_rel = subj_rel.join("packs").join(style_slug);
+                if let Some(pack_dir) = verify_optional_contained_dir_no_symlinks(
+                    root,
+                    &pack_rel,
+                    "ReferencePack directory",
+                )? {
+                    let pack_json_path = pack_dir.join("pack.json");
+                    match fs::symlink_metadata(&pack_json_path) {
+                        Ok(_) => {
+                            let bytes = read_regular_file_nofollow(&pack_json_path, "pack.json")?;
+                            let manifest: ReferencePackManifest = serde_json::from_slice(&bytes)
+                                .map_err(|err| {
+                                    CoreError::ReferencePackFailed(format!(
+                                        "parsing {}: {err}",
+                                        pack_json_path.display()
+                                    ))
+                                })?;
+                            strictest =
+                                Some(strictest.map_or(manifest.visibility, |cur| {
+                                    cur.max(manifest.visibility)
+                                }));
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => {
+                            return Err(CoreError::Io {
+                                context: format!(
+                                    "inspecting ReferencePack manifest {}",
+                                    pack_json_path.display()
+                                ),
+                                source: err,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(strictest)
+    }
+}
+
+/// Inspect an image path across `RunStore` and `LibraryRegistry`, returning the strictest
+/// `Visibility` classification discovered, or `None` for untracked external paths.
+pub fn inspect_asset_image_visibility(
+    run_store: Option<&RunStore>,
+    registry: Option<&LibraryRegistry>,
+    path: &Path,
+) -> Result<Option<Visibility>, CoreError> {
+    let mut strictest: Option<Visibility> = None;
+    if let Some(store) = run_store
+        && let Some(vis) = store.inspect_run_image_visibility(path)?
+    {
+        strictest = Some(strictest.map_or(vis, |cur| cur.max(vis)));
+    }
+    if let Some(reg) = registry
+        && let Some(vis) = reg.inspect_library_image_visibility(path)?
+    {
+        strictest = Some(strictest.map_or(vis, |cur| cur.max(vis)));
+    }
+    Ok(strictest)
 }
 
 fn collect_resource_slugs(
@@ -800,5 +930,85 @@ exemplars:
             _ => unreachable!(),
         };
         assert!(matches!(err, CoreError::Io { .. }));
+    }
+
+    #[rstest]
+    #[case::subject_internal_no_pack("internal", None, true, Some(Visibility::Internal))]
+    #[case::subject_public_pack_restricted(
+        "public",
+        Some("restricted"),
+        true,
+        Some(Visibility::Restricted)
+    )]
+    #[case::subject_restricted_pack_internal_takes_strictest(
+        "restricted",
+        Some("internal"),
+        true,
+        Some(Visibility::Internal)
+    )]
+    #[case::subject_internal_pack_public_takes_strictest(
+        "internal",
+        Some("public"),
+        true,
+        Some(Visibility::Internal)
+    )]
+    #[case::outside_library_returns_none("internal", Some("internal"), false, None)]
+    fn inspect_library_image_visibility_takes_strictest_card_and_pack_visibility(
+        #[case] subject_vis: &str,
+        #[case] pack_vis: Option<&str>,
+        #[case] inside_library: bool,
+        #[case] expected: Option<Visibility>,
+    ) {
+        let root = TempDir::new().unwrap();
+        let project_lib = root.path().join("project/library");
+        let subj_dir = project_lib.join("subjects/secret-envoy");
+        let slices_dir = subj_dir.join("packs/franco-belgian-line/slices");
+        fs::create_dir_all(&slices_dir).unwrap();
+
+        fs::write(
+            subj_dir.join("card.yaml"),
+            format!(
+                "schema_version: 1\nkind: prop\nslug: secret-envoy\ndisplay_name: Envoy\nexclusive_surface_map:\n  bindings:\n    - slot: body\n      material: wood\n      color_hex: \"#2C3E50\"\npalette_lock:\n  swatches:\n    - name: body\n      color_hex: \"#2C3E50\"\nvisibility: {subject_vis}\n"
+            ),
+        )
+        .unwrap();
+
+        if let Some(pvis) = pack_vis {
+            let pack_json = serde_json::json!({
+                "schema_version": 1,
+                "version": 1,
+                "subject_slug": "secret-envoy",
+                "style_slug": "franco-belgian-line",
+                "subject_kind": "prop",
+                "visibility": pvis,
+                "lifecycle": "draft",
+                "seed": null,
+                "sheets": [],
+                "slices": [],
+                "artifact_hashes": {},
+                "created_at_iso": "2026-01-01T00:00:00Z"
+            });
+            fs::write(
+                subj_dir.join("packs/franco-belgian-line/pack.json"),
+                serde_json::to_vec_pretty(&pack_json).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let target = if inside_library {
+            let p = slices_dir.join("sheet_001.png");
+            write_tiny_png(&p);
+            p
+        } else {
+            let p = root.path().join("outside.png");
+            write_tiny_png(&p);
+            p
+        };
+
+        let reg = LibraryRegistry::new(Some(project_lib), None);
+        assert_eq!(
+            reg.inspect_library_image_visibility(&target).unwrap(),
+            expected
+        );
     }
 }

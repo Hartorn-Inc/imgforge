@@ -39,7 +39,7 @@ use tokio::process::Command;
 
 use crate::auth::{DEFAULT_CODEX_BIN, TempCodexHome};
 use crate::error::CoreError;
-use crate::store::{decode_png_checked, read_regular_file_nofollow};
+use crate::store::{checked_pixel_count, decode_png_checked, read_regular_file_nofollow};
 
 /// Exact 8-byte PNG file magic header.
 pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -173,18 +173,17 @@ impl ImageBackend for CodexNativeBackend {
                 "width and height must both be greater than 0".to_string(),
             ));
         }
+        checked_pixel_count(request.width, request.height, "CodexNativeBackend request")
+            .map_err(|err| CoreError::InvalidGenerationRequest(err.to_string()))?;
         if request.prompt.trim().is_empty() {
             return Err(CoreError::InvalidGenerationRequest(
                 "compiled prompt must not be empty".to_string(),
             ));
         }
         for ref_path in &request.reference_images {
-            if !ref_path.is_file() {
-                return Err(CoreError::InvalidGenerationRequest(format!(
-                    "reference image does not exist or is not a regular file: {}",
-                    ref_path.display()
-                )));
-            }
+            let ref_bytes =
+                read_regular_file_nofollow(ref_path, "CodexNativeBackend reference PNG")?;
+            let _ = decode_png_checked(ref_path, &ref_bytes)?;
         }
 
         let temp_codex_home = TempCodexHome::create(&self.auth_dir)?;
@@ -419,6 +418,13 @@ pub fn validate_and_resample_png(
     target_width: u32,
     target_height: u32,
 ) -> Result<(Vec<u8>, u32, u32), CoreError> {
+    checked_pixel_count(target_width, target_height, "CodexNativeBackend target").map_err(
+        |err| CoreError::InvalidPng {
+            path: png_path.to_path_buf(),
+            reason: err.to_string(),
+        },
+    )?;
+
     if raw_bytes.len() < PNG_SIGNATURE.len() || raw_bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
         return Err(CoreError::InvalidPng {
             path: png_path.to_path_buf(),
@@ -811,5 +817,81 @@ printf '{{"type":"thread.started","thread_id":"thr_err"}}\n'
         let err = read_regular_png_nofollow(&link_png)
             .expect_err("symlinked PNG must be rejected fail-closed");
         assert!(matches!(err, CoreError::InvalidPng { .. }));
+    }
+
+    #[rstest]
+    #[case::zero_width(0, 512)]
+    #[case::exceeds_max_dim(16_385, 512)]
+    #[case::exceeds_total_pixels(16_384, 16_384)]
+    fn validate_and_resample_png_rejects_oversized_target_dimensions_before_resizing(
+        #[case] target_w: u32,
+        #[case] target_h: u32,
+    ) {
+        let raw = make_solid_png(64, 64);
+        let err = validate_and_resample_png(Path::new("out.png"), &raw, target_w, target_h)
+            .expect_err("oversized or zero target dimensions must fail closed");
+        assert!(matches!(err, CoreError::InvalidPng { .. }));
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::symlink_reference("symlink_ref")]
+    #[case::non_png_reference("non_png_ref")]
+    #[case::oversized_target("oversized_target")]
+    #[tokio::test]
+    async fn codex_native_backend_rejects_invalid_refs_and_oversized_dims_before_spawning(
+        #[case] case_kind: &str,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let auth_dir = root.path().join("auth");
+        create_secure_auth_dir(&auth_dir);
+
+        let valid_png = root.path().join("valid.png");
+        fs::write(&valid_png, make_solid_png(32, 32)).unwrap();
+        let bad_png = root.path().join("bad.png");
+        fs::write(&bad_png, b"NOT_A_PNG").unwrap();
+        let link_png = root.path().join("link.png");
+        symlink(&valid_png, &link_png).unwrap();
+
+        let spawned_marker = root.path().join("codex_spawned.marker");
+        let stub_bin = root.path().join("codex-sentinel");
+        fs::write(
+            &stub_bin,
+            format!(
+                "#!/usr/bin/env bash\ntouch \"{}\"\nexit 1\n",
+                spawned_marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (width, height, refs) = match case_kind {
+            "symlink_ref" => (512, 512, vec![link_png]),
+            "non_png_ref" => (512, 512, vec![bad_png]),
+            "oversized_target" => (16_384, 16_384, Vec::new()),
+            _ => unreachable!(),
+        };
+
+        let backend =
+            CodexNativeBackend::with_codex_bin(auth_dir, stub_bin.to_string_lossy().into_owned());
+        let err = backend
+            .generate(&ImageGenerationRequest {
+                prompt: "clean pier".to_string(),
+                width,
+                height,
+                reference_images: refs,
+            })
+            .await
+            .expect_err("unsafe reference or oversized dimensions must fail closed");
+        match case_kind {
+            "symlink_ref" => assert!(matches!(err, CoreError::Io { .. })),
+            "non_png_ref" => assert!(matches!(err, CoreError::InvalidPng { .. })),
+            "oversized_target" => assert!(matches!(err, CoreError::InvalidGenerationRequest(_))),
+            _ => unreachable!(),
+        }
+        assert!(
+            !spawned_marker.exists(),
+            "codex subprocess must not be spawned on invalid refs or dimensions"
+        );
     }
 }

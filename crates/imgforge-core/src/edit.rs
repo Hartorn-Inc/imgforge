@@ -51,6 +51,7 @@ use crate::color_qa::{
 };
 use crate::error::CoreError;
 use crate::lifecycle::sha256_hex;
+use crate::registry::{LibraryRegistry, inspect_asset_image_visibility};
 use crate::scene_spec::{Visibility, check_visibility_compatibility};
 use crate::slicer::PixelRect;
 use crate::store::{
@@ -139,6 +140,7 @@ pub struct WholeImageEditResult {
 pub async fn execute_whole_image_edit(
     backend: &dyn ImageBackend,
     run_store: &RunStore,
+    registry: Option<&LibraryRegistry>,
     request: &WholeImageEditRequest,
 ) -> Result<WholeImageEditResult, CoreError> {
     let mut vis_checks: Vec<(String, Visibility)> = request
@@ -146,12 +148,16 @@ pub async fn execute_whole_image_edit(
         .iter()
         .map(|s| (s.subject_slug.clone(), s.visibility))
         .collect();
-    if let Some(run_vis) = run_store.inspect_run_image_visibility(&request.target_image_path)? {
-        vis_checks.push((request.target_image_path.display().to_string(), run_vis));
+    if let Some(asset_vis) =
+        inspect_asset_image_visibility(Some(run_store), registry, &request.target_image_path)?
+    {
+        vis_checks.push((request.target_image_path.display().to_string(), asset_vis));
     }
     for ref_path in &request.reference_images {
-        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
-            vis_checks.push((ref_path.display().to_string(), run_vis));
+        if let Some(asset_vis) =
+            inspect_asset_image_visibility(Some(run_store), registry, ref_path)?
+        {
+            vis_checks.push((ref_path.display().to_string(), asset_vis));
         }
     }
     check_visibility_compatibility(
@@ -179,6 +185,7 @@ pub async fn execute_whole_image_edit(
     input_hashes.insert("target_image".to_string(), sha256_hex(&target_bytes));
     for (idx, ref_path) in request.reference_images.iter().enumerate() {
         let bytes = read_regular_file_nofollow(ref_path, "reference PNG")?;
+        let _ = decode_png_checked(ref_path, &bytes)?;
         input_hashes.insert(format!("ref_{idx}"), sha256_hex(&bytes));
     }
 
@@ -418,16 +425,27 @@ pub struct PatchEditResult {
 pub async fn execute_patch_edit(
     backend: &dyn ImageBackend,
     run_store: &RunStore,
+    registry: Option<&LibraryRegistry>,
     request: &PatchEditRequest,
 ) -> Result<PatchEditResult, CoreError> {
     request.config.validate()?;
     let mut vis_checks: Vec<(String, Visibility)> = Vec::new();
-    if let Some(run_vis) = run_store.inspect_run_image_visibility(&request.target_image_path)? {
-        vis_checks.push((request.target_image_path.display().to_string(), run_vis));
+    if let Some(asset_vis) =
+        inspect_asset_image_visibility(Some(run_store), registry, &request.target_image_path)?
+    {
+        vis_checks.push((request.target_image_path.display().to_string(), asset_vis));
+    }
+    if let PatchTargetMask::MaskImagePath(ref mask_path) = request.target_mask
+        && let Some(mask_vis) =
+            inspect_asset_image_visibility(Some(run_store), registry, mask_path)?
+    {
+        vis_checks.push((mask_path.display().to_string(), mask_vis));
     }
     for ref_path in &request.reference_images {
-        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
-            vis_checks.push((ref_path.display().to_string(), run_vis));
+        if let Some(asset_vis) =
+            inspect_asset_image_visibility(Some(run_store), registry, ref_path)?
+        {
+            vis_checks.push((ref_path.display().to_string(), asset_vis));
         }
     }
     check_visibility_compatibility(
@@ -495,6 +513,7 @@ pub async fn execute_patch_edit(
     input_hashes.insert("prepared_crop".to_string(), sha256_hex(&prepared_bytes));
     for (idx, ref_path) in request.reference_images.iter().enumerate() {
         let bytes = read_regular_file_nofollow(ref_path, "reference PNG")?;
+        let _ = decode_png_checked(ref_path, &bytes)?;
         input_hashes.insert(format!("ref_{idx}"), sha256_hex(&bytes));
     }
 
@@ -1735,6 +1754,7 @@ mod tests {
         let result = execute_patch_edit(
             &backend,
             &run_store,
+            None,
             &PatchEditRequest {
                 slug: "harbor-patch".to_string(),
                 visibility: Visibility::Public,
@@ -1797,6 +1817,7 @@ mod tests {
         let res = execute_whole_image_edit(
             &backend,
             &run_store,
+            None,
             &WholeImageEditRequest {
                 slug: "harbor-whole".to_string(),
                 visibility: Visibility::Public,
@@ -1883,6 +1904,7 @@ mod tests {
         let res = execute_whole_image_edit(
             &backend,
             &run_store,
+            None,
             &WholeImageEditRequest {
                 slug: "vis-check".to_string(),
                 visibility: request_vis,
@@ -1984,6 +2006,7 @@ mod tests {
             execute_whole_image_edit(
                 &backend,
                 &run_store,
+                None,
                 &WholeImageEditRequest {
                     slug: "pub-whole".to_string(),
                     visibility: Visibility::Public,
@@ -2006,6 +2029,7 @@ mod tests {
             execute_patch_edit(
                 &backend,
                 &run_store,
+                None,
                 &PatchEditRequest {
                     slug: "pub-patch".to_string(),
                     visibility: Visibility::Public,
@@ -2025,6 +2049,195 @@ mod tests {
         };
 
         assert_eq!(is_ok, expect_ok);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[rstest]
+    #[case::whole_blocks_library_pack_slice_as_target("whole_target")]
+    #[case::whole_blocks_library_pack_slice_as_ref("whole_ref")]
+    #[case::patch_blocks_library_pack_slice_as_target("patch_target")]
+    #[case::patch_blocks_library_pack_slice_as_ref("patch_ref")]
+    #[case::patch_blocks_library_pack_slice_as_mask("patch_mask")]
+    #[case::patch_blocks_internal_run_as_mask("patch_run_mask")]
+    #[tokio::test]
+    async fn edits_enforce_library_and_mask_visibility_for_target_mask_and_references(
+        #[case] case_kind: &str,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let run_store = RunStore::new(root.path().join("runs"));
+        let library_dir = root.path().join("library");
+        let pack_slices_dir =
+            library_dir.join("subjects/secret-envoy/packs/franco-belgian-line/slices");
+        fs::create_dir_all(&pack_slices_dir).unwrap();
+        fs::write(
+            library_dir.join("subjects/secret-envoy/card.yaml"),
+            "schema_version: 1\nkind: prop\nslug: secret-envoy\ndisplay_name: Envoy\nexclusive_surface_map:\n  bindings:\n    - slot: body\n      material: wood\n      color_hex: \"#2C3E50\"\npalette_lock:\n  swatches:\n    - name: body\n      color_hex: \"#2C3E50\"\nvisibility: internal\n",
+        )
+        .unwrap();
+        let pack_slice_path = pack_slices_dir.join("sheet_001.png");
+        write_test_png(
+            &pack_slice_path,
+            &ImageBuffer::from_pixel(64, 64, Rgba([120, 140, 160, 255])),
+        );
+
+        let mut buf = Vec::new();
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(64, 64, Rgba([255, 255, 255, 255])))
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        let secret_run = run_store
+            .record_run(RecordRunParams {
+                slug: "secret-mask-run".to_string(),
+                visibility: Visibility::Internal,
+                png_bytes: buf,
+                input_hashes: BTreeMap::new(),
+                compiled_prompt: "secret mask".to_string(),
+                backend: RunBackendMetadata {
+                    name: "stub".to_string(),
+                    width: 64,
+                    height: 64,
+                    raw_width: 64,
+                    raw_height: 64,
+                    thread_id: None,
+                },
+                seed: None,
+                qa_reports: RunQaReports::default(),
+            })
+            .unwrap();
+
+        let public_png = root.path().join("public.png");
+        write_test_png(
+            &public_png,
+            &ImageBuffer::from_pixel(64, 64, Rgba([120, 140, 160, 255])),
+        );
+
+        let registry = LibraryRegistry::new(Some(library_dir), None);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = StubEditBackend {
+            response_fill: [120, 140, 160],
+            seen_requests: Arc::clone(&seen),
+        };
+
+        let err = match case_kind {
+            "whole_target" => execute_whole_image_edit(
+                &backend,
+                &run_store,
+                Some(&registry),
+                &WholeImageEditRequest {
+                    slug: "pub-whole".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path: pack_slice_path,
+                    compiled_prompt: "clean".to_string(),
+                    reference_images: Vec::new(),
+                    exposure_floor: None,
+                    subject_rois: Vec::new(),
+                    palette_config: PaletteQaConfig::default(),
+                    edit_mask: None,
+                    untouched_drift_config: UntouchedDriftConfig::default(),
+                    allowed_sparkle_mask: None,
+                    sparkle_config: SparkleConfig::default(),
+                    fail_closed_on_qa: true,
+                },
+            )
+            .await
+            .unwrap_err(),
+            "whole_ref" => execute_whole_image_edit(
+                &backend,
+                &run_store,
+                Some(&registry),
+                &WholeImageEditRequest {
+                    slug: "pub-whole".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path: public_png,
+                    compiled_prompt: "clean".to_string(),
+                    reference_images: vec![pack_slice_path],
+                    exposure_floor: None,
+                    subject_rois: Vec::new(),
+                    palette_config: PaletteQaConfig::default(),
+                    edit_mask: None,
+                    untouched_drift_config: UntouchedDriftConfig::default(),
+                    allowed_sparkle_mask: None,
+                    sparkle_config: SparkleConfig::default(),
+                    fail_closed_on_qa: true,
+                },
+            )
+            .await
+            .unwrap_err(),
+            "patch_target" => execute_patch_edit(
+                &backend,
+                &run_store,
+                Some(&registry),
+                &PatchEditRequest {
+                    slug: "pub-patch".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path: pack_slice_path,
+                    target_mask: PatchTargetMask::SquareRoi {
+                        x: 20,
+                        y: 20,
+                        size: 16,
+                    },
+                    compiled_prompt: "clean".to_string(),
+                    reference_images: Vec::new(),
+                    config: PatchEditConfig::default(),
+                },
+            )
+            .await
+            .unwrap_err(),
+            "patch_ref" => execute_patch_edit(
+                &backend,
+                &run_store,
+                Some(&registry),
+                &PatchEditRequest {
+                    slug: "pub-patch".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path: public_png,
+                    target_mask: PatchTargetMask::SquareRoi {
+                        x: 20,
+                        y: 20,
+                        size: 16,
+                    },
+                    compiled_prompt: "clean".to_string(),
+                    reference_images: vec![pack_slice_path],
+                    config: PatchEditConfig::default(),
+                },
+            )
+            .await
+            .unwrap_err(),
+            "patch_mask" => execute_patch_edit(
+                &backend,
+                &run_store,
+                Some(&registry),
+                &PatchEditRequest {
+                    slug: "pub-patch".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path: public_png,
+                    target_mask: PatchTargetMask::MaskImagePath(pack_slice_path),
+                    compiled_prompt: "clean".to_string(),
+                    reference_images: Vec::new(),
+                    config: PatchEditConfig::default(),
+                },
+            )
+            .await
+            .unwrap_err(),
+            "patch_run_mask" => execute_patch_edit(
+                &backend,
+                &run_store,
+                Some(&registry),
+                &PatchEditRequest {
+                    slug: "pub-patch".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path: public_png,
+                    target_mask: PatchTargetMask::MaskImagePath(secret_run.image_path),
+                    compiled_prompt: "clean".to_string(),
+                    reference_images: Vec::new(),
+                    config: PatchEditConfig::default(),
+                },
+            )
+            .await
+            .unwrap_err(),
+            _ => unreachable!(),
+        };
+
+        assert!(matches!(err, CoreError::VisibilityViolation { .. }));
         assert!(seen.lock().unwrap().is_empty());
     }
 }
