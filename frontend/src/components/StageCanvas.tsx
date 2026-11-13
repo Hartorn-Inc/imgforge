@@ -1,42 +1,105 @@
 /** === KONVA SPATIALGUIDE CANVAS STAGE ===
  *
  * PURPOSE:
- * Renders the interactive Konva `Stage` placeholder for `GuideSpec` layouts
- * (`OverlayGuide` and `Blockout`), drawing canvas bounds, coordinate grid,
- * depth bands, proportionally scaled `Subject` mannequins, overlay regions,
- * and haloed action vectors.
+ * Renders the interactive Konva `Stage` for `GuideSpec` layouts
+ * (`OverlayGuide` and `Blockout`), supporting drag-and-drop repositioning of
+ * `SubjectMannequin` nodes, `DepthBand` boundary resizing, `OverlayRegion`
+ * vertex handles, `ActionVector` endpoint dragging / drawing, and freehand
+ * alpha-mask brush painting exported as PNG for `PatchEdit`.
  *
  * DESIGN RATIONALE ("WHY"):
  * Mounting `konva` directly via `useRef` + `useEffect` decouples Konva's
  * imperative canvas lifecycle from Preact virtual-DOM reconciliation and keeps
  * deterministic `GuideRenderer` rasterization strictly in Rust core.
- *
- * EXECUTION LIFECYCLE / DATA FLOW:
- * 1. Mounts `Konva.Stage` into the container `<div>` sized to the fitted viewport.
- * 2. Redraws deterministic grid/bounds and `GuideSpec` primitives whenever `spec`
- *    or `showGrid` changes.
- * 3. Destroys the Konva stage cleanly on unmount to prevent memory leaks.
  */
 
 import Konva from 'konva';
 import type { JSX } from 'preact';
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import type { GuideSpec } from '../types/guideSpec';
+import {
+  appendActionVectorToSpec,
+  moveMannequinInSpec,
+  resizeDepthBandInSpec,
+  stripPngDataUrlPrefix,
+  updateActionVectorInSpec,
+  updateOverlayRegionPointInSpec,
+} from './stageGeometry';
+
+export type StageToolMode = 'select' | 'draw_vector' | 'paint_mask';
 
 export interface StageCanvasProps {
   readonly spec: GuideSpec;
   readonly showGrid: boolean;
   readonly disabled?: boolean;
+  readonly toolMode?: StageToolMode;
+  readonly brushRadiusPx?: number;
+  readonly backgroundImageUrl?: string | null;
+  readonly onSpecChange?: (nextSpec: GuideSpec) => void;
+  readonly onMaskExport?: (maskPngBase64: string) => void;
 }
 
 const STAGE_VIEWPORT_SIZE = 512;
 const GRID_DIVISIONS = 8;
 
-/** Live Konva canvas stage rendering `GuideSpec` bounds, grid, and spatial cues. */
-export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasProps): JSX.Element {
+function attachEventIfSupported(node: unknown, eventName: string, handler: () => void): void {
+  const candidate = node as { on?: (ev: string, cb: () => void) => void } | null;
+  if (candidate !== null && typeof candidate.on === 'function') {
+    candidate.on(eventName, handler);
+  }
+}
+
+/** Live Konva canvas stage rendering `GuideSpec` bounds, interactive handles, and mask painter. */
+export function StageCanvas({
+  spec,
+  showGrid,
+  disabled = false,
+  toolMode = 'select',
+  brushRadiusPx = 20,
+  backgroundImageUrl = null,
+  onSpecChange,
+  onMaskExport,
+}: StageCanvasProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const maskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const isPaintingRef = useRef<boolean>(false);
   const [canvasUnavailable, setCanvasUnavailable] = useState<string | null>(null);
   const [viewportSize, setViewportSize] = useState<number>(STAGE_VIEWPORT_SIZE);
+  const [bgImgElement, setBgImgElement] = useState<HTMLImageElement | null>(null);
+  const [hasMaskStrokes, setHasMaskStrokes] = useState<boolean>(false);
+
+  const specRef = useRef<GuideSpec>(spec);
+  specRef.current = spec;
+  const onSpecChangeRef = useRef<((nextSpec: GuideSpec) => void) | undefined>(onSpecChange);
+  onSpecChangeRef.current = onSpecChange;
+
+  useEffect(() => {
+    if (
+      spec.variant !== 'OverlayGuide' ||
+      backgroundImageUrl === null ||
+      backgroundImageUrl.trim().length === 0 ||
+      typeof Image === 'undefined'
+    ) {
+      setBgImgElement(null);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (!cancelled) {
+        setBgImgElement(img);
+      }
+    };
+    img.onerror = () => {
+      if (!cancelled) {
+        setBgImgElement(null);
+      }
+    };
+    img.src = backgroundImageUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [spec.variant, backgroundImageUrl]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -72,6 +135,12 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
     };
   }, []);
 
+  const aspectRatio = spec.canvasWidth / spec.canvasHeight;
+  const stageWidth =
+    aspectRatio >= 1 ? viewportSize : Math.max(1, Math.round(viewportSize * aspectRatio));
+  const stageHeight =
+    aspectRatio >= 1 ? Math.max(1, Math.round(viewportSize / aspectRatio)) : viewportSize;
+
   useEffect(() => {
     if (disabled) {
       setCanvasUnavailable(null);
@@ -82,12 +151,6 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
     if (!container) {
       return;
     }
-
-    const aspectRatio = spec.canvasWidth / spec.canvasHeight;
-    const stageWidth =
-      aspectRatio >= 1 ? viewportSize : Math.max(1, Math.round(viewportSize * aspectRatio));
-    const stageHeight =
-      aspectRatio >= 1 ? Math.max(1, Math.round(viewportSize / aspectRatio)) : viewportSize;
 
     let stage: Konva.Stage;
     try {
@@ -105,6 +168,7 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
     setCanvasUnavailable(null);
     const backgroundLayer = new Konva.Layer();
     const guideLayer = new Konva.Layer();
+    const interactiveSelect = toolMode === 'select' && onSpecChangeRef.current !== undefined;
 
     // Neutral #252830 calibration surface matching ADR 0005.
     backgroundLayer.add(
@@ -118,6 +182,22 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
         strokeWidth: 2,
       }),
     );
+
+    if (
+      spec.variant === 'OverlayGuide' &&
+      bgImgElement !== null &&
+      typeof Konva.Image === 'function'
+    ) {
+      backgroundLayer.add(
+        new Konva.Image({
+          x: 0,
+          y: 0,
+          width: stageWidth,
+          height: stageHeight,
+          image: bgImgElement,
+        }),
+      );
+    }
 
     if (spec.variant === 'Blockout') {
       for (const band of spec.depthBands) {
@@ -143,8 +223,31 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
             fill: '#E2E8F0',
           }),
         );
+
+        if (interactiveSelect && band.yEndRatio < 0.999) {
+          const divider = new Konva.Rect({
+            x: 0,
+            y: band.yEndRatio * stageHeight - 4,
+            width: stageWidth,
+            height: 8,
+            fill: '#63B3ED',
+            opacity: 0.35,
+            draggable: true,
+            dragBoundFunc: (pos: { x: number; y: number }) => ({
+              x: 0,
+              y: Math.max(band.yStartRatio * stageHeight + 8, Math.min(stageHeight - 4, pos.y)),
+            }),
+          });
+          attachEventIfSupported(divider, 'dragend', () => {
+            const nextEnd = (divider.y() + 4) / stageHeight;
+            onSpecChangeRef.current?.(
+              resizeDepthBandInSpec(specRef.current, band.id, band.yStartRatio, nextEnd),
+            );
+          });
+          guideLayer.add(divider);
+        }
       }
-    } else {
+    } else if (bgImgElement === null) {
       backgroundLayer.add(
         new Konva.Text({
           x: 12,
@@ -272,6 +375,32 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
             }),
           );
         }
+
+        if (interactiveSelect) {
+          region.points.forEach((pt, pointIdx) => {
+            const handle = new Konva.Circle({
+              x: pt.xRatio * stageWidth,
+              y: pt.yRatio * stageHeight,
+              radius: 6,
+              fill: region.strokeHex,
+              stroke: '#1A1D24',
+              strokeWidth: 2,
+              draggable: true,
+            });
+            attachEventIfSupported(handle, 'dragend', () => {
+              onSpecChangeRef.current?.(
+                updateOverlayRegionPointInSpec(
+                  specRef.current,
+                  region.id,
+                  pointIdx,
+                  handle.x() / stageWidth,
+                  handle.y() / stageHeight,
+                ),
+              );
+            });
+            guideLayer.add(handle);
+          });
+        }
       }
     }
 
@@ -284,19 +413,29 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
       );
       const mannequinWidth = Math.max(20, Math.round(mannequinHeight * 0.34));
 
-      guideLayer.add(
-        new Konva.Rect({
-          x: cx - mannequinWidth / 2,
-          y: cy - mannequinHeight,
-          width: mannequinWidth,
-          height: mannequinHeight,
-          stroke: mannequin.paletteHex,
-          strokeWidth: 2,
-          fill: mannequin.paletteHex,
-          opacity: 0.25,
-          cornerRadius: 6,
-        }),
-      );
+      const body = new Konva.Rect({
+        x: cx - mannequinWidth / 2,
+        y: cy - mannequinHeight,
+        width: mannequinWidth,
+        height: mannequinHeight,
+        stroke: mannequin.paletteHex,
+        strokeWidth: 2,
+        fill: mannequin.paletteHex,
+        opacity: 0.25,
+        cornerRadius: 6,
+        draggable: interactiveSelect,
+      });
+      if (interactiveSelect) {
+        attachEventIfSupported(body, 'dragend', () => {
+          const nextX = (body.x() + mannequinWidth / 2) / stageWidth;
+          const nextY = (body.y() + mannequinHeight) / stageHeight;
+          onSpecChangeRef.current?.(
+            moveMannequinInSpec(specRef.current, mannequin.id, nextX, nextY),
+          );
+        });
+      }
+      guideLayer.add(body);
+
       guideLayer.add(
         new Konva.Circle({
           x: cx,
@@ -352,6 +491,113 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
           dash,
         }),
       );
+
+      if (interactiveSelect) {
+        const startHandle = new Konva.Circle({
+          x: vector.fromXRatio * stageWidth,
+          y: vector.fromYRatio * stageHeight,
+          radius: 6,
+          fill: vector.strokeHex,
+          stroke: '#1A1D24',
+          strokeWidth: 2,
+          draggable: true,
+        });
+        attachEventIfSupported(startHandle, 'dragend', () => {
+          onSpecChangeRef.current?.(
+            updateActionVectorInSpec(
+              specRef.current,
+              vector.id,
+              startHandle.x() / stageWidth,
+              startHandle.y() / stageHeight,
+              vector.toXRatio,
+              vector.toYRatio,
+            ),
+          );
+        });
+        guideLayer.add(startHandle);
+
+        const endHandle = new Konva.Circle({
+          x: vector.toXRatio * stageWidth,
+          y: vector.toYRatio * stageHeight,
+          radius: 6,
+          fill: vector.strokeHex,
+          stroke: '#F7FAFC',
+          strokeWidth: 2,
+          draggable: true,
+        });
+        attachEventIfSupported(endHandle, 'dragend', () => {
+          onSpecChangeRef.current?.(
+            updateActionVectorInSpec(
+              specRef.current,
+              vector.id,
+              vector.fromXRatio,
+              vector.fromYRatio,
+              endHandle.x() / stageWidth,
+              endHandle.y() / stageHeight,
+            ),
+          );
+        });
+        guideLayer.add(endHandle);
+      }
+    }
+
+    if (toolMode === 'draw_vector' && onSpecChangeRef.current !== undefined) {
+      let drawOrigin: { x: number; y: number } | null = null;
+      let previewArrow: Konva.Arrow | null = null;
+
+      attachEventIfSupported(stage, 'mousedown touchstart', () => {
+        const pos = stage.getPointerPosition();
+        if (pos === null) {
+          return;
+        }
+        drawOrigin = { x: pos.x, y: pos.y };
+        previewArrow = new Konva.Arrow({
+          points: [pos.x, pos.y, pos.x, pos.y],
+          stroke: '#F6AD55',
+          fill: '#F6AD55',
+          strokeWidth: 4,
+          pointerLength: 10,
+          pointerWidth: 8,
+        });
+        guideLayer.add(previewArrow);
+        guideLayer.batchDraw();
+      });
+
+      attachEventIfSupported(stage, 'mousemove touchmove', () => {
+        if (drawOrigin === null || previewArrow === null) {
+          return;
+        }
+        const pos = stage.getPointerPosition();
+        if (pos === null) {
+          return;
+        }
+        previewArrow.points([drawOrigin.x, drawOrigin.y, pos.x, pos.y]);
+        guideLayer.batchDraw();
+      });
+
+      attachEventIfSupported(stage, 'mouseup touchend', () => {
+        if (drawOrigin === null) {
+          return;
+        }
+        const pos = stage.getPointerPosition();
+        const origin = drawOrigin;
+        drawOrigin = null;
+        if (previewArrow !== null) {
+          previewArrow.destroy();
+          previewArrow = null;
+        }
+        if (pos !== null && Math.hypot(pos.x - origin.x, pos.y - origin.y) >= 8) {
+          onSpecChangeRef.current?.(
+            appendActionVectorToSpec(
+              specRef.current,
+              origin.x / stageWidth,
+              origin.y / stageHeight,
+              pos.x / stageWidth,
+              pos.y / stageHeight,
+            ),
+          );
+        }
+      });
     }
 
     stage.add(backgroundLayer);
@@ -361,7 +607,54 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
     return () => {
       stage.destroy();
     };
-  }, [spec, showGrid, disabled, viewportSize]);
+  }, [spec, showGrid, disabled, viewportSize, stageWidth, stageHeight, toolMode, bgImgElement]);
+
+  const paintMaskAt = useCallback(
+    (clientX: number, clientY: number): void => {
+      const canvas = maskCanvasRef.current;
+      if (canvas === null) {
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return;
+      }
+      const x = ((clientX - rect.left) / rect.width) * canvas.width;
+      const y = ((clientY - rect.top) / rect.height) * canvas.height;
+      const ctx = canvas.getContext('2d');
+      if (ctx === null) {
+        return;
+      }
+      const scaledRadius = Math.max(2, Math.round((brushRadiusPx / stageWidth) * canvas.width));
+      ctx.fillStyle = 'rgba(255, 255, 255, 1)';
+      ctx.beginPath();
+      ctx.arc(x, y, scaledRadius, 0, Math.PI * 2);
+      ctx.fill();
+      setHasMaskStrokes(true);
+    },
+    [brushRadiusPx, stageWidth],
+  );
+
+  const exportMaskPng = useCallback((): void => {
+    const canvas = maskCanvasRef.current;
+    if (canvas === null || onMaskExport === undefined) {
+      return;
+    }
+    const b64 = stripPngDataUrlPrefix(canvas.toDataURL('image/png'));
+    onMaskExport(b64);
+  }, [onMaskExport]);
+
+  const clearMaskCanvas = useCallback((): void => {
+    const canvas = maskCanvasRef.current;
+    if (canvas === null) {
+      return;
+    }
+    const ctx = canvas.getContext('2d');
+    if (ctx !== null) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+    setHasMaskStrokes(false);
+  }, []);
 
   const isCanvasHidden = disabled || canvasUnavailable !== null;
 
@@ -373,6 +666,7 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
         </span>
         <span>Variant: {spec.variant}</span>
         <span>Grid: {showGrid ? 'Visible' : 'Hidden'}</span>
+        <span>Tool: {toolMode}</span>
       </div>
       {disabled ? (
         <div class="stage-frame__placeholder" role="status">
@@ -385,13 +679,66 @@ export function StageCanvas({ spec, showGrid, disabled = false }: StageCanvasPro
           </div>
         )
       )}
-      <div
-        ref={containerRef}
-        hidden={isCanvasHidden}
-        class="stage-frame__canvas"
-        role="img"
-        aria-label={`Konva SpatialGuide stage for ${spec.title} (${spec.variant}, ${String(spec.canvasWidth)} by ${String(spec.canvasHeight)} pixels)`}
-      />
+      <div class="stage-canvas-stack" hidden={isCanvasHidden}>
+        <div
+          ref={containerRef}
+          hidden={isCanvasHidden}
+          class="stage-frame__canvas"
+          role="img"
+          aria-label={`Konva SpatialGuide stage for ${spec.title} (${spec.variant}, ${String(spec.canvasWidth)} by ${String(spec.canvasHeight)} pixels)`}
+        />
+        {toolMode === 'paint_mask' && !isCanvasHidden && (
+          <canvas
+            ref={maskCanvasRef}
+            width={spec.canvasWidth}
+            height={spec.canvasHeight}
+            class="mask-paint-overlay"
+            style={{ width: `${String(stageWidth)}px`, height: `${String(stageHeight)}px` }}
+            aria-label="Freehand PatchEdit alpha mask painting canvas"
+            onPointerDown={(e) => {
+              isPaintingRef.current = true;
+              paintMaskAt(e.clientX, e.clientY);
+            }}
+            onPointerMove={(e) => {
+              if (isPaintingRef.current) {
+                paintMaskAt(e.clientX, e.clientY);
+              }
+            }}
+            onPointerUp={() => {
+              if (isPaintingRef.current) {
+                isPaintingRef.current = false;
+                exportMaskPng();
+              }
+            }}
+            onPointerLeave={() => {
+              if (isPaintingRef.current) {
+                isPaintingRef.current = false;
+                exportMaskPng();
+              }
+            }}
+          />
+        )}
+      </div>
+      {toolMode === 'paint_mask' && !isCanvasHidden && (
+        <div class="button-row">
+          <button
+            type="button"
+            class="btn btn--secondary"
+            disabled={!hasMaskStrokes}
+            onClick={exportMaskPng}
+          >
+            Export PNG Mask
+          </button>
+          <button
+            type="button"
+            class="btn btn--ghost"
+            disabled={!hasMaskStrokes}
+            onClick={clearMaskCanvas}
+          >
+            Clear Mask
+          </button>
+        </div>
+      )}
     </div>
   );
 }

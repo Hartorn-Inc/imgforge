@@ -1,13 +1,43 @@
 import { describe, expect, test } from 'vitest';
-import type { AsyncViewState, LifecycleState, WorkspaceTab } from '../types/domain';
+import type {
+  AsyncViewState,
+  LifecycleState,
+  PatchEditDraft,
+  RunRecord,
+  Visibility,
+  WorkspaceTab,
+} from '../types/domain';
 import {
   WORKSPACE_TABS,
+  buildPatchEditPayload,
+  clampPatchEditDraft,
+  createDefaultPatchEditDraft,
   describeAsyncState,
   isExportEligible,
+  isVisibilityAllowedForExport,
+  nextLifecycleStep,
   resolveNextTabForKey,
 } from './workspace';
 
-describe('workspace navigation and view state helpers', () => {
+const SAMPLE_RUN: RunRecord = {
+  runId: 'harbor-dock-v001',
+  slug: 'harbor-dock',
+  version: 1,
+  versionLabel: 'v001',
+  lifecycle: 'draft',
+  visibility: 'restricted',
+  widthPx: 1024,
+  heightPx: 768,
+  visionCriticPassed: null,
+  colorQaMaxDeltaE2000: 1.5,
+  createdAtIso: '2026-11-13T00:10:00Z',
+  imageUrl: '/api/assets/runs/harbor-dock/v001.png',
+  compiledPrompt: 'harbor dock',
+  backendName: 'codex-native',
+  structuralChecks: [],
+};
+
+describe('workspace navigation, lifecycle, visibility, and PatchEdit helpers', () => {
   test('exposes all four Phase 5 top-level workspace tabs', () => {
     expect(WORKSPACE_TABS.map((tab) => tab.label)).toEqual([
       'Style & Atmosphere',
@@ -77,6 +107,144 @@ describe('workspace navigation and view state helpers', () => {
     { id: 'superseded-blocks-export', lifecycle: 'superseded', expected: false },
   ])('$id', ({ lifecycle, expected }) => {
     expect(isExportEligible(lifecycle)).toBe(expected);
+  });
+
+  test.each<{ id: string; current: LifecycleState; expectedNext: LifecycleState | null }>([
+    { id: 'draft-to-candidate', current: 'draft', expectedNext: 'candidate' },
+    { id: 'candidate-to-validated', current: 'candidate', expectedNext: 'validated' },
+    { id: 'validated-to-canonical', current: 'validated', expectedNext: 'canonical' },
+    { id: 'canonical-is-terminal', current: 'canonical', expectedNext: null },
+    { id: 'superseded-is-terminal', current: 'superseded', expectedNext: null },
+  ])('$id', ({ current, expectedNext }) => {
+    expect(nextLifecycleStep(current)).toBe(expectedNext);
+  });
+
+  test.each<{ id: string; source: Visibility; target: Visibility; allowed: boolean }>([
+    { id: 'public-to-public-allowed', source: 'public', target: 'public', allowed: true },
+    { id: 'public-to-internal-allowed', source: 'public', target: 'internal', allowed: true },
+    { id: 'restricted-to-public-blocked', source: 'restricted', target: 'public', allowed: false },
+    {
+      id: 'internal-to-restricted-blocked',
+      source: 'internal',
+      target: 'restricted',
+      allowed: false,
+    },
+    { id: 'internal-to-internal-allowed', source: 'internal', target: 'internal', allowed: true },
+  ])('$id', ({ source, target, allowed }) => {
+    expect(isVisibilityAllowedForExport(source, target)).toBe(allowed);
+  });
+
+  test.each<{
+    id: string;
+    patch: Partial<PatchEditDraft>;
+    expected: {
+      readonly cropSizePx: number;
+      readonly originXPx: number;
+      readonly originYPx: number;
+      readonly collarWidthPx: number;
+      readonly featherPx: number;
+    };
+  }>([
+    {
+      id: 'clamps-oversized-square-to-shortest-canvas-edge',
+      patch: { cropSizePx: 1200, originXPx: 500, originYPx: 400 },
+      expected: {
+        cropSizePx: 768,
+        originXPx: 256,
+        originYPx: 0,
+        collarWidthPx: 24,
+        featherPx: 12,
+      },
+    },
+    {
+      id: 'clamps-negative-origin-and-collar-bounds',
+      patch: { originXPx: -50, originYPx: -20, collarWidthPx: 8, featherPx: 40 },
+      expected: {
+        cropSizePx: 269,
+        originXPx: 0,
+        originYPx: 0,
+        collarWidthPx: 16,
+        featherPx: 16,
+      },
+    },
+    {
+      id: 'clamps-collar-max-32-and-feather-min-2',
+      patch: { collarWidthPx: 64, featherPx: 0 },
+      expected: {
+        cropSizePx: 269,
+        originXPx: 377,
+        originYPx: 249,
+        collarWidthPx: 32,
+        featherPx: 2,
+      },
+    },
+  ])('$id', ({ patch, expected }) => {
+    const base = createDefaultPatchEditDraft(SAMPLE_RUN);
+    const clamped = clampPatchEditDraft({ ...base, ...patch });
+    expect({
+      cropSizePx: clamped.cropSizePx,
+      originXPx: clamped.originXPx,
+      originYPx: clamped.originYPx,
+      collarWidthPx: clamped.collarWidthPx,
+      featherPx: clamped.featherPx,
+    }).toEqual(expected);
+  });
+
+  test.each<{
+    id: string;
+    draftPatch: Partial<PatchEditDraft>;
+    run: RunRecord | null;
+    expectError: boolean;
+    expectedMode?: 'roi' | 'mask';
+  }>([
+    {
+      id: 'builds-run-roi-patch-payload',
+      draftPatch: { mode: 'roi', prompt: 'refine brass lantern' },
+      run: SAMPLE_RUN,
+      expectError: false,
+      expectedMode: 'roi',
+    },
+    {
+      id: 'builds-target-image-mask-payload',
+      draftPatch: {
+        mode: 'mask',
+        targetImagePath: 'runs/harbor-dock/v001.png',
+        maskPngBase64: 'iVBORw0KGgo=',
+        prompt: 'fix lantern',
+      },
+      run: null,
+      expectError: false,
+      expectedMode: 'mask',
+    },
+    {
+      id: 'rejects-empty-prompt',
+      draftPatch: { prompt: '   ' },
+      run: SAMPLE_RUN,
+      expectError: true,
+    },
+    {
+      id: 'rejects-mask-mode-without-mask-png',
+      draftPatch: { mode: 'mask', maskPngBase64: null, prompt: 'fix' },
+      run: SAMPLE_RUN,
+      expectError: true,
+    },
+  ])('$id', ({ draftPatch, run, expectError, expectedMode }) => {
+    const draft = { ...createDefaultPatchEditDraft(run), ...draftPatch };
+    const result = buildPatchEditPayload(draft, run);
+    if (expectError) {
+      expect('error' in result).toBe(true);
+    } else {
+      expect('error' in result).toBe(false);
+      if (!('error' in result)) {
+        if (expectedMode === 'roi') {
+          expect(result.roi).toBeDefined();
+          expect(result.maskPngBase64).toBeUndefined();
+        } else {
+          expect(result.maskPngBase64).toBeDefined();
+          expect(result.roi).toBeUndefined();
+        }
+      }
+    }
   });
 
   test.each<{
