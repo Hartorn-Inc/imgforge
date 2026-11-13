@@ -15,6 +15,7 @@
 //! 2. Resolve optional workspace (`--workspace` > `IMGFORGE_WORKSPACE` > nearest `imgforge.toml`).
 //! 3. Dispatch the requested subcommand and emit structured output or fail closed.
 
+mod mcp;
 mod server;
 
 use std::fs;
@@ -43,6 +44,7 @@ use imgforge_core::{
 };
 use serde::Serialize;
 
+use crate::mcp::{ImgforgeMcpServer, serve_mcp_http, serve_mcp_stdio};
 use crate::server::{AppState, serve_ui};
 
 /// Standalone domain-agnostic visual consistency engine CLI.
@@ -94,6 +96,8 @@ enum Commands {
     Pack(PackArgs),
     /// Start the embedded Web Canvas SPA server strictly on 127.0.0.1:<port>.
     Ui(UiArgs),
+    /// Start the `rmcp` Model Context Protocol server (stdio by default, or --http 127.0.0.1:<port>).
+    Mcp(McpArgs),
     /// Inspect resolved workspace configuration and tool-local auth readiness.
     Status(StatusArgs),
 }
@@ -492,6 +496,13 @@ struct UiArgs {
     /// Port on 127.0.0.1 (overrides imgforge.toml server.port; defaults to 8080).
     #[arg(long)]
     port: Option<u16>,
+}
+
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// Optional loopback Streamable HTTP bind address (for example `127.0.0.1:3001`); defaults to stdio.
+    #[arg(long, value_name = "ADDR")]
+    http: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1842,6 +1853,17 @@ async fn main() -> anyhow::Result<()> {
                 .or_else(|| ws.as_ref().map(|w| w.config.server.port))
                 .unwrap_or(8080);
             serve_ui(AppState::new(auth_dir), port).await?;
+        }
+        Commands::Mcp(args) => {
+            if let Some(ref explicit_ws) = cli.workspace {
+                let _ = resolve_workspace_from_env(Some(explicit_ws.as_path()))?;
+            }
+            let server = ImgforgeMcpServer::new(cli.workspace.clone(), auth_dir, codex_bin);
+            if let Some(bind_addr) = args.http {
+                serve_mcp_http(server, &bind_addr).await?;
+            } else {
+                serve_mcp_stdio(server).await?;
+            }
         }
         Commands::Status(args) => {
             let ws = resolve_workspace_from_env(cli.workspace.as_deref())?;

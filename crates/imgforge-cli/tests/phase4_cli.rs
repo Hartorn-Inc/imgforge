@@ -7,11 +7,11 @@
 //! using isolated workspaces and a deterministic stub `codex` binary.
 
 use std::fs;
-use std::io::Cursor;
+use std::io::{BufRead, BufReader, Cursor, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use tempfile::TempDir;
@@ -352,5 +352,100 @@ fn cli_phase4_generate_explore_compose_validate_and_promote_e2e() {
         verify_lock.status.success(),
         "verify-lock failed: {}",
         String::from_utf8_lossy(&verify_lock.stderr)
+    );
+}
+
+#[test]
+fn cli_mcp_stdio_handshake_lists_8_tools_and_4_resources_and_rejects_non_loopback_http() {
+    let (_root, ws, data_home) = setup_workspace();
+
+    // 1. Non-loopback --http bind address must fail closed
+    let bad_http = Command::new(imgforge_bin())
+        .env("XDG_DATA_HOME", &data_home)
+        .args([
+            "--workspace",
+            ws.to_str().unwrap(),
+            "mcp",
+            "--http",
+            "0.0.0.0:3099",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !bad_http.status.success(),
+        "0.0.0.0 bind address must fail closed"
+    );
+
+    // 2. Spawn `imgforge mcp` over stdio JSON-RPC
+    let mut child = Command::new(imgforge_bin())
+        .env("XDG_DATA_HOME", &data_home)
+        .args(["--workspace", ws.to_str().unwrap(), "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    fn send_and_read(
+        stdin: &mut std::process::ChildStdin,
+        stdout: &mut BufReader<std::process::ChildStdout>,
+        msg: &str,
+    ) -> serde_json::Value {
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("invalid JSON line '{line}': {e}"))
+    }
+
+    let init_resp = send_and_read(
+        &mut stdin,
+        &mut stdout,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"1.0"}}}"#,
+    );
+    assert_eq!(init_resp["id"], 1);
+    assert!(init_resp["result"]["capabilities"]["tools"].is_object());
+    assert!(init_resp["result"]["capabilities"]["resources"].is_object());
+
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    let tools_resp = send_and_read(
+        &mut stdin,
+        &mut stdout,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+    );
+    let tools = tools_resp["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 8);
+
+    let res_list = send_and_read(
+        &mut stdin,
+        &mut stdout,
+        r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#,
+    );
+    let resources = res_list["result"]["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 4);
+
+    let read_subj = send_and_read(
+        &mut stdin,
+        &mut stdout,
+        r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"imgforge://subjects"}}"#,
+    );
+    let subj_text = read_subj["result"]["contents"][0]["text"].as_str().unwrap();
+    let subj_json: serde_json::Value = serde_json::from_str(subj_text).unwrap();
+    assert_eq!(subj_json[0]["subject"]["slug"], "brass-lantern");
+
+    drop(stdin);
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "mcp stdio server should exit cleanly on EOF"
     );
 }

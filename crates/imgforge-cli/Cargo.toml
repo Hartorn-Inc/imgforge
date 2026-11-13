@@ -16,7 +16,9 @@ axum.workspace = true
 clap.workspace = true
 imgforge-core = { path = "../imgforge-core" }
 mime_guess.workspace = true
+rmcp.workspace = true
 rust-embed.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -25,7 +27,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 http-body-util.workspace = true
 image.workspace = true
+rmcp = { version = "3.10.0", features = ["client"] }
 rstest.workspace = true
 tower.workspace = true
