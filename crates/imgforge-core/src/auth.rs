@@ -26,8 +26,9 @@
 //!    and clones it into a `0700` temp dir for a single `codex exec` invocation.
 
 use std::ffi::OsStr;
-use std::fs::{self, Permissions};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -97,10 +98,14 @@ pub fn resolve_codex_auth_dir_from_env() -> Result<PathBuf, CoreError> {
 }
 
 fn ensure_secure_dir(dir: &Path) -> Result<(), CoreError> {
-    fs::create_dir_all(dir).map_err(|err| CoreError::Io {
-        context: format!("creating auth directory {}", dir.display()),
-        source: err,
-    })?;
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|err| CoreError::Io {
+            context: format!("creating auth directory {}", dir.display()),
+            source: err,
+        })?;
 
     let meta = fs::symlink_metadata(dir).map_err(|err| CoreError::Io {
         context: format!("inspecting auth directory {}", dir.display()),
@@ -120,8 +125,45 @@ fn ensure_secure_dir(dir: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
+fn validate_auth_dir(auth_dir: &Path) -> Result<(), CoreError> {
+    let meta = match fs::symlink_metadata(auth_dir) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CoreError::AuthMissing {
+                auth_file: auth_dir.join(AUTH_JSON_FILENAME),
+            });
+        }
+        Err(err) => {
+            return Err(CoreError::Io {
+                context: format!("inspecting auth directory {}", auth_dir.display()),
+                source: err,
+            });
+        }
+    };
+
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(CoreError::AuthInvalid {
+            path: auth_dir.to_path_buf(),
+            reason: "auth directory must be a real directory, not a symlink".to_string(),
+        });
+    }
+
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(CoreError::AuthInvalid {
+            path: auth_dir.to_path_buf(),
+            reason: format!(
+                "auth directory has overly permissive mode {:04o}; expected 0700 (no group/world permissions)",
+                mode & 0o777
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_regular_auth_file(auth_file: &Path) -> Result<Vec<u8>, CoreError> {
-    let meta = match fs::symlink_metadata(auth_file) {
+    let lstat_meta = match fs::symlink_metadata(auth_file) {
         Ok(m) => m,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(CoreError::AuthMissing {
@@ -136,21 +178,63 @@ fn validate_regular_auth_file(auth_file: &Path) -> Result<Vec<u8>, CoreError> {
         }
     };
 
-    if meta.file_type().is_symlink() {
+    if lstat_meta.file_type().is_symlink() {
         return Err(CoreError::AuthInvalid {
             path: auth_file.to_path_buf(),
             reason: "refusing symlinked auth.json; credentials must be tool-local regular files"
                 .to_string(),
         });
     }
-    if !meta.is_file() {
+    if !lstat_meta.is_file() {
         return Err(CoreError::AuthInvalid {
             path: auth_file.to_path_buf(),
             reason: "auth.json path exists but is not a regular file".to_string(),
         });
     }
 
-    let bytes = fs::read(auth_file).map_err(|err| CoreError::Io {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(auth_file)
+        .map_err(|err| {
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                CoreError::AuthInvalid {
+                    path: auth_file.to_path_buf(),
+                    reason:
+                        "refusing symlinked auth.json; credentials must be tool-local regular files"
+                            .to_string(),
+                }
+            } else {
+                CoreError::Io {
+                    context: format!("opening {}", auth_file.display()),
+                    source: err,
+                }
+            }
+        })?;
+
+    let meta = file.metadata().map_err(|err| CoreError::Io {
+        context: format!("inspecting opened {}", auth_file.display()),
+        source: err,
+    })?;
+    if !meta.is_file() {
+        return Err(CoreError::AuthInvalid {
+            path: auth_file.to_path_buf(),
+            reason: "auth.json is not a regular file".to_string(),
+        });
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(CoreError::AuthInvalid {
+            path: auth_file.to_path_buf(),
+            reason: format!(
+                "auth.json has overly permissive mode {:04o}; expected 0600 (no group/world permissions)",
+                mode & 0o777
+            ),
+        });
+    }
+
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|err| CoreError::Io {
         context: format!("reading {}", auth_file.display()),
         source: err,
     })?;
@@ -167,6 +251,23 @@ fn validate_regular_auth_file(auth_file: &Path) -> Result<Vec<u8>, CoreError> {
     })?;
 
     Ok(bytes)
+}
+
+fn write_private_new_file(path: &Path, contents: &[u8], context: &str) -> Result<(), CoreError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| CoreError::Io {
+            context: context.to_string(),
+            source: err,
+        })?;
+    file.write_all(contents).map_err(|err| CoreError::Io {
+        context: context.to_string(),
+        source: err,
+    })?;
+    Ok(())
 }
 
 /// Manager for tool-local ChatGPT Plus OAuth provisioning via `codex login`.
@@ -198,10 +299,11 @@ impl AuthManager {
         self.auth_dir.join(AUTH_JSON_FILENAME)
     }
 
-    /// Fast local check (used by `GET /api/health`) verifying `auth.json` exists and is valid JSON.
+    /// Fast local check (used by `GET /api/health`) verifying `auth.json` exists, is secure, and is valid JSON.
     #[must_use]
     pub fn is_provisioned_locally(&self) -> bool {
-        validate_regular_auth_file(&self.auth_file_path()).is_ok()
+        validate_auth_dir(&self.auth_dir).is_ok()
+            && validate_regular_auth_file(&self.auth_file_path()).is_ok()
     }
 
     /// Invoke `codex login` (optionally `--device-auth`) with `CODEX_HOME` bound to the tool-local dir.
@@ -209,6 +311,7 @@ impl AuthManager {
         ensure_secure_dir(&self.auth_dir)?;
 
         let mut cmd = Command::new(&self.codex_bin);
+        cmd.kill_on_drop(true);
         cmd.arg("login");
         if device_auth {
             cmd.arg("--device-auth");
@@ -229,29 +332,50 @@ impl AuthManager {
         }
 
         let auth_file = self.auth_file_path();
-        let _ = validate_regular_auth_file(&auth_file)?;
+        let meta = match fs::symlink_metadata(&auth_file) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CoreError::AuthMissing { auth_file });
+            }
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!("inspecting {}", auth_file.display()),
+                    source: err,
+                });
+            }
+        };
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(CoreError::AuthInvalid {
+                path: auth_file,
+                reason: "codex login produced a symlink or non-regular auth.json".to_string(),
+            });
+        }
         fs::set_permissions(&auth_file, Permissions::from_mode(0o600)).map_err(|err| {
             CoreError::Io {
                 context: format!("setting 0600 permissions on {}", auth_file.display()),
                 source: err,
             }
         })?;
+        let _ = validate_regular_auth_file(&auth_file)?;
 
         Ok(auth_file)
     }
 
     /// Verify local `auth.json` presence/integrity and query `codex login status` in `CODEX_HOME`.
     pub async fn status(&self) -> Result<AuthStatusReport, CoreError> {
+        validate_auth_dir(&self.auth_dir)?;
         let auth_file = self.auth_file_path();
         let _ = validate_regular_auth_file(&auth_file)?;
 
-        let output = Command::new(&self.codex_bin)
-            .args(["login", "status"])
+        let mut cmd = Command::new(&self.codex_bin);
+        cmd.kill_on_drop(true);
+        cmd.args(["login", "status"])
             .env("CODEX_HOME", &self.auth_dir)
             .env_remove("OPENAI_API_KEY")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = cmd
             .output()
             .await
             .map_err(|err| CoreError::AuthCommandFailed {
@@ -328,6 +452,7 @@ pub struct TempCodexHome {
 impl TempCodexHome {
     /// Materialize a fresh isolated `CODEX_HOME` directory from `source_auth_dir/auth.json`.
     pub fn create(source_auth_dir: &Path) -> Result<Self, CoreError> {
+        validate_auth_dir(source_auth_dir)?;
         let source_auth_file = source_auth_dir.join(AUTH_JSON_FILENAME);
         let auth_bytes = validate_regular_auth_file(&source_auth_file)?;
 
@@ -350,32 +475,22 @@ impl TempCodexHome {
         })?;
 
         let dest_auth_file = temp_dir.path().join(AUTH_JSON_FILENAME);
-        fs::write(&dest_auth_file, auth_bytes).map_err(|err| CoreError::Io {
-            context: format!("copying auth.json into {}", dest_auth_file.display()),
-            source: err,
-        })?;
-        fs::set_permissions(&dest_auth_file, Permissions::from_mode(0o600)).map_err(|err| {
-            CoreError::Io {
-                context: format!("setting 0600 permissions on {}", dest_auth_file.display()),
-                source: err,
-            }
-        })?;
+        write_private_new_file(
+            &dest_auth_file,
+            &auth_bytes,
+            &format!("copying auth.json into {}", dest_auth_file.display()),
+        )?;
 
         let dest_config_file = temp_dir.path().join(CODEX_CONFIG_FILENAME);
-        let minimal_config = "# Isolated per-job imgforge CODEX_HOME\n";
-        fs::write(&dest_config_file, minimal_config).map_err(|err| CoreError::Io {
-            context: format!(
+        let minimal_config = b"# Isolated per-job imgforge CODEX_HOME\n";
+        write_private_new_file(
+            &dest_config_file,
+            minimal_config,
+            &format!(
                 "writing minimal config.toml at {}",
                 dest_config_file.display()
             ),
-            source: err,
-        })?;
-        fs::set_permissions(&dest_config_file, Permissions::from_mode(0o600)).map_err(|err| {
-            CoreError::Io {
-                context: format!("setting 0600 permissions on {}", dest_config_file.display()),
-                source: err,
-            }
-        })?;
+        )?;
 
         Ok(Self { temp_dir })
     }
@@ -433,8 +548,10 @@ mod tests {
     #[test]
     fn temp_codex_home_copies_auth_with_strict_permissions_and_cleans_up_on_drop() {
         let auth_dir = TempDir::new().expect("auth tempdir");
+        fs::set_permissions(auth_dir.path(), Permissions::from_mode(0o700)).unwrap();
         let auth_file = auth_dir.path().join("auth.json");
         fs::write(&auth_file, r#"{"access_token":"test-token"}"#).unwrap();
+        fs::set_permissions(&auth_file, Permissions::from_mode(0o600)).unwrap();
 
         let isolated_path: PathBuf;
         {
@@ -469,6 +586,7 @@ mod tests {
     #[test]
     fn temp_codex_home_rejects_missing_and_symlinked_auth_json() {
         let auth_dir = TempDir::new().expect("auth tempdir");
+        fs::set_permissions(auth_dir.path(), Permissions::from_mode(0o700)).unwrap();
         let missing_err = TempCodexHome::create(auth_dir.path()).expect_err("missing auth");
         assert!(matches!(missing_err, CoreError::AuthMissing { .. }));
 
@@ -478,6 +596,30 @@ mod tests {
 
         let symlink_err = TempCodexHome::create(auth_dir.path()).expect_err("symlink auth");
         assert!(matches!(symlink_err, CoreError::AuthInvalid { .. }));
+    }
+
+    #[rstest]
+    #[case::group_readable_dir(0o740, 0o600)]
+    #[case::world_readable_dir(0o755, 0o600)]
+    #[case::world_writable_dir(0o702, 0o600)]
+    #[case::group_readable_auth_file(0o700, 0o640)]
+    #[case::world_readable_auth_file(0o700, 0o644)]
+    #[case::group_writable_auth_file(0o700, 0o660)]
+    fn temp_codex_home_rejects_group_or_world_permissions(
+        #[case] dir_mode: u32,
+        #[case] file_mode: u32,
+    ) {
+        let root = TempDir::new().expect("root tempdir");
+        let auth_dir = root.path().join("codex");
+        fs::create_dir(&auth_dir).unwrap();
+        let auth_file = auth_dir.join("auth.json");
+        fs::write(&auth_file, r#"{"access_token":"test-token"}"#).unwrap();
+        fs::set_permissions(&auth_file, Permissions::from_mode(file_mode)).unwrap();
+        fs::set_permissions(&auth_dir, Permissions::from_mode(dir_mode)).unwrap();
+
+        let err = TempCodexHome::create(&auth_dir)
+            .expect_err("group/world permission bits on auth_dir or auth.json must fail closed");
+        assert!(matches!(err, CoreError::AuthInvalid { .. }));
     }
 
     #[tokio::test]

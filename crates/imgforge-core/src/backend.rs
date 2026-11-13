@@ -26,8 +26,10 @@
 //!    and Lanczos-resample to exact `WxH`.
 //! 6. Drop `TempCodexHome` automatically on return, error, or cancellation.
 
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, OpenOptions};
+use std::io::{Cursor, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::SystemTime;
@@ -89,6 +91,47 @@ pub trait ImageBackend: Send + Sync {
     ) -> Result<ImageGenerationOutput, CoreError>;
 }
 
+/// Construct the reduced integer aspect ratio label (for example `"16:9"` or `"1:1"`).
+#[must_use]
+pub fn format_aspect_ratio(width: u32, height: u32) -> String {
+    let mut a = width;
+    let mut b = height;
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    let divisor = a.max(1);
+    format!("{}:{}", width / divisor, height / divisor)
+}
+
+/// Build the full prompt passed to `codex exec` including target `WxH` dimensions,
+/// aspect ratio, and positive-only reference/textless rendering guidance.
+#[must_use]
+pub fn build_generation_prompt(request: &ImageGenerationRequest) -> String {
+    let aspect = format_aspect_ratio(request.width, request.height);
+    let ref_clause = if request.reference_images.is_empty() {
+        "Render the image faithfully"
+    } else {
+        "Render the image faithfully matching the attached reference image(s)"
+    };
+    format!(
+        "[RENDER_TARGET]\n\
+         dimensions: {}x{}\n\
+         aspect_ratio: {}\n\
+         instruction: {} at {}x{} ({}) framing as purely visual artwork with clean, unlabeled surfaces and zero rendered text or labels.\n\n\
+         {}",
+        request.width,
+        request.height,
+        aspect,
+        ref_clause,
+        request.width,
+        request.height,
+        aspect,
+        request.prompt.trim()
+    )
+}
+
 /// Sole built-in backend executing `codex exec` with isolated per-job `CODEX_HOME`.
 #[derive(Debug, Clone)]
 pub struct CodexNativeBackend {
@@ -146,13 +189,15 @@ impl ImageBackend for CodexNativeBackend {
         }
 
         let temp_codex_home = TempCodexHome::create(&self.auth_dir)?;
+        let full_prompt = build_generation_prompt(request);
 
         let mut cmd = Command::new(&self.codex_bin);
+        cmd.kill_on_drop(true);
         cmd.args(["exec", "--ephemeral", "--json"]);
         for ref_path in &request.reference_images {
             cmd.arg("-i").arg(ref_path);
         }
-        cmd.arg("--").arg(&request.prompt);
+        cmd.arg("--").arg(&full_prompt);
         cmd.env("CODEX_HOME", temp_codex_home.path());
         cmd.env_remove("OPENAI_API_KEY");
         cmd.stdin(Stdio::null());
@@ -186,10 +231,7 @@ impl ImageBackend for CodexNativeBackend {
         let generated_root = temp_codex_home.path().join("generated_images");
         let png_path = locate_generated_png(&generated_root, thread_id.as_deref())?;
 
-        let raw_bytes = fs::read(&png_path).map_err(|err| CoreError::Io {
-            context: format!("reading generated PNG at {}", png_path.display()),
-            source: err,
-        })?;
+        let raw_bytes = read_regular_png_nofollow(&png_path)?;
 
         let (png_bytes, raw_width, raw_height) =
             validate_and_resample_png(&png_path, &raw_bytes, request.width, request.height)?;
@@ -238,42 +280,143 @@ fn is_safe_thread_id(raw: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn collect_png_candidates(dir: &Path, out: &mut Vec<(SystemTime, PathBuf)>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if meta.file_type().is_symlink() {
-            continue;
+fn ensure_real_directory(dir: &Path, label: &str) -> Result<bool, CoreError> {
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(CoreError::Io {
+                context: format!("inspecting {label} at {}", dir.display()),
+                source: err,
+            });
         }
+    };
+
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(CoreError::InvalidPng {
+            path: dir.to_path_buf(),
+            reason: format!("refusing symlink or non-directory {label}"),
+        });
+    }
+
+    Ok(true)
+}
+
+fn collect_png_candidates(
+    dir: &Path,
+    out: &mut Vec<(SystemTime, PathBuf)>,
+) -> Result<(), CoreError> {
+    let entries = fs::read_dir(dir).map_err(|err| CoreError::Io {
+        context: format!("listing generated images directory {}", dir.display()),
+        source: err,
+    })?;
+
+    for entry_res in entries {
+        let entry = entry_res.map_err(|err| CoreError::Io {
+            context: format!("reading entry in {}", dir.display()),
+            source: err,
+        })?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path).map_err(|err| CoreError::Io {
+            context: format!("inspecting generated entry {}", path.display()),
+            source: err,
+        })?;
+
+        if meta.file_type().is_symlink() {
+            return Err(CoreError::InvalidPng {
+                path,
+                reason: "refusing symlink inside generated_images".to_string(),
+            });
+        }
+
         if meta.is_dir() {
-            collect_png_candidates(&path, out);
-        } else if meta.is_file()
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+            collect_png_candidates(&path, out)?;
+        } else if !meta.is_file() {
+            return Err(CoreError::InvalidPng {
+                path,
+                reason: "refusing non-regular file inside generated_images".to_string(),
+            });
+        } else if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
         {
             let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
             out.push((mtime, path));
         }
     }
+
+    Ok(())
 }
 
-fn pick_newest_png(dir: &Path) -> Option<PathBuf> {
-    if !dir.is_dir() {
-        return None;
+fn pick_newest_png(dir: &Path, label: &str) -> Result<Option<PathBuf>, CoreError> {
+    if !ensure_real_directory(dir, label)? {
+        return Ok(None);
     }
     let mut candidates = Vec::new();
-    collect_png_candidates(dir, &mut candidates);
+    collect_png_candidates(dir, &mut candidates)?;
     candidates.sort_by(|(mtime_a, path_a), (mtime_b, path_b)| {
         mtime_b.cmp(mtime_a).then_with(|| path_b.cmp(path_a))
     });
-    candidates.into_iter().next().map(|(_, path)| path)
+    Ok(candidates.into_iter().next().map(|(_, path)| path))
+}
+
+fn read_regular_png_nofollow(png_path: &Path) -> Result<Vec<u8>, CoreError> {
+    let lstat_meta = fs::symlink_metadata(png_path).map_err(|err| CoreError::Io {
+        context: format!("inspecting generated PNG at {}", png_path.display()),
+        source: err,
+    })?;
+    if lstat_meta.file_type().is_symlink() || !lstat_meta.is_file() {
+        return Err(CoreError::InvalidPng {
+            path: png_path.to_path_buf(),
+            reason: "refusing symlink or non-regular generated PNG".to_string(),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(png_path)
+            .map_err(|err| {
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    CoreError::InvalidPng {
+                        path: png_path.to_path_buf(),
+                        reason: "refusing symlink generated PNG (O_NOFOLLOW)".to_string(),
+                    }
+                } else {
+                    CoreError::Io {
+                        context: format!("opening generated PNG at {}", png_path.display()),
+                        source: err,
+                    }
+                }
+            })?;
+        let meta = file.metadata().map_err(|err| CoreError::Io {
+            context: format!("inspecting opened generated PNG at {}", png_path.display()),
+            source: err,
+        })?;
+        if !meta.is_file() {
+            return Err(CoreError::InvalidPng {
+                path: png_path.to_path_buf(),
+                reason: "generated PNG is not a regular file".to_string(),
+            });
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|err| CoreError::Io {
+            context: format!("reading generated PNG at {}", png_path.display()),
+            source: err,
+        })?;
+        Ok(bytes)
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::read(png_path).map_err(|err| CoreError::Io {
+            context: format!("reading generated PNG at {}", png_path.display()),
+            source: err,
+        })
+    }
 }
 
 /// Locate the generated PNG under `$CODEX_HOME/generated_images/<thread_id>/`,
@@ -282,16 +425,23 @@ pub fn locate_generated_png(
     generated_root: &Path,
     thread_id: Option<&str>,
 ) -> Result<PathBuf, CoreError> {
+    if !ensure_real_directory(generated_root, "generated_images root")? {
+        return Err(CoreError::GeneratedImageNotFound {
+            search_root: generated_root.to_path_buf(),
+            thread_id: thread_id.map(str::to_string),
+        });
+    }
+
     if let Some(tid) = thread_id
         && is_safe_thread_id(tid)
     {
         let thread_dir = generated_root.join(tid);
-        if let Some(found) = pick_newest_png(&thread_dir) {
+        if let Some(found) = pick_newest_png(&thread_dir, "thread generated_images directory")? {
             return Ok(found);
         }
     }
 
-    if let Some(fallback) = pick_newest_png(generated_root) {
+    if let Some(fallback) = pick_newest_png(generated_root, "generated_images root")? {
         return Ok(fallback);
     }
 
@@ -365,13 +515,22 @@ pub fn validate_and_resample_png(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use image::{ImageBuffer, Rgba};
     use rstest::rstest;
     use tempfile::TempDir;
 
     use super::*;
+
+    fn create_secure_auth_dir(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let auth_file = dir.join("auth.json");
+        fs::write(&auth_file, r#"{"token":"oauth"}"#).unwrap();
+        fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     fn make_solid_png(width: u32, height: u32) -> Vec<u8> {
         let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
@@ -439,8 +598,7 @@ mod tests {
     async fn codex_native_backend_uses_isolated_codex_home_thread_id_and_cleans_up() {
         let root = TempDir::new().expect("tempdir");
         let auth_dir = root.path().join("auth");
-        fs::create_dir_all(&auth_dir).unwrap();
-        fs::write(auth_dir.join("auth.json"), r#"{"token":"oauth"}"#).unwrap();
+        create_secure_auth_dir(&auth_dir);
 
         let ref_img = root.path().join("ref.png");
         fs::write(&ref_img, make_solid_png(64, 64)).unwrap();
@@ -506,14 +664,16 @@ printf '{{"type":"thread.started","thread_id":"thr_001"}}\n'
         let args = fs::read_to_string(&recorded_args).unwrap();
         assert!(args.contains("exec\n--ephemeral\n--json\n-i\n"));
         assert!(args.contains(&ref_img.to_string_lossy().into_owned()));
+        assert!(args.contains("1024x1024"));
+        assert!(args.contains("1:1"));
+        assert!(args.contains("attached reference"));
     }
 
     #[tokio::test]
     async fn codex_native_backend_uses_newest_png_fallback_when_thread_id_absent() {
         let root = TempDir::new().expect("tempdir");
         let auth_dir = root.path().join("auth");
-        fs::create_dir_all(&auth_dir).unwrap();
-        fs::write(auth_dir.join("auth.json"), r#"{"token":"oauth"}"#).unwrap();
+        create_secure_auth_dir(&auth_dir);
 
         let older_fixture = root.path().join("older.png");
         let newer_fixture = root.path().join("newer.png");
@@ -574,8 +734,7 @@ printf '{{"type":"turn.completed"}}\n'
     async fn codex_native_backend_cleans_up_temp_codex_home_when_aspect_ratio_fails() {
         let root = TempDir::new().expect("tempdir");
         let auth_dir = root.path().join("auth");
-        fs::create_dir_all(&auth_dir).unwrap();
-        fs::write(auth_dir.join("auth.json"), r#"{"token":"oauth"}"#).unwrap();
+        create_secure_auth_dir(&auth_dir);
 
         let bad_ar_fixture = root.path().join("bad_ar.png");
         fs::write(&bad_ar_fixture, make_solid_png(1600, 800)).unwrap();
@@ -614,5 +773,89 @@ printf '{{"type":"thread.started","thread_id":"thr_err"}}\n'
             !used_home.exists(),
             "TempCodexHome must be removed even when aspect-ratio validation fails"
         );
+    }
+
+    #[rstest]
+    #[case::widescreen_with_refs(1280, 720, true, "1280x720", "16:9", true)]
+    #[case::square_without_refs(1024, 1024, false, "1024x1024", "1:1", false)]
+    fn generation_prompt_includes_target_dimensions_and_aspect_ratio(
+        #[case] width: u32,
+        #[case] height: u32,
+        #[case] with_refs: bool,
+        #[case] expected_dim: &str,
+        #[case] expected_ar: &str,
+        #[case] expect_ref_phrase: bool,
+    ) {
+        let refs = if with_refs {
+            vec![PathBuf::from("ref.png")]
+        } else {
+            Vec::new()
+        };
+        let prompt = build_generation_prompt(&ImageGenerationRequest {
+            prompt: "harbor pier at dawn".to_string(),
+            width,
+            height,
+            reference_images: refs,
+        });
+        assert!(prompt.contains(expected_dim));
+        assert!(prompt.contains(expected_ar));
+        assert!(prompt.contains("unlabeled surfaces"));
+        assert_eq!(prompt.contains("attached reference"), expect_ref_phrase);
+    }
+
+    #[rstest]
+    #[case::symlink_generated_images_root("root_symlink")]
+    #[case::non_directory_generated_images_root("root_file")]
+    #[case::symlink_thread_dir("thread_symlink")]
+    #[case::symlink_nested_dir("nested_dir_symlink")]
+    #[case::symlink_candidate_png("png_symlink")]
+    fn locate_generated_png_rejects_symlinks_and_non_directories_fail_closed(
+        #[case] scenario: &str,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let outside_dir = root.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_png = outside_dir.join("secret.png");
+        fs::write(&outside_png, make_solid_png(64, 64)).unwrap();
+
+        let generated_root = root.path().join("generated_images");
+        match scenario {
+            "root_symlink" => {
+                symlink(&outside_dir, &generated_root).unwrap();
+            }
+            "root_file" => {
+                fs::write(&generated_root, b"not a dir").unwrap();
+            }
+            "thread_symlink" => {
+                fs::create_dir_all(&generated_root).unwrap();
+                symlink(&outside_dir, generated_root.join("thr_1")).unwrap();
+            }
+            "nested_dir_symlink" => {
+                fs::create_dir_all(generated_root.join("thr_1")).unwrap();
+                symlink(&outside_dir, generated_root.join("thr_1/sub")).unwrap();
+            }
+            "png_symlink" => {
+                fs::create_dir_all(generated_root.join("thr_1")).unwrap();
+                symlink(&outside_png, generated_root.join("thr_1/out.png")).unwrap();
+            }
+            other => panic!("unexpected scenario: {other}"),
+        }
+
+        let err = locate_generated_png(&generated_root, Some("thr_1"))
+            .expect_err("symlink or non-directory component must fail closed");
+        assert!(matches!(err, CoreError::InvalidPng { .. }));
+    }
+
+    #[test]
+    fn read_regular_png_nofollow_rejects_symlink_png() {
+        let root = TempDir::new().expect("tempdir");
+        let real_png = root.path().join("real.png");
+        fs::write(&real_png, make_solid_png(32, 32)).unwrap();
+        let link_png = root.path().join("link.png");
+        symlink(&real_png, &link_png).unwrap();
+
+        let err = read_regular_png_nofollow(&link_png)
+            .expect_err("symlinked PNG must be rejected fail-closed");
+        assert!(matches!(err, CoreError::InvalidPng { .. }));
     }
 }

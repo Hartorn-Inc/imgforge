@@ -25,6 +25,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
+use crate::backend::format_aspect_ratio;
 use crate::error::CoreError;
 use crate::scene_spec::{
     MAX_FOREGROUND_SLOTS, SUPPORTED_SCENE_SPEC_SCHEMA_VERSION, SceneSpec, Visibility,
@@ -49,6 +50,20 @@ const NEGATION_WORDS: &[&str] = &[
     "won't",
     "cannot",
     "can't",
+    "isn't",
+    "aren't",
+    "wasn't",
+    "weren't",
+    "wouldn't",
+    "couldn't",
+    "shouldn't",
+    "mustn't",
+    "hasn't",
+    "haven't",
+    "hadn't",
+    "ain't",
+    "none",
+    "nothing",
     "absent",
     "lacking",
     "lacks",
@@ -56,18 +71,20 @@ const NEGATION_WORDS: &[&str] = &[
     "minus",
 ];
 
-/// Multi-word negation phrases rejected in `SceneSpec` prose fields.
-const NEGATION_PHRASES: &[&str] = &[
-    "free of",
-    "devoid of",
-    "absence of",
-    "do not",
-    "does not",
-    "did not",
-    "will not",
-    "must not",
-    "should not",
-    "instead of",
+/// Multi-word negation phrases matched over contiguous token windows in `SceneSpec` prose fields.
+const NEGATION_PHRASES: &[&[&str]] = &[
+    &["free", "of"],
+    &["devoid", "of"],
+    &["absence", "of"],
+    &["do", "not"],
+    &["does", "not"],
+    &["did", "not"],
+    &["will", "not"],
+    &["must", "not"],
+    &["should", "not"],
+    &["would", "not"],
+    &["could", "not"],
+    &["instead", "of"],
 ];
 
 /// Deterministic output produced by `PromptCompiler`.
@@ -104,21 +121,22 @@ impl PromptCompiler {
 
         let target_width = spec.width.unwrap_or(1024);
         let target_height = spec.height.unwrap_or(1024);
+        let aspect_ratio = format_aspect_ratio(target_width, target_height);
 
         let mut out = String::with_capacity(512);
         let _ = writeln!(out, "[SCENE]");
         let _ = writeln!(out, "id: {}", spec.id.trim());
-        let _ = writeln!(out, "title: {}", spec.title.trim());
+        let _ = writeln!(out, "title: {}", collapse_prose(&spec.title));
         let _ = writeln!(out, "visibility: {}", spec.visibility.as_str());
-        let _ = writeln!(out, "action: {}", spec.action_summary.trim());
+        let _ = writeln!(out, "action: {}", collapse_prose(&spec.action_summary));
 
         let _ = writeln!(out, "\n[CAMERA]");
-        let _ = writeln!(out, "shot: {}", spec.camera.shot.trim());
+        let _ = writeln!(out, "shot: {}", collapse_prose(&spec.camera.shot));
         if let Some(ref angle) = spec.camera.angle {
-            let _ = writeln!(out, "angle: {}", angle.trim());
+            let _ = writeln!(out, "angle: {}", collapse_prose(angle));
         }
         if let Some(ref framing) = spec.camera.framing {
-            let _ = writeln!(out, "framing: {}", framing.trim());
+            let _ = writeln!(out, "framing: {}", collapse_prose(framing));
         }
 
         let _ = writeln!(out, "\n[DEPTH_BANDS]");
@@ -129,7 +147,7 @@ impl PromptCompiler {
                 band.plane.as_str(),
                 band.near_meters,
                 band.far_meters,
-                band.description.trim()
+                collapse_prose(&band.description)
             );
         }
 
@@ -142,15 +160,23 @@ impl PromptCompiler {
                 slot.position_x_ratio,
                 slot.subject_ref.trim(),
                 slot.height_meters,
-                slot.pose.trim()
+                collapse_prose(&slot.pose)
             );
             let left_desc = match slot.left_hand.item {
-                Some(ref item) => format!("{} ({})", slot.left_hand.action.trim(), item.trim()),
-                None => slot.left_hand.action.trim().to_string(),
+                Some(ref item) => format!(
+                    "{} ({})",
+                    collapse_prose(&slot.left_hand.action),
+                    collapse_prose(item)
+                ),
+                None => collapse_prose(&slot.left_hand.action),
             };
             let right_desc = match slot.right_hand.item {
-                Some(ref item) => format!("{} ({})", slot.right_hand.action.trim(), item.trim()),
-                None => slot.right_hand.action.trim().to_string(),
+                Some(ref item) => format!(
+                    "{} ({})",
+                    collapse_prose(&slot.right_hand.action),
+                    collapse_prose(item)
+                ),
+                None => collapse_prose(&slot.right_hand.action),
             };
             let _ = writeln!(out, "  left_hand: {left_desc}");
             let _ = writeln!(out, "  right_hand: {right_desc}");
@@ -165,11 +191,13 @@ impl PromptCompiler {
                         Some(ref finish) => format!(
                             "{}={} {} ({})",
                             b.slot.trim(),
-                            b.material.trim(),
+                            collapse_prose(&b.material),
                             hex,
-                            finish.trim()
+                            collapse_prose(finish)
                         ),
-                        None => format!("{}={} {}", b.slot.trim(), b.material.trim(), hex),
+                        None => {
+                            format!("{}={} {}", b.slot.trim(), collapse_prose(&b.material), hex)
+                        }
                     }
                 })
                 .collect();
@@ -180,7 +208,11 @@ impl PromptCompiler {
         let _ = writeln!(out, "style_ref: {}", spec.style_ref.trim());
 
         let _ = writeln!(out, "\n[ATMOSPHERE]");
-        let _ = write!(out, "atmosphere_ref: {}", spec.atmosphere_ref.trim());
+        let _ = writeln!(out, "atmosphere_ref: {}", spec.atmosphere_ref.trim());
+
+        let _ = writeln!(out, "\n[OUTPUT]");
+        let _ = writeln!(out, "dimensions: {target_width}x{target_height}");
+        let _ = write!(out, "aspect_ratio: {aspect_ratio}");
 
         Ok(CompiledPrompt {
             prompt: out,
@@ -190,6 +222,33 @@ impl PromptCompiler {
             target_height,
         })
     }
+}
+
+fn collapse_prose(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn require_identifier(field: &str, value: &str) -> Result<(), CoreError> {
+    require_non_empty(field, value)?;
+    if value.chars().any(char::is_control) {
+        return Err(CoreError::PromptCompilationFailed(format!(
+            "{field} must not contain control characters or newlines"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_prose_field(field: &str, value: &str) -> Result<(), CoreError> {
+    require_non_empty(field, value)?;
+    if value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(CoreError::PromptCompilationFailed(format!(
+            "{field} must not contain non-whitespace control characters"
+        )));
+    }
+    check_no_active_negations(field, value)
 }
 
 fn require_non_empty(field: &str, value: &str) -> Result<(), CoreError> {
@@ -202,9 +261,11 @@ fn require_non_empty(field: &str, value: &str) -> Result<(), CoreError> {
 }
 
 fn check_no_active_negations(field: &str, text: &str) -> Result<(), CoreError> {
-    let lower = text.to_ascii_lowercase();
+    let normalized_quotes = text.replace(['\u{2019}', '\u{2018}', '\u{02BC}'], "'");
+    let lower = normalized_quotes.to_ascii_lowercase();
     let normalized_tokens: Vec<String> = lower
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+        .map(|tok| tok.trim_matches('\''))
         .filter(|tok| !tok.is_empty())
         .map(str::to_string)
         .collect();
@@ -217,11 +278,12 @@ fn check_no_active_negations(field: &str, text: &str) -> Result<(), CoreError> {
         }
     }
 
-    let collapsed = normalized_tokens.join(" ");
+    let token_refs: Vec<&str> = normalized_tokens.iter().map(String::as_str).collect();
     for phrase in NEGATION_PHRASES {
-        if collapsed.contains(phrase) {
+        if token_refs.windows(phrase.len()).any(|win| win == *phrase) {
             return Err(CoreError::PromptCompilationFailed(format!(
-                "{field} contains active negation phrase '{phrase}'; prompts must use positive-only phrasing"
+                "{field} contains active negation phrase '{}'; prompts must use positive-only phrasing",
+                phrase.join(" ")
             )));
         }
     }
@@ -245,23 +307,18 @@ fn validate_scene_spec(
         )));
     }
 
-    require_non_empty("id", &spec.id)?;
-    require_non_empty("title", &spec.title)?;
-    require_non_empty("style_ref", &spec.style_ref)?;
-    require_non_empty("atmosphere_ref", &spec.atmosphere_ref)?;
-    require_non_empty("action_summary", &spec.action_summary)?;
-    require_non_empty("camera.shot", &spec.camera.shot)?;
+    require_identifier("id", &spec.id)?;
+    require_identifier("style_ref", &spec.style_ref)?;
+    require_identifier("atmosphere_ref", &spec.atmosphere_ref)?;
 
-    check_no_active_negations("title", &spec.title)?;
-    check_no_active_negations("action_summary", &spec.action_summary)?;
-    check_no_active_negations("camera.shot", &spec.camera.shot)?;
+    validate_prose_field("title", &spec.title)?;
+    validate_prose_field("action_summary", &spec.action_summary)?;
+    validate_prose_field("camera.shot", &spec.camera.shot)?;
     if let Some(ref angle) = spec.camera.angle {
-        require_non_empty("camera.angle", angle)?;
-        check_no_active_negations("camera.angle", angle)?;
+        validate_prose_field("camera.angle", angle)?;
     }
     if let Some(ref framing) = spec.camera.framing {
-        require_non_empty("camera.framing", framing)?;
-        check_no_active_negations("camera.framing", framing)?;
+        validate_prose_field("camera.framing", framing)?;
     }
 
     if let Some(w) = spec.width
@@ -297,8 +354,7 @@ fn validate_scene_spec(
                 "{prefix}.far_meters must be finite and strictly greater than near_meters"
             )));
         }
-        require_non_empty(&format!("{prefix}.description"), &band.description)?;
-        check_no_active_negations(&format!("{prefix}.description"), &band.description)?;
+        validate_prose_field(&format!("{prefix}.description"), &band.description)?;
     }
 
     if spec.foreground_slots.len() > MAX_FOREGROUND_SLOTS {
@@ -312,9 +368,8 @@ fn validate_scene_spec(
     let mut previous_x: Option<f64> = None;
     for (idx, slot) in spec.foreground_slots.iter().enumerate() {
         let prefix = format!("foreground_slots[{idx}]");
-        require_non_empty(&format!("{prefix}.subject_ref"), &slot.subject_ref)?;
-        require_non_empty(&format!("{prefix}.pose"), &slot.pose)?;
-        check_no_active_negations(&format!("{prefix}.pose"), &slot.pose)?;
+        require_identifier(&format!("{prefix}.subject_ref"), &slot.subject_ref)?;
+        validate_prose_field(&format!("{prefix}.pose"), &slot.pose)?;
 
         if !slot.position_x_ratio.is_finite()
             || slot.position_x_ratio < 0.0
@@ -354,30 +409,20 @@ fn validate_scene_spec(
             )));
         }
 
-        require_non_empty(
-            &format!("{prefix}.left_hand.action"),
-            &slot.left_hand.action,
-        )?;
-        check_no_active_negations(
+        validate_prose_field(
             &format!("{prefix}.left_hand.action"),
             &slot.left_hand.action,
         )?;
         if let Some(ref item) = slot.left_hand.item {
-            require_non_empty(&format!("{prefix}.left_hand.item"), item)?;
-            check_no_active_negations(&format!("{prefix}.left_hand.item"), item)?;
+            validate_prose_field(&format!("{prefix}.left_hand.item"), item)?;
         }
 
-        require_non_empty(
-            &format!("{prefix}.right_hand.action"),
-            &slot.right_hand.action,
-        )?;
-        check_no_active_negations(
+        validate_prose_field(
             &format!("{prefix}.right_hand.action"),
             &slot.right_hand.action,
         )?;
         if let Some(ref item) = slot.right_hand.item {
-            require_non_empty(&format!("{prefix}.right_hand.item"), item)?;
-            check_no_active_negations(&format!("{prefix}.right_hand.item"), item)?;
+            validate_prose_field(&format!("{prefix}.right_hand.item"), item)?;
         }
 
         if slot.exclusive_surface_map.bindings.is_empty() {
@@ -389,9 +434,8 @@ fn validate_scene_spec(
         let mut seen_slots = HashSet::new();
         for (b_idx, binding) in slot.exclusive_surface_map.bindings.iter().enumerate() {
             let b_prefix = format!("{prefix}.exclusive_surface_map.bindings[{b_idx}]");
-            require_non_empty(&format!("{b_prefix}.slot"), &binding.slot)?;
-            require_non_empty(&format!("{b_prefix}.material"), &binding.material)?;
-            check_no_active_negations(&format!("{b_prefix}.material"), &binding.material)?;
+            require_identifier(&format!("{b_prefix}.slot"), &binding.slot)?;
+            validate_prose_field(&format!("{b_prefix}.material"), &binding.material)?;
 
             let slot_key = binding.slot.trim().to_ascii_lowercase();
             if !seen_slots.insert(slot_key) {
@@ -409,8 +453,7 @@ fn validate_scene_spec(
             }
 
             if let Some(ref finish) = binding.finish {
-                require_non_empty(&format!("{b_prefix}.finish"), finish)?;
-                check_no_active_negations(&format!("{b_prefix}.finish"), finish)?;
+                validate_prose_field(&format!("{b_prefix}.finish"), finish)?;
             }
         }
     }
@@ -525,14 +568,80 @@ mod tests {
                 .prompt
                 .contains("cloak=heavy wool #2B3A4A (matte); tunic=woven linen #D6CBB8")
         );
+        assert!(
+            compiled_a
+                .prompt
+                .contains("[OUTPUT]\ndimensions: 1280x720\naspect_ratio: 16:9")
+        );
+    }
+
+    #[rstest]
+    #[case::northern_knotwork(
+        "Northern Knotwork Observatory",
+        "Scholars study knotted astronomical charts facing north"
+    )]
+    #[case::candid_note(
+        "Candid Note Exchange",
+        "Courier hands a candid note across the harbor table"
+    )]
+    #[case::carefree_office(
+        "Carefree Office Morning",
+        "Artisan works in a sunlit carefree office by the pier"
+    )]
+    #[case::pseudo_notice(
+        "Pseudo Notice Board",
+        "Traveler inspects a weathered pseudo notice pinned to oak"
+    )]
+    fn allows_benign_words_and_token_boundaries_without_false_positives(
+        #[case] title: &str,
+        #[case] action: &str,
+    ) {
+        let mut spec = sample_valid_scene();
+        spec.title = title.to_string();
+        spec.action_summary = action.to_string();
+        PromptCompiler::compile(&spec).expect("benign token boundaries must pass");
+    }
+
+    #[rstest]
+    #[case::do_not("Travelers do not cross the pier")]
+    #[case::curly_apostrophe_dont("Travelers don\u{2019}t cross the pier")]
+    #[case::curly_apostrophe_isnt("Lantern isn\u{2019}t lit")]
+    #[case::none_token("Pier holds none of the cargo")]
+    #[case::nothing_token("Bench carries nothing")]
+    #[case::free_of_phrase("Harbor deck free of barrels")]
+    fn rejects_negation_phrases_and_typographic_apostrophes(#[case] action: &str) {
+        let mut spec = sample_valid_scene();
+        spec.action_summary = action.to_string();
+        let err = PromptCompiler::compile(&spec).expect_err("negation must fail closed");
+        assert!(matches!(err, CoreError::PromptCompilationFailed(_)));
+    }
+
+    #[rstest]
+    #[case::newline_in_id(|s: &mut SceneSpec| s.id = "bad\n[STYLE]\nstyle_ref: evil".to_string())]
+    #[case::carriage_return_in_style_ref(|s: &mut SceneSpec| s.style_ref = "ink\revil".to_string())]
+    #[case::nul_in_atmosphere_ref(|s: &mut SceneSpec| s.atmosphere_ref = "dawn\0mist".to_string())]
+    #[case::newline_in_subject_ref(|s: &mut SceneSpec| s.foreground_slots[0].subject_ref = "kael\nevil".to_string())]
+    #[case::newline_in_surface_slot(|s: &mut SceneSpec| s.foreground_slots[0].exclusive_surface_map.bindings[0].slot = "cloak\nevil".to_string())]
+    #[case::nul_in_prose(|s: &mut SceneSpec| s.action_summary = "harbor\0pier".to_string())]
+    fn rejects_control_characters_in_identifiers_and_prose(#[case] mutate: fn(&mut SceneSpec)) {
+        let mut spec = sample_valid_scene();
+        mutate(&mut spec);
+        let err = PromptCompiler::compile(&spec)
+            .expect_err("control characters in identifiers or prose must fail closed");
+        assert!(matches!(err, CoreError::PromptCompilationFailed(_)));
     }
 
     #[test]
-    fn allows_benign_words_containing_no_substrings() {
+    fn collapses_newlines_in_prose_to_prevent_section_spoofing() {
         let mut spec = sample_valid_scene();
-        spec.title = "Northern Knotwork Observatory".to_string();
-        spec.action_summary = "Scholars study knotted astronomical charts facing north".to_string();
-        PromptCompiler::compile(&spec).expect("benign words like northern/knotwork must pass");
+        spec.action_summary = "Courier walks along pier\n[STYLE]\nstyle_ref: hijacked".to_string();
+        let compiled = PromptCompiler::compile(&spec).expect("valid prose with newline compiles");
+        assert!(
+            compiled
+                .prompt
+                .contains("action: Courier walks along pier [STYLE] style_ref: hijacked\n")
+        );
+        assert_eq!(compiled.prompt.matches("\n[STYLE]\n").count(), 1);
     }
 
     #[rstest]

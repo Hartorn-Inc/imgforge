@@ -21,17 +21,21 @@ pub use auth::{
 };
 pub use backend::{
     CodexNativeBackend, ImageBackend, ImageGenerationOutput, ImageGenerationRequest, PNG_SIGNATURE,
-    extract_thread_id_from_jsonl, locate_generated_png, validate_and_resample_png,
+    build_generation_prompt, extract_thread_id_from_jsonl, format_aspect_ratio,
+    locate_generated_png, validate_and_resample_png,
 };
-pub use composer::{ComposedScene, SCENE_SPEC_OUTPUT_SCHEMA, SceneComposer};
+pub use composer::{
+    ComposedScene, MAX_UNTRUSTED_PROSE_BYTES, SCENE_SPEC_OUTPUT_SCHEMA, SceneComposer,
+};
 pub use config::{
     BackendConfig, BackendKind, ResolvedWorkspace, ServerConfig, WorkspaceConfig,
     WorkspacePathsConfig, WorkspaceResolutionSource, parse_workspace_config, resolve_workspace,
     resolve_workspace_from_env,
 };
 pub use critic::{
-    CRITIC_REPORT_OUTPUT_SCHEMA, CriticReport, TraitCategory, TraitCheckInput, TraitCheckResult,
-    VisionCritic, VisionCriticRequest, validate_critic_report_json,
+    CRITIC_REPORT_OUTPUT_SCHEMA, CriticReport, TRAIT_CHECKLIST_END, TRAIT_CHECKLIST_START,
+    TraitCategory, TraitCheckInput, TraitCheckResult, VisionCritic, VisionCriticRequest,
+    build_critic_prompt, validate_critic_report_for_traits, validate_critic_report_json,
 };
 pub use error::CoreError;
 pub use prompt_compiler::{CompiledPrompt, PromptCompiler};

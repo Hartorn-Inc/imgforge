@@ -106,30 +106,22 @@ fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
     let stub = create_stub_codex(root.path(), &fixture_png);
     fs::write(
         ws_dir.join("imgforge.toml"),
-        format!(
-            "schema_version = 1\nname = \"e2e-ws\"\n[backend]\ncodex_bin = \"{}\"\n",
-            stub.display()
-        ),
+        "schema_version = 1\nname = \"e2e-ws\"\n",
     )
     .unwrap();
 
     // 1. Missing auth fails closed on auth status
     let unauth_status = Command::new(bin_path())
-        .args(["--workspace", ws_dir.to_str().unwrap(), "auth", "status"])
+        .args(["--codex-bin", stub.to_str().unwrap(), "auth", "status"])
         .env("XDG_DATA_HOME", &xdg_dir)
         .output()
         .expect("run auth status");
     assert!(!unauth_status.status.success());
 
-    // 2. Login provisions tool-local auth.json
+    // 2. Login provisions tool-local auth.json via IMGFORGE_CODEX_BIN
     let login = Command::new(bin_path())
-        .args([
-            "--workspace",
-            ws_dir.to_str().unwrap(),
-            "auth",
-            "login",
-            "--device-auth",
-        ])
+        .args(["auth", "login", "--device-auth"])
+        .env("IMGFORGE_CODEX_BIN", &stub)
         .env("XDG_DATA_HOME", &xdg_dir)
         .output()
         .expect("run auth login");
@@ -161,6 +153,8 @@ fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
         .args([
             "--workspace",
             ws_dir.to_str().unwrap(),
+            "--codex-bin",
+            stub.to_str().unwrap(),
             "compose",
             "--prose",
             "Courier on stone pier with brass lantern",
@@ -179,7 +173,12 @@ fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
 
     // 5. Validate SceneSpec deterministically
     let validate = Command::new(bin_path())
-        .args(["validate", scene_yaml.to_str().unwrap()])
+        .args([
+            "--workspace",
+            ws_dir.to_str().unwrap(),
+            "validate",
+            scene_yaml.to_str().unwrap(),
+        ])
         .env("XDG_DATA_HOME", &xdg_dir)
         .output()
         .expect("run validate");
@@ -199,6 +198,7 @@ fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
             "-i",
             ref_png.to_str().unwrap(),
         ])
+        .env("IMGFORGE_CODEX_BIN", &stub)
         .env("XDG_DATA_HOME", &xdg_dir)
         .output()
         .expect("run generate");
@@ -215,6 +215,8 @@ fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
         .args([
             "--workspace",
             ws_dir.to_str().unwrap(),
+            "--codex-bin",
+            stub.to_str().unwrap(),
             "critic",
             "--image",
             out_png.to_str().unwrap(),
@@ -242,9 +244,67 @@ fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
     assert!(!xdg_dir.join("imgforge/codex/auth.json").exists());
 }
 
+#[test]
+fn untrusted_workspace_codex_bin_is_rejected_and_auth_ignores_workspace_toml() {
+    let root = TempDir::new().expect("tempdir");
+    let evil_ws = root.path().join("evil-ws");
+    let xdg_dir = root.path().join("xdg");
+    fs::create_dir_all(&evil_ws).unwrap();
+    fs::create_dir_all(&xdg_dir).unwrap();
+
+    let marker = root.path().join("pwned.txt");
+    let evil_bin = root.path().join("evil-codex");
+    fs::write(
+        &evil_bin,
+        format!("#!/usr/bin/env bash\ntouch \"{}\"\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&evil_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::write(
+        evil_ws.join("imgforge.toml"),
+        format!(
+            "schema_version = 1\n[backend]\ncodex_bin = \"{}\"\n",
+            evil_bin.display()
+        ),
+    )
+    .unwrap();
+
+    let status_err = Command::new(bin_path())
+        .args(["--workspace", evil_ws.to_str().unwrap(), "status"])
+        .env("XDG_DATA_HOME", &xdg_dir)
+        .output()
+        .expect("run status");
+    assert!(!status_err.status.success());
+
+    let fixture_png = root.path().join("gen.png");
+    write_png_file(&fixture_png, 512, 512);
+    let stub = create_stub_codex(root.path(), &fixture_png);
+
+    // Running `auth login` from inside evil_ws must ignore evil_ws/imgforge.toml and use IMGFORGE_CODEX_BIN
+    let auth_login = Command::new(bin_path())
+        .current_dir(&evil_ws)
+        .args(["auth", "login"])
+        .env("IMGFORGE_CODEX_BIN", &stub)
+        .env("XDG_DATA_HOME", &xdg_dir)
+        .output()
+        .expect("run auth login inside evil workspace");
+    assert!(
+        auth_login.status.success(),
+        "auth login stderr: {}",
+        String::from_utf8_lossy(&auth_login.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "untrusted workspace backend.codex_bin must never be executed"
+    );
+}
+
 #[rstest]
 #[case::unknown_subcommand(&["does-not-exist"])]
-#[case::invalid_explicit_workspace(&["--workspace", "/nonexistent/imgforge/ws", "status"])]
+#[case::invalid_explicit_workspace_status(&["--workspace", "/nonexistent/imgforge/ws", "status"])]
+#[case::invalid_explicit_workspace_validate(&["--workspace", "/nonexistent/imgforge/ws", "validate", "scene.yaml"])]
+#[case::empty_codex_bin_flag(&["--codex-bin", "   ", "auth", "logout"])]
 fn cli_invalid_invocations_fail_closed(#[case] args: &[&str]) {
     let output = Command::new(bin_path())
         .args(args)

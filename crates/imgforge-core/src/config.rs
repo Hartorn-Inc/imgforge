@@ -55,16 +55,26 @@ pub enum BackendKind {
     CodexNative,
 }
 
+impl BackendKind {
+    /// Canonical lowercase backend identifier matching `imgforge.toml` and `/api/health`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CodexNative => "codex-native",
+        }
+    }
+}
+
 /// Backend settings declared in `imgforge.toml`.
+///
+/// Executable paths (`--codex-bin` / `IMGFORGE_CODEX_BIN`) are intentionally excluded
+/// from `imgforge.toml` so untrusted workspace manifests can never hijack binary execution.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     /// Active backend kind (defaults to `codex-native`).
     #[serde(default)]
     pub kind: BackendKind,
-    /// Optional executable path or binary name overriding `codex` on `PATH`.
-    #[serde(default)]
-    pub codex_bin: Option<String>,
 }
 
 /// Workspace-relative directory layout declared in `imgforge.toml`.
@@ -204,15 +214,6 @@ pub fn parse_workspace_config(
         });
     }
 
-    if let Some(ref bin) = config.backend.codex_bin
-        && bin.trim().is_empty()
-    {
-        return Err(CoreError::ConfigInvalid {
-            path: config_path.to_path_buf(),
-            reason: "backend.codex_bin must not be empty when specified".to_string(),
-        });
-    }
-
     validate_relative_workspace_path("paths.library_dir", &config.paths.library_dir, config_path)?;
     validate_relative_workspace_path("paths.runs_dir", &config.paths.runs_dir, config_path)?;
     validate_relative_workspace_path("paths.exports_dir", &config.paths.exports_dir, config_path)?;
@@ -341,7 +342,12 @@ mod tests {
     #[case::parent_dir_escape_in_paths("schema_version = 1\n[paths]\nruns_dir = \"../outside\"\n")]
     #[case::absolute_path_in_paths("schema_version = 1\n[paths]\nlibrary_dir = \"/tmp/lib\"\n")]
     #[case::zero_port("schema_version = 1\n[server]\nport = 0\n")]
-    #[case::empty_codex_bin("schema_version = 1\n[backend]\ncodex_bin = \"   \"\n")]
+    #[case::untrusted_codex_bin_rejected(
+        "schema_version = 1\n[backend]\ncodex_bin = \"/tmp/evil-codex\"\n"
+    )]
+    #[case::untrusted_empty_codex_bin_rejected(
+        "schema_version = 1\n[backend]\ncodex_bin = \"   \"\n"
+    )]
     fn rejects_invalid_imgforge_toml(#[case] raw_toml: &str) {
         let err = parse_workspace_config(raw_toml, Path::new("imgforge.toml"))
             .expect_err("invalid config must fail closed");

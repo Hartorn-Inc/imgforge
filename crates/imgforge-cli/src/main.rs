@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     workspace: Option<PathBuf>,
 
+    /// Override path or executable name for `codex` (also via IMGFORGE_CODEX_BIN).
+    #[arg(long, global = true, value_name = "PATH")]
+    codex_bin: Option<String>,
+
     /// Subcommand to execute.
     #[command(subcommand)]
     command: Commands,
@@ -183,24 +187,25 @@ fn resolve_optional_workspace(
     }
 }
 
-fn resolve_codex_bin(ws: Option<&ResolvedWorkspace>) -> String {
-    ws.and_then(|w| w.config.backend.codex_bin.clone())
-        .unwrap_or_else(|| DEFAULT_CODEX_BIN.to_string())
+fn resolve_codex_bin(explicit_flag: Option<&str>, env_val: Option<&str>) -> anyhow::Result<String> {
+    if let Some(flag) = explicit_flag {
+        if flag.trim().is_empty() {
+            bail!("--codex-bin must not be empty");
+        }
+        return Ok(flag.to_string());
+    }
+    if let Some(env_raw) = env_val
+        && !env_raw.trim().is_empty()
+    {
+        return Ok(env_raw.to_string());
+    }
+    Ok(DEFAULT_CODEX_BIN.to_string())
 }
 
 fn parse_trait_arg(index: usize, raw: &str) -> anyhow::Result<TraitCheckInput> {
     let parts: Vec<&str> = raw.splitn(3, ':').collect();
     if parts.len() == 3 {
-        let category = match parts[1].trim() {
-            "identity" => TraitCategory::Identity,
-            "hand_props" => TraitCategory::HandProps,
-            "weapon_geometry" => TraitCategory::WeaponGeometry,
-            "style_adherence" => TraitCategory::StyleAdherence,
-            "zero_leaked_text" => TraitCategory::ZeroLeakedText,
-            other => bail!(
-                "unknown trait category '{other}' (expected identity, hand_props, weapon_geometry, style_adherence, or zero_leaked_text)"
-            ),
-        };
+        let category = parts[1].parse::<TraitCategory>()?;
         Ok(TraitCheckInput {
             trait_id: parts[0].trim().to_string(),
             category,
@@ -226,11 +231,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let auth_dir = resolve_codex_auth_dir_from_env()?;
+    let env_codex_bin = std::env::var("IMGFORGE_CODEX_BIN").ok();
+    let codex_bin = resolve_codex_bin(cli.codex_bin.as_deref(), env_codex_bin.as_deref())?;
 
     match cli.command {
         Commands::Auth(args) => {
-            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
-            let codex_bin = resolve_codex_bin(ws.as_ref());
+            // `imgforge auth` intentionally never reads workspace `imgforge.toml`.
             let manager = AuthManager::new(auth_dir, codex_bin);
 
             match args.action {
@@ -264,8 +270,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Compose(args) => {
-            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
-            let codex_bin = resolve_codex_bin(ws.as_ref());
+            let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
 
             let prose = match (args.prose, args.prose_file) {
                 (Some(inline), None) => inline,
@@ -291,6 +296,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Validate(args) => {
+            let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+
             let spec = SceneSpec::load_from_path(&args.scene_spec)?;
             let compiled = PromptCompiler::compile(&spec)?;
             println!(
@@ -304,8 +311,7 @@ async fn main() -> anyhow::Result<()> {
             println!("\n{}", compiled.prompt);
         }
         Commands::Generate(args) => {
-            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
-            let codex_bin = resolve_codex_bin(ws.as_ref());
+            let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
 
             let spec = SceneSpec::load_from_path(&args.scene)?;
             let compiled = PromptCompiler::compile(&spec)?;
@@ -342,8 +348,7 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         Commands::Critic(args) => {
-            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
-            let codex_bin = resolve_codex_bin(ws.as_ref());
+            let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
 
             let mut traits = Vec::with_capacity(args.traits.len());
             for (idx, raw) in args.traits.iter().enumerate() {
@@ -374,7 +379,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status(args) => {
             let ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
-            let auth_manager = AuthManager::new(auth_dir.clone(), resolve_codex_bin(Some(&ws)));
+            let auth_manager = AuthManager::new(auth_dir.clone(), codex_bin);
             let summary = WorkspaceStatusSummary {
                 workspace_root: ws.root,
                 config_path: ws.config_path,
@@ -394,6 +399,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("config_path: {}", summary.config_path.display());
                 println!("resolution_source: {:?}", summary.resolution_source);
                 println!("schema_version: {}", summary.schema_version);
+                println!("backend: {}", summary.backend.as_str());
                 println!("auth_dir: {}", summary.auth_dir.display());
                 println!("auth_provisioned: {}", summary.auth_provisioned);
                 println!("server_port: {}", summary.server_port);
@@ -402,4 +408,29 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::cli_flag_overrides_env(Some("/cli/codex"), Some("/env/codex"), Some("/cli/codex"))]
+    #[case::env_overrides_default(None, Some("/env/codex"), Some("/env/codex"))]
+    #[case::empty_env_falls_back_to_default(None, Some("   "), Some(DEFAULT_CODEX_BIN))]
+    #[case::unset_falls_back_to_default(None, None, Some(DEFAULT_CODEX_BIN))]
+    #[case::empty_cli_flag_fails_closed(Some("  "), Some("/env/codex"), None)]
+    fn resolves_codex_bin_in_strict_order(
+        #[case] flag: Option<&str>,
+        #[case] env_val: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let res = resolve_codex_bin(flag, env_val);
+        match expected {
+            Some(exp) => assert_eq!(res.expect("should resolve"), exp),
+            None => assert!(res.is_err()),
+        }
+    }
 }

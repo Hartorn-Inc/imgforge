@@ -516,6 +516,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "image",
+ "libc",
  "rstest",
  "serde",
  "serde_json",
