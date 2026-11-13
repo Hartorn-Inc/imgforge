@@ -893,13 +893,13 @@ pub fn compile_pack_sheet_prompt(
         "layout_instruction: {}",
         match role {
             ReferenceSheetRole::Turnaround => {
-                "full-body orthogonal turnaround showing front view, three-quarter view, side profile, and back view arranged side by side with consistent proportions"
+                "5 distinct full-body orthogonal views arranged left-to-right on a single horizontal ground baseline: front view, three-quarter front view, left side profile, right side profile, and back view, separated by wide uniform #252830 vertical gaps (>= 48px clear studio background between every silhouette) with zero overlapping limbs; consistent proportions, base attire and natural posture only with empty open hands and zero held weapons, scabbards, shields, or accessories"
             }
             ReferenceSheetRole::PosesExpressions => {
-                "anchored character study matching the turnaround reference with three distinct dynamic action poses and four clear facial expression portraits spaced evenly on #252830"
+                "anchored character study matching the turnaround reference using a strict two-row grid layout cleanly separated by a wide horizontal #252830 band (>= 48px tall) so poses and facial expressions slice into separate components: upper half row shows 4 distinct full-body dynamic poses side by side with wide #252830 gaps (>= 48px) and zero overlapping silhouettes, wearing base attire only with empty open hands and zero held weapons, tools, or accessories; lower half row cleanly above the 72px bottom margin shows 4 to 5 isolated close-up head-and-shoulders facial expression portraits arranged in one horizontal row with wide #252830 gaps (>= 48px) between every portrait"
             }
             ReferenceSheetRole::InventoryFlatlay => {
-                "anchored equipment flatlay matching the turnaround reference displaying isolated held props, tools, garments, and gear arranged cleanly with generous #252830 spacing"
+                "anchored equipment flatlay matching the turnaround reference displaying an isolated knolling/flatlay of held weapons, tools, garments, and gear arranged cleanly in spaced rows and columns with generous #252830 margins (>= 32px clear background between items) so each item slices independently"
             }
             ReferenceSheetRole::SingleSheet => {
                 "multi-angle canonical reference sheet displaying primary three-quarter view, side elevation, and close surface detail cleanly separated on #252830"
@@ -921,12 +921,22 @@ pub fn compile_pack_sheet_prompt(
             subject.asymmetric_markers.join("; ")
         );
     }
-    if !subject.positive_weapon_geometry.is_empty() {
-        let _ = writeln!(
-            out,
-            "positive_weapon_geometry: {}",
-            subject.positive_weapon_geometry.join("; ")
-        );
+    match role {
+        ReferenceSheetRole::Turnaround | ReferenceSheetRole::PosesExpressions => {
+            let _ = writeln!(
+                out,
+                "pose_equipment_rule: empty open hands, base attire only, zero held weapons or accessories"
+            );
+        }
+        ReferenceSheetRole::InventoryFlatlay | ReferenceSheetRole::SingleSheet => {
+            if !subject.positive_weapon_geometry.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "positive_weapon_geometry: {}",
+                    subject.positive_weapon_geometry.join("; ")
+                );
+            }
+        }
     }
     let surfaces: Vec<String> = subject
         .exclusive_surface_map
@@ -1511,5 +1521,152 @@ visibility: public
         )
         .expect_err("canonical pack cannot be resliced");
         assert!(matches!(err, CoreError::CanonicalImmutable { .. }));
+    }
+
+    fn sample_prompt_subject(include_weapon_geometry: bool) -> Subject {
+        let weapon_block = if include_weapon_geometry {
+            "positive_weapon_geometry:\n  - curved brass astrolabe arm with engraved degree ring\n"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            r##"
+schema_version: 1
+kind: character
+slug: courier-ren
+display_name: Courier Ren
+height_m: 1.74
+asymmetric_markers:
+  - brass compass clipped to left lapel
+exclusive_surface_map:
+  bindings:
+    - slot: coat
+      material: waxed canvas
+      color_hex: "#2c3e50"
+{weapon_block}palette_lock:
+  swatches:
+    - name: coat_slate
+      color_hex: "#2c3e50"
+      surface_slot: coat
+visibility: public
+"##
+        );
+        Subject::from_yaml_str(&yaml).expect("valid prompt Subject")
+    }
+
+    fn sample_prompt_style() -> Style {
+        Style::from_yaml_str(
+            r#"
+schema_version: 1
+slug: franco-belgian-line
+display_name: Franco-Belgian Clear Line
+medium: technical ink outlines with flat gouache color fills
+linework: uniform crisp dark ink contour lines with steady pen weight
+shading_and_texture: clean two-tone cel shadows and smooth matte fills
+palette_profile: balanced mid-saturation hues with clear local color separation
+framing_and_border: clean full-frame composition with crisp subject silhouette separation
+style_guardrails:
+  - maintain uniform contour line thickness across foreground and background
+exemplars:
+  - exemplars/ex1.png
+"#,
+        )
+        .expect("valid prompt Style")
+    }
+
+    #[rstest]
+    #[case::turnaround_five_views_empty_hands_no_weapons(
+        ReferenceSheetRole::Turnaround,
+        &[
+            "5 distinct full-body orthogonal views",
+            "front view",
+            "three-quarter front view",
+            "left side profile",
+            "right side profile",
+            "back view",
+            ">= 48px",
+            "zero overlapping limbs",
+            "empty open hands",
+            "zero held weapons, scabbards, shields, or accessories",
+            "pose_equipment_rule: empty open hands, base attire only, zero held weapons or accessories",
+        ],
+        false,
+    )]
+    #[case::poses_expressions_two_row_grid_empty_hands_no_weapons(
+        ReferenceSheetRole::PosesExpressions,
+        &[
+            "strict two-row grid layout",
+            ">= 48px tall",
+            "upper half row shows 4 distinct full-body dynamic poses",
+            ">= 48px",
+            "zero overlapping silhouettes",
+            "empty open hands",
+            "zero held weapons, tools, or accessories",
+            "lower half row cleanly above the 72px bottom margin",
+            "4 to 5 isolated close-up head-and-shoulders facial expression portraits",
+            "pose_equipment_rule: empty open hands, base attire only, zero held weapons or accessories",
+        ],
+        false,
+    )]
+    #[case::inventory_flatlay_knolling_with_weapon_geometry(
+        ReferenceSheetRole::InventoryFlatlay,
+        &[
+            "knolling/flatlay",
+            "spaced rows and columns",
+            ">= 32px",
+            "positive_weapon_geometry: curved brass astrolabe arm with engraved degree ring",
+        ],
+        true,
+    )]
+    #[case::single_sheet_with_weapon_geometry(
+        ReferenceSheetRole::SingleSheet,
+        &[
+            "multi-angle canonical reference sheet",
+            "positive_weapon_geometry: curved brass astrolabe arm with engraved degree ring",
+        ],
+        true,
+    )]
+    fn compile_pack_sheet_prompt_enforces_role_layout_and_weapon_scoping(
+        #[case] role: ReferenceSheetRole,
+        #[case] expected_fragments: &[&str],
+        #[case] expect_weapon_geometry: bool,
+    ) {
+        let subject = sample_prompt_subject(true);
+        let style = sample_prompt_style();
+        let prompt = compile_pack_sheet_prompt(&subject, &style, role);
+
+        for fragment in expected_fragments {
+            assert!(
+                prompt.contains(fragment),
+                "role {role:?} prompt missing '{fragment}':\n{prompt}"
+            );
+        }
+
+        if expect_weapon_geometry {
+            assert!(
+                !prompt.contains("pose_equipment_rule:"),
+                "role {role:?} should not emit pose_equipment_rule:\n{prompt}"
+            );
+        } else {
+            assert!(
+                !prompt.contains("positive_weapon_geometry"),
+                "role {role:?} must omit positive_weapon_geometry:\n{prompt}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::inventory_flatlay_empty_weapon_geometry(ReferenceSheetRole::InventoryFlatlay)]
+    #[case::single_sheet_empty_weapon_geometry(ReferenceSheetRole::SingleSheet)]
+    fn compile_pack_sheet_prompt_omits_empty_positive_weapon_geometry(
+        #[case] role: ReferenceSheetRole,
+    ) {
+        let subject = sample_prompt_subject(false);
+        let style = sample_prompt_style();
+        let prompt = compile_pack_sheet_prompt(&subject, &style, role);
+        assert!(
+            !prompt.contains("positive_weapon_geometry"),
+            "role {role:?} should omit positive_weapon_geometry when list is empty:\n{prompt}"
+        );
     }
 }
