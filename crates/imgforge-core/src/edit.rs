@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::atmosphere::ExposureFloor;
-use crate::backend::{ImageBackend, ImageGenerationRequest, PNG_SIGNATURE};
+use crate::backend::{ImageBackend, ImageGenerationRequest};
 use crate::calibration::STUDIO_BG_RGBA;
 use crate::color_qa::{
     ColorQaEngine, ColorQaReport, ExposureQaConfig, PaletteQaConfig, SparkleConfig, SubjectRoiSpec,
@@ -51,11 +51,11 @@ use crate::color_qa::{
 };
 use crate::error::CoreError;
 use crate::lifecycle::sha256_hex;
-use crate::scene_spec::Visibility;
+use crate::scene_spec::{Visibility, check_visibility_compatibility};
 use crate::slicer::PixelRect;
 use crate::store::{
-    RecordRunParams, RecordedRun, RunBackendMetadata, RunQaReports, RunStore,
-    read_regular_file_nofollow,
+    RecordRunParams, RecordedRun, RunBackendMetadata, RunQaReports, RunStore, checked_pixel_count,
+    decode_png_checked, read_regular_file_nofollow,
 };
 use crate::subject::PaletteLock;
 
@@ -84,6 +84,8 @@ pub const DEFAULT_PYRAMID_LEVELS: usize = 5;
 pub struct OwnedSubjectRoi {
     /// `Subject` slug for reporting.
     pub subject_slug: String,
+    /// Access classification (`Visibility`) of the referenced `Subject`.
+    pub visibility: Visibility,
     /// Bound `PaletteLock` swatches.
     pub palette_lock: PaletteLock,
     /// Target ROIs inside the canvas (empty evaluates the full image).
@@ -139,6 +141,15 @@ pub async fn execute_whole_image_edit(
     run_store: &RunStore,
     request: &WholeImageEditRequest,
 ) -> Result<WholeImageEditResult, CoreError> {
+    check_visibility_compatibility(
+        request.visibility,
+        "WholeImageEdit",
+        request
+            .subject_rois
+            .iter()
+            .map(|s| (s.subject_slug.as_str(), s.visibility)),
+    )?;
+
     if request.compiled_prompt.trim().is_empty() {
         return Err(CoreError::EditFailed(
             "WholeImageEdit compiled_prompt must not be empty".to_string(),
@@ -426,7 +437,8 @@ pub async fn execute_patch_edit(
 
     let crop_w = crop_rect.width as usize;
     let crop_h = crop_rect.height as usize;
-    let mut crop_mask = vec![0.0f32; crop_w * crop_h];
+    let crop_total = checked_pixel_count(crop_rect.width, crop_rect.height, "PatchEdit crop")?;
+    let mut crop_mask = vec![0.0f32; crop_total];
     for ly in 0..crop_h {
         let gy = crop_rect.y as usize + ly;
         for lx in 0..crop_w {
@@ -567,7 +579,7 @@ pub fn composite_calibrated_patch(
             crop_rect.height
         )));
     }
-    let crop_len = (crop_rect.width as usize) * (crop_rect.height as usize);
+    let crop_len = checked_pixel_count(crop_rect.width, crop_rect.height, "PatchEdit crop")?;
     if crop_mask.len() != crop_len {
         return Err(CoreError::EditFailed(format!(
             "crop_mask length {} does not match crop pixel count {crop_len}",
@@ -622,7 +634,8 @@ pub fn composite_calibrated_patch(
 
     // 5. Composite strictly where feathered_alpha > 0.0 so outer pixels remain bit-for-bit identical.
     let mut output = target_img.clone();
-    let mut full_footprint_mask = vec![0.0f32; (canvas_w as usize) * (canvas_h as usize)];
+    let canvas_total = checked_pixel_count(canvas_w, canvas_h, "PatchEdit canvas")?;
+    let mut full_footprint_mask = vec![0.0f32; canvas_total];
     for ly in 0..h {
         let gy = crop_rect.y + ly as u32;
         for lx in 0..w {
@@ -665,7 +678,9 @@ pub fn apply_collar_reinhard_oklab(
 ) -> Result<(RgbaImage, ReinhardGainSummary), CoreError> {
     let w = orig_crop.width() as usize;
     let h = orig_crop.height() as usize;
-    let total = w * h;
+    let total = w
+        .checked_mul(h)
+        .ok_or_else(|| CoreError::EditFailed("collar pixel count overflow".to_string()))?;
     if gen_patch.width() as usize != w
         || gen_patch.height() as usize != h
         || crop_mask.len() != total
@@ -789,8 +804,16 @@ fn trimmed_mean_std(values: &mut [f32], trim_ratio: f32) -> (f32, f32) {
 #[must_use]
 pub fn euclidean_distance_transform(mask: &[bool], w: usize, h: usize) -> Vec<f32> {
     const INF: f32 = 1e20;
-    let mut grid = vec![INF; w * h];
-    for i in 0..(w * h) {
+    let total = w
+        .checked_mul(h)
+        .expect("euclidean_distance_transform pixel count overflow");
+    assert_eq!(
+        mask.len(),
+        total,
+        "euclidean_distance_transform mask length mismatch"
+    );
+    let mut grid = vec![INF; total];
+    for i in 0..total {
         if mask[i] {
             grid[i] = 0.0;
         }
@@ -889,7 +912,10 @@ fn build_cosine_feathered_alpha(
     feather_px: u32,
 ) -> Vec<f32> {
     let feather = feather_px as f32;
-    let mut alpha = vec![0.0f32; w * h];
+    let total = w
+        .checked_mul(h)
+        .expect("build_cosine_feathered_alpha pixel count overflow");
+    let mut alpha = vec![0.0f32; total];
 
     let touches_left = crop_rect.x == 0;
     let touches_top = crop_rect.y == 0;
@@ -1059,27 +1085,12 @@ pub fn laplacian_pyramid_blend(
 
 // === 4. Helper Utilities ===
 
-fn decode_png_checked(path: &Path, bytes: &[u8]) -> Result<DynamicImage, CoreError> {
-    if bytes.len() < PNG_SIGNATURE.len() || bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
-        return Err(CoreError::InvalidPng {
-            path: path.to_path_buf(),
-            reason: "missing valid 8-byte PNG signature".to_string(),
-        });
-    }
-    image::load_from_memory_with_format(bytes, ImageFormat::Png).map_err(|err| {
-        CoreError::InvalidPng {
-            path: path.to_path_buf(),
-            reason: format!("PNG decode failed: {err}"),
-        }
-    })
-}
-
 fn resolve_unified_mask(
     target_mask: &PatchTargetMask,
     canvas_w: u32,
     canvas_h: u32,
 ) -> Result<(Vec<f32>, PixelRect), CoreError> {
-    let total = (canvas_w as usize) * (canvas_h as usize);
+    let total = checked_pixel_count(canvas_w, canvas_h, "PatchEdit canvas")?;
     let mut mask = vec![0.0f32; total];
 
     match target_mask {
@@ -1314,7 +1325,10 @@ fn oklab_f32_to_srgb_u8(oklab: Oklab<f32>) -> [u8; 3] {
 fn rgba_to_linear_buffer(img: &RgbaImage) -> LinearBuffer {
     let w = img.width() as usize;
     let h = img.height() as usize;
-    let mut pixels = Vec::with_capacity(w * h);
+    let total = w
+        .checked_mul(h)
+        .expect("linear buffer pixel count overflow");
+    let mut pixels = Vec::with_capacity(total);
     for px in img.pixels() {
         let srgb = Srgb::new(
             f32::from(px.0[0]) / 255.0,
@@ -1355,7 +1369,10 @@ const GAUSS_5_KERNEL: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0
 fn gaussian_5x5_rgb(buf: &LinearBuffer) -> LinearBuffer {
     let w = buf.width;
     let h = buf.height;
-    let mut horiz = vec![[0.0f32; 3]; w * h];
+    let total = w
+        .checked_mul(h)
+        .expect("gaussian_5x5_rgb pixel count overflow");
+    let mut horiz = vec![[0.0f32; 3]; total];
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0.0f32; 3];
@@ -1369,7 +1386,7 @@ fn gaussian_5x5_rgb(buf: &LinearBuffer) -> LinearBuffer {
             horiz[y * w + x] = acc;
         }
     }
-    let mut pixels = vec![[0.0f32; 3]; w * h];
+    let mut pixels = vec![[0.0f32; 3]; total];
     for y in 0..h {
         for x in 0..w {
             let mut acc = [0.0f32; 3];
@@ -1393,7 +1410,10 @@ fn gaussian_5x5_rgb(buf: &LinearBuffer) -> LinearBuffer {
 fn downsample_half_rgb(buf: &LinearBuffer) -> LinearBuffer {
     let nw = buf.width.div_ceil(2).max(1);
     let nh = buf.height.div_ceil(2).max(1);
-    let mut pixels = Vec::with_capacity(nw * nh);
+    let total = nw
+        .checked_mul(nh)
+        .expect("downsample_half_rgb pixel count overflow");
+    let mut pixels = Vec::with_capacity(total);
     for y in 0..nh {
         let sy = (y * 2).min(buf.height - 1);
         for x in 0..nw {
@@ -1409,7 +1429,10 @@ fn downsample_half_rgb(buf: &LinearBuffer) -> LinearBuffer {
 }
 
 fn upsample_double_rgb(buf: &LinearBuffer, target_w: usize, target_h: usize) -> LinearBuffer {
-    let mut pixels = Vec::with_capacity(target_w * target_h);
+    let total = target_w
+        .checked_mul(target_h)
+        .expect("upsample_double_rgb pixel count overflow");
+    let mut pixels = Vec::with_capacity(total);
     for y in 0..target_h {
         let fy = (y as f32) * 0.5;
         let y0 = (fy.floor() as usize).min(buf.height - 1);
@@ -1443,7 +1466,10 @@ fn upsample_double_rgb(buf: &LinearBuffer, target_w: usize, target_h: usize) -> 
 }
 
 fn gaussian_5x5_scalar(data: &[f32], w: usize, h: usize) -> Vec<f32> {
-    let mut horiz = vec![0.0f32; w * h];
+    let total = w
+        .checked_mul(h)
+        .expect("gaussian_5x5_scalar pixel count overflow");
+    let mut horiz = vec![0.0f32; total];
     for y in 0..h {
         for x in 0..w {
             let mut acc = 0.0f32;
@@ -1454,7 +1480,7 @@ fn gaussian_5x5_scalar(data: &[f32], w: usize, h: usize) -> Vec<f32> {
             horiz[y * w + x] = acc;
         }
     }
-    let mut out = vec![0.0f32; w * h];
+    let mut out = vec![0.0f32; total];
     for y in 0..h {
         for x in 0..w {
             let mut acc = 0.0f32;
@@ -1471,7 +1497,10 @@ fn gaussian_5x5_scalar(data: &[f32], w: usize, h: usize) -> Vec<f32> {
 fn downsample_half_scalar(data: &[f32], w: usize, h: usize) -> (usize, usize, Vec<f32>) {
     let nw = w.div_ceil(2).max(1);
     let nh = h.div_ceil(2).max(1);
-    let mut out = Vec::with_capacity(nw * nh);
+    let total = nw
+        .checked_mul(nh)
+        .expect("downsample_half_scalar pixel count overflow");
+    let mut out = Vec::with_capacity(total);
     for y in 0..nh {
         let sy = (y * 2).min(h - 1);
         for x in 0..nw {
@@ -1759,6 +1788,7 @@ mod tests {
                 )),
                 subject_rois: vec![OwnedSubjectRoi {
                     subject_slug: "stone-wall".to_string(),
+                    visibility: Visibility::Public,
                     palette_lock: PaletteLock {
                         swatches: vec![PaletteSwatch {
                             name: "stone".to_string(),
@@ -1787,6 +1817,87 @@ mod tests {
             assert!(matches!(res.unwrap_err(), CoreError::ColorQaFailed(_)));
             // Draft run is still preserved for inspection.
             assert_eq!(run_store.list_runs("harbor-whole").unwrap().len(), 1);
+        }
+    }
+
+    #[rstest]
+    #[case::public_edit_blocks_restricted_subject(
+        Visibility::Public,
+        Visibility::Restricted,
+        false
+    )]
+    #[case::public_edit_blocks_internal_subject(Visibility::Public, Visibility::Internal, false)]
+    #[case::restricted_edit_blocks_internal_subject(
+        Visibility::Restricted,
+        Visibility::Internal,
+        false
+    )]
+    #[case::restricted_edit_allows_restricted_subject(
+        Visibility::Restricted,
+        Visibility::Restricted,
+        true
+    )]
+    #[case::internal_edit_allows_internal_subject(Visibility::Internal, Visibility::Internal, true)]
+    #[tokio::test]
+    async fn whole_image_edit_enforces_subject_visibility_fail_closed(
+        #[case] request_vis: Visibility,
+        #[case] subject_vis: Visibility,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let run_store = RunStore::new(root.path().join("runs"));
+        let target_path = root.path().join("scene.png");
+        let target_img: RgbaImage = ImageBuffer::from_pixel(32, 32, Rgba([150, 155, 160, 255]));
+        write_test_png(&target_path, &target_img);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = StubEditBackend {
+            response_fill: [150, 155, 160],
+            seen_requests: Arc::clone(&seen),
+        };
+
+        let res = execute_whole_image_edit(
+            &backend,
+            &run_store,
+            &WholeImageEditRequest {
+                slug: "vis-check".to_string(),
+                visibility: request_vis,
+                target_image_path: target_path,
+                compiled_prompt: "preserve crisp daylight exposure".to_string(),
+                reference_images: Vec::new(),
+                exposure_floor: None,
+                subject_rois: vec![OwnedSubjectRoi {
+                    subject_slug: "spoiler-subject".to_string(),
+                    visibility: subject_vis,
+                    palette_lock: PaletteLock {
+                        swatches: vec![PaletteSwatch {
+                            name: "stone".to_string(),
+                            color_hex: "#969BA0".to_string(),
+                            surface_slot: None,
+                        }],
+                    },
+                    rois: Vec::new(),
+                }],
+                palette_config: PaletteQaConfig::default(),
+                edit_mask: None,
+                untouched_drift_config: UntouchedDriftConfig::default(),
+                allowed_sparkle_mask: None,
+                sparkle_config: SparkleConfig::default(),
+                fail_closed_on_qa: true,
+            },
+        )
+        .await;
+
+        assert_eq!(res.is_ok(), expect_ok);
+        if !expect_ok {
+            assert!(matches!(
+                res.unwrap_err(),
+                CoreError::VisibilityViolation { .. }
+            ));
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "backend must not be invoked when Visibility fails"
+            );
         }
     }
 }

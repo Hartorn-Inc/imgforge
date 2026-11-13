@@ -24,11 +24,12 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write as _};
+use std::io::{Cursor, Read, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
+use image::{DynamicImage, ImageFormat, ImageReader, Limits};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
@@ -44,6 +45,21 @@ pub const SUPPORTED_STORE_SCHEMA_VERSION: u32 = 1;
 
 /// Canonical filename for the workspace canonical lockfile under `library/`.
 pub const MANIFEST_LOCK_FILENAME: &str = "manifest.lock.json";
+
+/// Maximum file size permitted by `read_regular_file_nofollow` (`128 MiB`).
+pub const MAX_REGULAR_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum `.cube` 3D LUT file size permitted during `Export` (`16 MiB`).
+pub const MAX_CUBE_LUT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum permitted raster dimension per axis (`16_384 px`).
+pub const MAX_IMAGE_DIM: u32 = 16_384;
+
+/// Maximum permitted decoded raster pixel count (`67_108_864` pixels = `8192 x 8192`).
+pub const MAX_IMAGE_TOTAL_PIXELS: u64 = 67_108_864;
+
+/// Maximum memory allocation allowed inside `image::Limits` during PNG decoding (`512 MiB`).
+pub const MAX_IMAGE_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Backend execution snapshot captured inside `vNNN.meta.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +401,77 @@ impl RunStore {
         self.runs_dir
             .join(slug)
             .join(format!("{}.meta.json", Self::format_version_label(version)))
+    }
+
+    /// Inspect whether `input_path` resolves inside `self.runs_dir` with a sibling
+    /// `vNNN.meta.json` and, if so, return that `RunMetadata.visibility` fail-closed.
+    pub fn inspect_run_image_visibility(
+        &self,
+        input_path: &Path,
+    ) -> Result<Option<Visibility>, CoreError> {
+        let canon_runs = match fs::canonicalize(&self.runs_dir) {
+            Ok(p) => p,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!("canonicalizing runs_dir {}", self.runs_dir.display()),
+                    source: err,
+                });
+            }
+        };
+        let canon_input = match fs::canonicalize(input_path) {
+            Ok(p) => p,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!("canonicalizing input path {}", input_path.display()),
+                    source: err,
+                });
+            }
+        };
+        if !canon_input.starts_with(&canon_runs) {
+            return Ok(None);
+        }
+        let Some(file_name) = canon_input.file_name().and_then(|s| s.to_str()) else {
+            return Ok(None);
+        };
+        if !file_name.to_ascii_lowercase().ends_with(".png")
+            || parse_version_from_filename(file_name).is_none()
+        {
+            return Ok(None);
+        }
+        let Some(stem) = canon_input.file_stem().and_then(|s| s.to_str()) else {
+            return Ok(None);
+        };
+        let meta_path = canon_input.with_file_name(format!("{stem}.meta.json"));
+        match fs::symlink_metadata(&meta_path) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CoreError::Io {
+                    context: format!("inspecting sibling Run metadata {}", meta_path.display()),
+                    source: err,
+                });
+            }
+        }
+        let bytes = read_regular_file_nofollow(&meta_path, "Run metadata")?;
+        let meta: RunMetadata = serde_json::from_slice(&bytes).map_err(|err| CoreError::Io {
+            context: format!("parsing Run metadata {}", meta_path.display()),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+        })?;
+        if meta.schema_version != SUPPORTED_STORE_SCHEMA_VERSION {
+            return Err(CoreError::Io {
+                context: format!("validating Run metadata {}", meta_path.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported RunMetadata schema_version {}",
+                        meta.schema_version
+                    ),
+                ),
+            });
+        }
+        Ok(Some(meta.visibility))
     }
 
     fn persist_metadata(&self, meta: &RunMetadata) -> Result<(), CoreError> {
@@ -847,14 +934,19 @@ pub(crate) fn relative_workspace_key(
 }
 
 /// Write `bytes` to `dest` atomically via a sibling temporary file + fsync + rename.
-pub(crate) fn write_atomic(dest: &Path, bytes: &[u8], label: &str) -> Result<(), CoreError> {
-    let parent = dest.parent().ok_or_else(|| CoreError::Io {
+pub fn write_atomic(dest: &Path, bytes: &[u8], label: &str) -> Result<(), CoreError> {
+    let raw_parent = dest.parent().ok_or_else(|| CoreError::Io {
         context: format!(
             "resolving parent directory for {label} at {}",
             dest.display()
         ),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory"),
     })?;
+    let parent = if raw_parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        raw_parent
+    };
     fs::create_dir_all(parent).map_err(|err| CoreError::Io {
         context: format!("creating directory {} for {label}", parent.display()),
         source: err,
@@ -1128,10 +1220,119 @@ pub(crate) fn verify_optional_contained_dir_no_symlinks(
     }
 }
 
-/// Read a regular non-symlink file using `O_NOFOLLOW` on Unix to prevent symlink races.
+/// Compute `width * height` safely using checked arithmetic and enforce `MAX_IMAGE_DIM` and
+/// `MAX_IMAGE_TOTAL_PIXELS` bounds fail-closed.
+pub(crate) fn checked_pixel_count(
+    width: u32,
+    height: u32,
+    context: &str,
+) -> Result<usize, CoreError> {
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIM || height > MAX_IMAGE_DIM {
+        return Err(CoreError::EditFailed(format!(
+            "{context} dimensions {width}x{height} out of bounds 1..={MAX_IMAGE_DIM}"
+        )));
+    }
+    let total_u64 = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| {
+            CoreError::EditFailed(format!(
+                "{context} pixel count overflow for {width}x{height}"
+            ))
+        })?;
+    if total_u64 > MAX_IMAGE_TOTAL_PIXELS {
+        return Err(CoreError::EditFailed(format!(
+            "{context} total pixel count {total_u64} ({width}x{height}) exceeds limit {MAX_IMAGE_TOTAL_PIXELS}"
+        )));
+    }
+    usize::try_from(total_u64).map_err(|_| {
+        CoreError::EditFailed(format!(
+            "{context} pixel count {total_u64} exceeds addressable usize range"
+        ))
+    })
+}
+
+/// Decode PNG bytes fail-closed with explicit `image::Limits` and total-pixel bounds.
+pub(crate) fn decode_png_checked(path: &Path, bytes: &[u8]) -> Result<DynamicImage, CoreError> {
+    decode_png_checked_with_limits(
+        path,
+        bytes,
+        MAX_IMAGE_DIM,
+        MAX_IMAGE_TOTAL_PIXELS,
+        MAX_IMAGE_DECODE_ALLOC_BYTES,
+    )
+}
+
+/// Decode PNG bytes fail-closed with caller-supplied dimension, pixel-count, and allocation limits.
+pub(crate) fn decode_png_checked_with_limits(
+    path: &Path,
+    bytes: &[u8],
+    max_dim: u32,
+    max_total_pixels: u64,
+    max_alloc: u64,
+) -> Result<DynamicImage, CoreError> {
+    if bytes.len() < PNG_SIGNATURE.len() || bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
+        return Err(CoreError::InvalidPng {
+            path: path.to_path_buf(),
+            reason: "missing valid 8-byte PNG signature".to_string(),
+        });
+    }
+
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(max_dim);
+    limits.max_image_height = Some(max_dim);
+    limits.max_alloc = Some(max_alloc);
+
+    let mut dim_reader = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png);
+    dim_reader.limits(limits.clone());
+    let (w, h) = dim_reader
+        .into_dimensions()
+        .map_err(|err| CoreError::InvalidPng {
+            path: path.to_path_buf(),
+            reason: format!("PNG header inspection failed: {err}"),
+        })?;
+    if w == 0 || h == 0 || w > max_dim || h > max_dim {
+        return Err(CoreError::InvalidPng {
+            path: path.to_path_buf(),
+            reason: format!("PNG dimensions {w}x{h} exceed allowed bounds 1..={max_dim}"),
+        });
+    }
+    let total_pixels =
+        u64::from(w)
+            .checked_mul(u64::from(h))
+            .ok_or_else(|| CoreError::InvalidPng {
+                path: path.to_path_buf(),
+                reason: format!("PNG pixel count overflow for {w}x{h}"),
+            })?;
+    if total_pixels > max_total_pixels {
+        return Err(CoreError::InvalidPng {
+            path: path.to_path_buf(),
+            reason: format!(
+                "PNG total pixel count {total_pixels} ({w}x{h}) exceeds limit {max_total_pixels}"
+            ),
+        });
+    }
+
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png);
+    reader.limits(limits);
+    reader.decode().map_err(|err| CoreError::InvalidPng {
+        path: path.to_path_buf(),
+        reason: format!("PNG decode failed: {err}"),
+    })
+}
+
+/// Read a regular non-symlink file using `O_NOFOLLOW` on Unix up to `MAX_REGULAR_FILE_BYTES`.
 pub(crate) fn read_regular_file_nofollow(
     path: &Path,
     context_label: &str,
+) -> Result<Vec<u8>, CoreError> {
+    read_regular_file_nofollow_bounded(path, context_label, MAX_REGULAR_FILE_BYTES)
+}
+
+/// Read a regular non-symlink file using `O_NOFOLLOW` on Unix with an explicit byte-size cap.
+pub(crate) fn read_regular_file_nofollow_bounded(
+    path: &Path,
+    context_label: &str,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, CoreError> {
     let lstat_meta = fs::symlink_metadata(path).map_err(|err| CoreError::Io {
         context: format!("inspecting {context_label} at {}", path.display()),
@@ -1146,10 +1347,22 @@ pub(crate) fn read_regular_file_nofollow(
             ),
         });
     }
+    if lstat_meta.len() > max_bytes {
+        return Err(CoreError::Io {
+            context: format!("reading {context_label} at {}", path.display()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{context_label} size ({} bytes) exceeds maximum allowed {max_bytes} bytes",
+                    lstat_meta.len()
+                ),
+            ),
+        });
+    }
 
     #[cfg(unix)]
     {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
@@ -1170,20 +1383,76 @@ pub(crate) fn read_regular_file_nofollow(
                 ),
             });
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|err| CoreError::Io {
-            context: format!("reading {context_label} at {}", path.display()),
-            source: err,
-        })?;
+        if meta.len() > max_bytes {
+            return Err(CoreError::Io {
+                context: format!("reading {context_label} at {}", path.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{context_label} size ({} bytes) exceeds maximum allowed {max_bytes} bytes",
+                        meta.len()
+                    ),
+                ),
+            });
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(meta.len().min(max_bytes)).unwrap_or(0));
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|err| CoreError::Io {
+                context: format!("reading {context_label} at {}", path.display()),
+                source: err,
+            })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(CoreError::Io {
+                context: format!("reading {context_label} at {}", path.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{context_label} exceeds maximum allowed {max_bytes} bytes"),
+                ),
+            });
+        }
         Ok(bytes)
     }
 
     #[cfg(not(unix))]
     {
-        fs::read(path).map_err(|err| CoreError::Io {
-            context: format!("reading {context_label} at {}", path.display()),
+        let file = File::open(path).map_err(|err| CoreError::Io {
+            context: format!("opening {context_label} at {}", path.display()),
             source: err,
-        })
+        })?;
+        let meta = file.metadata().map_err(|err| CoreError::Io {
+            context: format!("inspecting opened {context_label} at {}", path.display()),
+            source: err,
+        })?;
+        if meta.len() > max_bytes {
+            return Err(CoreError::Io {
+                context: format!("reading {context_label} at {}", path.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{context_label} size ({} bytes) exceeds maximum allowed {max_bytes} bytes",
+                        meta.len()
+                    ),
+                ),
+            });
+        }
+        let mut bytes = Vec::with_capacity(usize::try_from(meta.len().min(max_bytes)).unwrap_or(0));
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|err| CoreError::Io {
+                context: format!("reading {context_label} at {}", path.display()),
+                source: err,
+            })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(CoreError::Io {
+                context: format!("reading {context_label} at {}", path.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{context_label} exceeds maximum allowed {max_bytes} bytes"),
+                ),
+            });
+        }
+        Ok(bytes)
     }
 }
 
@@ -1205,18 +1474,7 @@ impl SeedInput {
     /// Load and validate a `SeedInput` from a regular non-symlink PNG file on disk.
     pub fn from_png_path(path: &Path, label: Option<String>) -> Result<Self, CoreError> {
         let bytes = read_regular_png_bytes_nofollow(path)?;
-        if bytes.len() < PNG_SIGNATURE.len() || bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
-            return Err(CoreError::InvalidPng {
-                path: path.to_path_buf(),
-                reason: "SeedInput file does not start with valid 8-byte PNG signature".to_string(),
-            });
-        }
-        image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).map_err(|err| {
-            CoreError::InvalidPng {
-                path: path.to_path_buf(),
-                reason: format!("SeedInput PNG decode failed: {err}"),
-            }
-        })?;
+        let _ = decode_png_checked(path, &bytes)?;
 
         let sha256 = sha256_hex(&bytes);
         let cleaned_label = label
@@ -1567,5 +1825,121 @@ mod tests {
             serde_json::from_slice(&fs::read(pack_dir.join("pack.json")).unwrap()).unwrap();
         assert_eq!(persisted.lifecycle, Lifecycle::Validated);
         assert_eq!(lock_store.load_or_init().unwrap(), lock_before);
+    }
+
+    fn minimal_png_with_ihdr_dims(w: u32, h: u32) -> Vec<u8> {
+        let mut png = Vec::from(PNG_SIGNATURE);
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+        png.extend_from_slice(&(13u32).to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&[0u8; 4]); // placeholder CRC (header dimensions read before decode)
+        png
+    }
+
+    #[rstest]
+    #[case::within_limits(32, 32, 64, 1024, 1024 * 1024, true)]
+    #[case::exceeds_max_dim(64, 32, 32, 4096, 1024 * 1024, false)]
+    #[case::exceeds_total_pixels(32, 32, 64, 512, 1024 * 1024, false)]
+    #[case::exceeds_max_alloc(32, 32, 64, 4096, 512, false)]
+    fn decode_png_checked_with_limits_rejects_oversized_dimensions_and_alloc(
+        #[case] w: u32,
+        #[case] h: u32,
+        #[case] max_dim: u32,
+        #[case] max_total_pixels: u64,
+        #[case] max_alloc: u64,
+        #[case] expect_ok: bool,
+    ) {
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(w, h, Rgba([10, 20, 30, 255]));
+        let mut buf = Vec::new();
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+
+        let res = decode_png_checked_with_limits(
+            Path::new("test.png"),
+            &buf,
+            max_dim,
+            max_total_pixels,
+            max_alloc,
+        );
+        assert_eq!(res.is_ok(), expect_ok);
+        if !expect_ok {
+            assert!(matches!(res.unwrap_err(), CoreError::InvalidPng { .. }));
+        }
+    }
+
+    #[rstest]
+    #[case::width_exceeds_max_image_dim(MAX_IMAGE_DIM + 1, 16)]
+    #[case::total_pixels_exceeds_cap(16_384, 16_384)]
+    fn decode_png_checked_rejects_oversized_ihdr_before_allocating(#[case] w: u32, #[case] h: u32) {
+        let forged = minimal_png_with_ihdr_dims(w, h);
+        let err = decode_png_checked(Path::new("bomb.png"), &forged)
+            .expect_err("oversized IHDR must fail closed before pixel buffer allocation");
+        assert!(matches!(err, CoreError::InvalidPng { .. }));
+    }
+
+    #[rstest]
+    #[case::within_cap(64, 128, true)]
+    #[case::exact_cap(128, 128, true)]
+    #[case::exceeds_cap(129, 128, false)]
+    fn read_regular_file_nofollow_bounded_enforces_size_cap(
+        #[case] file_len: usize,
+        #[case] cap_bytes: u64,
+        #[case] expect_ok: bool,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("payload.bin");
+        fs::write(&file_path, vec![0xAAu8; file_len]).unwrap();
+        let res = read_regular_file_nofollow_bounded(&file_path, "test payload", cap_bytes);
+        assert_eq!(res.is_ok(), expect_ok);
+    }
+
+    #[rstest]
+    #[case::internal_run_detected(Visibility::Internal, true, Some(Visibility::Internal))]
+    #[case::restricted_run_detected(Visibility::Restricted, true, Some(Visibility::Restricted))]
+    #[case::outside_runs_dir_returns_none(Visibility::Internal, false, None)]
+    fn inspect_run_image_visibility_detects_sibling_metadata_inside_runs_dir(
+        #[case] run_vis: Visibility,
+        #[case] inside_runs: bool,
+        #[case] expected: Option<Visibility>,
+    ) {
+        let root = TempDir::new().unwrap();
+        let store = RunStore::new(root.path().join("runs"));
+        let recorded = store
+            .record_run(RecordRunParams {
+                slug: "secret-scene".to_string(),
+                visibility: run_vis,
+                png_bytes: sample_png_bytes([10, 20, 30, 255]),
+                input_hashes: BTreeMap::new(),
+                compiled_prompt: "test".to_string(),
+                backend: RunBackendMetadata {
+                    name: "stub".to_string(),
+                    width: 32,
+                    height: 32,
+                    raw_width: 32,
+                    raw_height: 32,
+                    thread_id: None,
+                },
+                seed: None,
+                qa_reports: RunQaReports::default(),
+            })
+            .unwrap();
+
+        let target = if inside_runs {
+            recorded.image_path
+        } else {
+            let outside = root.path().join("external.png");
+            fs::write(&outside, sample_png_bytes([10, 20, 30, 255])).unwrap();
+            outside
+        };
+        assert_eq!(
+            store.inspect_run_image_visibility(&target).unwrap(),
+            expected
+        );
     }
 }

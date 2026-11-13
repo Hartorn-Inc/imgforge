@@ -86,9 +86,9 @@ pub use error::CoreError;
 pub use export::{
     CubeLut, DEFAULT_CDF_DAMP_STRENGTH, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
     DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportResult, ExportSource,
-    ExportedArtifact, MAX_CDF_DAMP_STRENGTH, MIN_CDF_DAMP_STRENGTH, MatchGradeOptions,
-    VttMapOptions, VttTokenOptions, apply_damped_l_star_cdf_match, execute_export,
-    render_vtt_token, split_grid_2x2,
+    ExportedArtifact, MAX_CDF_DAMP_STRENGTH, MAX_VTT_TOKEN_SIZE_PX, MIN_CDF_DAMP_STRENGTH,
+    MIN_VTT_TOKEN_SIZE_PX, MatchGradeOptions, VttMapOptions, VttTokenOptions,
+    apply_damped_l_star_cdf_match, execute_export, render_vtt_token, split_grid_2x2,
 };
 pub use guide_renderer::{
     ActionVector, DepthBand, GuideDepthPlane, GuideRenderer, GuideSpec, MAX_GUIDE_CANVAS_DIM,
@@ -119,8 +119,10 @@ pub use slicer::{
     SlicesManifest, slice_sheet_image, slice_sheet_to_dir,
 };
 pub use store::{
-    MANIFEST_LOCK_FILENAME, ManifestEntry, ManifestEntryKind, ManifestLock, ManifestLockStore,
-    RecordRunParams, RecordedRun, RunBackendMetadata, RunMetadata, RunQaReports, RunStore,
+    MANIFEST_LOCK_FILENAME, MAX_CUBE_LUT_BYTES, MAX_IMAGE_DECODE_ALLOC_BYTES, MAX_IMAGE_DIM,
+    MAX_IMAGE_TOTAL_PIXELS, MAX_REGULAR_FILE_BYTES, ManifestEntry, ManifestEntryKind, ManifestLock,
+    ManifestLockStore, RecordRunParams, RecordedRun, RunBackendMetadata, RunMetadata, RunQaReports,
+    RunStore, write_atomic,
 };
 pub use style::{MAX_STYLE_EXEMPLARS, MIN_STYLE_EXEMPLARS, Style};
 pub use subject::{PaletteLock, PaletteSwatch, Subject, SubjectHandBindings, SubjectKind};

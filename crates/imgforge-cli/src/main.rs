@@ -34,9 +34,9 @@ use imgforge_core::{
     ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore, SceneComposer,
     SceneSpec, SlicerConfig, SparkleConfig, TraitCategory, TraitCheckInput, UntouchedDriftConfig,
     Visibility, VisionCritic, VisionCriticRequest, VttMapOptions, VttTokenOptions,
-    WholeImageEditRequest, execute_export, execute_patch_edit, execute_whole_image_edit,
-    pack_dynamic_atlas, resolve_codex_auth_dir_from_env, resolve_user_config_dir_from_env,
-    resolve_workspace_from_env, slice_sheet_to_dir,
+    WholeImageEditRequest, check_visibility_compatibility, execute_export, execute_patch_edit,
+    execute_whole_image_edit, pack_dynamic_atlas, resolve_codex_auth_dir_from_env,
+    resolve_user_config_dir_from_env, resolve_workspace_from_env, slice_sheet_to_dir, write_atomic,
 };
 use serde::Serialize;
 
@@ -776,11 +776,18 @@ async fn main() -> anyhow::Result<()> {
                         }
                         None => None,
                     };
+                    let target_visibility: Visibility = visibility.into();
                     let mut subject_rois = Vec::with_capacity(subjects.len());
                     for subj_slug in &subjects {
                         let resolved = registry.resolve_subject(subj_slug)?;
+                        check_visibility_compatibility(
+                            target_visibility,
+                            "WholeImageEdit",
+                            [(resolved.subject.slug.as_str(), resolved.subject.visibility)],
+                        )?;
                         subject_rois.push(OwnedSubjectRoi {
                             subject_slug: resolved.subject.slug,
+                            visibility: resolved.subject.visibility,
                             palette_lock: resolved.subject.palette_lock,
                             rois: Vec::new(),
                         });
@@ -790,7 +797,7 @@ async fn main() -> anyhow::Result<()> {
                         &run_store,
                         &WholeImageEditRequest {
                             slug,
-                            visibility: visibility.into(),
+                            visibility: target_visibility,
                             target_image_path: target,
                             compiled_prompt: prompt,
                             reference_images: references,
@@ -919,16 +926,9 @@ async fn main() -> anyhow::Result<()> {
                             .context("resolving current working directory")?,
                     };
                     let rendered = GuideRenderer::new().render(&parsed, &ws_root)?;
-                    if let Some(parent) = out.parent()
-                        && !parent.as_os_str().is_empty()
-                    {
-                        fs::create_dir_all(parent).with_context(|| {
-                            format!("creating output directory {}", parent.display())
-                        })?;
-                    }
-                    fs::write(&out, &rendered.png_bytes).with_context(|| {
-                        format!("writing SpatialGuide PNG to {}", out.display())
-                    })?;
+                    write_atomic(&out, &rendered.png_bytes, "SpatialGuide PNG").with_context(
+                        || format!("writing SpatialGuide PNG to {}", out.display()),
+                    )?;
                     if json {
                         println!(
                             "{}",
@@ -974,6 +974,12 @@ async fn main() -> anyhow::Result<()> {
                     )
                 }
                 (None, Some(path)) => {
+                    let mut effective_source_vis: Visibility = args.source_visibility.into();
+                    if let Some(ref store) = run_store
+                        && let Some(run_vis) = store.inspect_run_image_visibility(&path)?
+                    {
+                        effective_source_vis = std::cmp::max(effective_source_vis, run_vis);
+                    }
                     let stem = path
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -983,7 +989,7 @@ async fn main() -> anyhow::Result<()> {
                         ExportSource::PngPath {
                             path,
                             asset_id: stem.clone(),
-                            visibility: args.source_visibility.into(),
+                            visibility: effective_source_vis,
                         },
                         stem,
                     )

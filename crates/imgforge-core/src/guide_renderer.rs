@@ -27,11 +27,11 @@
 //!    `OverlayRegion`s + `ActionVector`s) and encodes a verified PNG.
 
 use std::fmt::Write as _;
-use std::io::Cursor;
 use std::path::Path;
 
+use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
-use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 use resvg::usvg;
 use serde::{Deserialize, Serialize};
 use tiny_skia::{
@@ -39,12 +39,12 @@ use tiny_skia::{
     Transform,
 };
 
-use crate::backend::PNG_SIGNATURE;
 use crate::calibration::{STUDIO_BG_RGB, parse_hex_rgb};
 use crate::error::CoreError;
 use crate::lifecycle::normalize_hex_color;
 use crate::store::{
-    read_regular_file_nofollow, validate_strict_relative_path, verify_contained_path_no_symlinks,
+    checked_pixel_count, decode_png_checked, read_regular_file_nofollow,
+    validate_strict_relative_path, verify_contained_path_no_symlinks,
 };
 
 /// Supported `GuideSpec` schema version matching `frontend/src/types/guideSpec.ts`.
@@ -52,6 +52,21 @@ pub const SUPPORTED_GUIDE_SPEC_SCHEMA_VERSION: &str = "1.0";
 
 /// Maximum permitted `SpatialGuide` canvas dimension in pixels (`1..=16384`).
 pub const MAX_GUIDE_CANVAS_DIM: u32 = 16_384;
+
+/// Maximum permitted `depthBands` entries in a `GuideSpec`.
+pub const MAX_GUIDE_DEPTH_BANDS: usize = 64;
+
+/// Maximum permitted `mannequins` entries in a `GuideSpec`.
+pub const MAX_GUIDE_MANNEQUINS: usize = 128;
+
+/// Maximum permitted `actionVectors` entries in a `GuideSpec`.
+pub const MAX_GUIDE_ACTION_VECTORS: usize = 256;
+
+/// Maximum permitted `overlayRegions` entries in a `GuideSpec`.
+pub const MAX_GUIDE_OVERLAY_REGIONS: usize = 256;
+
+/// Maximum permitted `points` per `OverlayRegion`.
+pub const MAX_GUIDE_REGION_POINTS: usize = 1_024;
 
 /// Discriminator selecting the `SpatialGuide` rendering mode in `GuideRenderer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,6 +315,31 @@ impl GuideSpec {
             }
         }
 
+        if self.depth_bands.len() > MAX_GUIDE_DEPTH_BANDS {
+            return Err(CoreError::GuideRenderFailed(format!(
+                "depthBands count {} exceeds maximum {MAX_GUIDE_DEPTH_BANDS}",
+                self.depth_bands.len()
+            )));
+        }
+        if self.mannequins.len() > MAX_GUIDE_MANNEQUINS {
+            return Err(CoreError::GuideRenderFailed(format!(
+                "mannequins count {} exceeds maximum {MAX_GUIDE_MANNEQUINS}",
+                self.mannequins.len()
+            )));
+        }
+        if self.action_vectors.len() > MAX_GUIDE_ACTION_VECTORS {
+            return Err(CoreError::GuideRenderFailed(format!(
+                "actionVectors count {} exceeds maximum {MAX_GUIDE_ACTION_VECTORS}",
+                self.action_vectors.len()
+            )));
+        }
+        if self.overlay_regions.len() > MAX_GUIDE_OVERLAY_REGIONS {
+            return Err(CoreError::GuideRenderFailed(format!(
+                "overlayRegions count {} exceeds maximum {MAX_GUIDE_OVERLAY_REGIONS}",
+                self.overlay_regions.len()
+            )));
+        }
+
         for (idx, band) in self.depth_bands.iter_mut().enumerate() {
             let pfx = format!("depthBands[{idx}]");
             require_non_empty_str(&format!("{pfx}.id"), &band.id)?;
@@ -338,6 +378,12 @@ impl GuideSpec {
             require_unit_ratio(&format!("{pfx}.toXRatio"), v.to_x_ratio)?;
             require_unit_ratio(&format!("{pfx}.toYRatio"), v.to_y_ratio)?;
             require_pos_finite(&format!("{pfx}.strokeWidthPx"), v.stroke_width_px)?;
+            if v.stroke_width_px > f64::from(MAX_GUIDE_CANVAS_DIM) {
+                return Err(CoreError::GuideRenderFailed(format!(
+                    "{pfx}.strokeWidthPx ({}) exceeds maximum {MAX_GUIDE_CANVAS_DIM}",
+                    v.stroke_width_px
+                )));
+            }
             v.stroke_hex = normalize_hex_color(&v.stroke_hex, &format!("{pfx}.strokeHex"))
                 .map_err(CoreError::GuideRenderFailed)?;
             v.halo_hex = normalize_hex_color(&v.halo_hex, &format!("{pfx}.haloHex"))
@@ -348,9 +394,9 @@ impl GuideSpec {
             let pfx = format!("overlayRegions[{idx}]");
             require_non_empty_str(&format!("{pfx}.id"), &r.id)?;
             require_non_empty_str(&format!("{pfx}.label"), &r.label)?;
-            if r.points.len() < 2 {
+            if r.points.len() < 2 || r.points.len() > MAX_GUIDE_REGION_POINTS {
                 return Err(CoreError::GuideRenderFailed(format!(
-                    "{pfx}.points must contain at least 2 points"
+                    "{pfx}.points must contain between 2 and {MAX_GUIDE_REGION_POINTS} points"
                 )));
             }
             for (pidx, pt) in r.points.iter().enumerate() {
@@ -409,6 +455,8 @@ impl GuideRenderer {
 
         let w = normalized.canvas_width;
         let h = normalized.canvas_height;
+        checked_pixel_count(w, h, "SpatialGuide canvas")
+            .map_err(|err| CoreError::GuideRenderFailed(err.to_string()))?;
         let mut pixmap = Pixmap::new(w, h).ok_or_else(|| {
             CoreError::GuideRenderFailed(format!("failed to allocate {w}x{h} pixmap"))
         })?;
@@ -430,24 +478,12 @@ impl GuideRenderer {
                 )?;
                 let png_bytes =
                     read_regular_file_nofollow(&contained_path, "OverlayGuide target image")?;
-                if png_bytes.len() < PNG_SIGNATURE.len()
-                    || png_bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE
-                {
-                    return Err(CoreError::InvalidPng {
-                        path: contained_path,
-                        reason: "OverlayGuide target image missing 8-byte PNG signature"
-                            .to_string(),
-                    });
-                }
-                let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)
-                    .map_err(|err| CoreError::InvalidPng {
-                        path: contained_path,
-                        reason: format!("OverlayGuide target PNG decode failed: {err}"),
-                    })?;
+                let decoded = decode_png_checked(&contained_path, &png_bytes)?;
                 let target_rgba = if decoded.width() == w && decoded.height() == h {
-                    decoded.to_rgba8()
+                    decoded.into_rgba8()
                 } else {
-                    decoded.resize_exact(w, h, FilterType::Lanczos3).to_rgba8()
+                    let src_rgba = decoded.into_rgba8();
+                    image::imageops::resize(&src_rgba, w, h, FilterType::Lanczos3)
                 };
                 copy_rgba_into_premul_pixmap(&target_rgba, &mut pixmap);
             }
@@ -466,10 +502,10 @@ impl GuideRenderer {
         render_overlay_regions(&mut pixmap, &normalized.overlay_regions, w, h)?;
         render_action_vectors(&mut pixmap, &normalized.action_vectors, w, h)?;
 
-        let rgba = pixmap_to_unpremul_rgba(&pixmap);
+        let rgba = pixmap_into_unpremul_rgba(pixmap);
         let mut out_bytes = Vec::new();
-        DynamicImage::ImageRgba8(rgba)
-            .write_to(&mut Cursor::new(&mut out_bytes), ImageFormat::Png)
+        PngEncoder::new(&mut out_bytes)
+            .write_image(rgba.as_raw(), w, h, ExtendedColorType::Rgba8)
             .map_err(|err| {
                 CoreError::GuideRenderFailed(format!("encoding SpatialGuide PNG: {err}"))
             })?;
@@ -537,9 +573,11 @@ fn render_mannequins_via_resvg(
 
     for m in mannequins {
         let rgb = parse_hex_rgb(&m.palette_hex)?;
+        let max_h = (hf * 0.92).max(1.0);
+        let min_h = 24.0_f32.min(max_h);
         let pixel_h =
-            ((m.height_meters * m.scale_factor) as f32 * pixels_per_meter).clamp(24.0, hf * 0.92);
-        let pixel_w = (pixel_h * 0.44).max(12.0);
+            ((m.height_meters * m.scale_factor) as f32 * pixels_per_meter).clamp(min_h, max_h);
+        let pixel_w = (pixel_h * 0.44).max(1.0);
         let anchor_x = (m.x_ratio as f32) * wf;
         let anchor_y = (m.y_ratio as f32) * hf;
 
@@ -760,7 +798,7 @@ fn render_action_vectors(
         }
         let ux = dx / len;
         let uy = dy / len;
-        let head_len = (sw * 3.8).clamp(10.0, len * 0.45);
+        let head_len = (sw * 3.8).max(10.0).min(len * 0.45);
         let head_half_w = head_len * 0.58;
 
         let shaft_end_x = x1 - ux * head_len * 0.7;
@@ -867,34 +905,26 @@ fn copy_rgba_into_premul_pixmap(src: &RgbaImage, dst: &mut Pixmap) {
     }
 }
 
-fn pixmap_to_unpremul_rgba(pixmap: &Pixmap) -> RgbaImage {
+fn pixmap_into_unpremul_rgba(pixmap: Pixmap) -> RgbaImage {
     let w = pixmap.width();
     let h = pixmap.height();
-    let mut out = RgbaImage::new(w, h);
-    let data = pixmap.data();
-    for y in 0..h {
-        for x in 0..w {
-            let offset = ((y * w + x) as usize) * 4;
-            let pr = data[offset];
-            let pg = data[offset + 1];
-            let pb = data[offset + 2];
-            let a = data[offset + 3];
-            let (r, g, b) = if a == 0 {
-                (0, 0, 0)
-            } else if a == 255 {
-                (pr, pg, pb)
-            } else {
-                let af = f32::from(a) / 255.0;
-                (
-                    (f32::from(pr) / af).round().clamp(0.0, 255.0) as u8,
-                    (f32::from(pg) / af).round().clamp(0.0, 255.0) as u8,
-                    (f32::from(pb) / af).round().clamp(0.0, 255.0) as u8,
-                )
-            };
-            out.put_pixel(x, y, Rgba([r, g, b, a]));
+    let mut raw = pixmap.take();
+    let (pixels, remainder) = raw.as_chunks_mut::<4>();
+    debug_assert!(remainder.is_empty());
+    for px in pixels {
+        let a = px[3];
+        if a == 0 {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        } else if a < 255 {
+            let af = f32::from(a) / 255.0;
+            px[0] = (f32::from(px[0]) / af).round().clamp(0.0, 255.0) as u8;
+            px[1] = (f32::from(px[1]) / af).round().clamp(0.0, 255.0) as u8;
+            px[2] = (f32::from(px[2]) / af).round().clamp(0.0, 255.0) as u8;
         }
     }
-    out
+    RgbaImage::from_raw(w, h, raw).expect("Pixmap raw buffer matches 4 * w * h")
 }
 
 fn require_non_empty_str(field: &str, value: &str) -> Result<(), CoreError> {
@@ -927,10 +957,11 @@ fn require_pos_finite(field: &str, val: f64) -> Result<(), CoreError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Cursor;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
-    use image::ImageBuffer;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use rstest::rstest;
     use tempfile::TempDir;
 
@@ -1179,6 +1210,107 @@ mod tests {
     fn rejects_invalid_guidespec_json_fail_closed(#[case] needle: &str, #[case] replacement: &str) {
         let invalid = sample_blockout_json().replacen(needle, replacement, 1);
         let err = GuideSpec::from_json_str(&invalid).expect_err("invalid GuideSpec must fail");
+        assert!(matches!(err, CoreError::GuideRenderFailed(_)));
+    }
+
+    #[rstest]
+    #[case::short_vector_5px_on_512(512, 512, 5.0)]
+    #[case::short_vector_15px_on_512(512, 512, 15.0)]
+    #[case::small_blockout_20x20_with_15px_vector(20, 20, 15.0)]
+    #[case::tiny_blockout_10x10_with_5px_vector(10, 10, 5.0)]
+    fn renders_short_action_vectors_and_small_blockout_without_panic(
+        #[case] canvas_w: u32,
+        #[case] canvas_h: u32,
+        #[case] vector_len_px: f64,
+    ) {
+        let mut spec = GuideSpec::from_json_str(sample_blockout_json()).unwrap();
+        spec.canvas_width = canvas_w;
+        spec.canvas_height = canvas_h;
+        let dx_ratio = (vector_len_px / f64::from(canvas_w)).min(0.8);
+        spec.action_vectors[0].from_x_ratio = 0.1;
+        spec.action_vectors[0].from_y_ratio = 0.5;
+        spec.action_vectors[0].to_x_ratio = 0.1 + dx_ratio;
+        spec.action_vectors[0].to_y_ratio = 0.5;
+
+        let ws = TempDir::new().unwrap();
+        let rendered = GuideRenderer::new()
+            .render(&spec, ws.path())
+            .expect("small Blockout and short ActionVector must render without panic");
+        assert_eq!((rendered.width, rendered.height), (canvas_w, canvas_h));
+        let decoded = image::load_from_memory(&rendered.png_bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (canvas_w, canvas_h));
+    }
+
+    #[rstest]
+    #[case::excessive_stroke_width("stroke_width")]
+    #[case::excessive_depth_bands("depth_bands")]
+    #[case::excessive_mannequins("mannequins")]
+    #[case::excessive_action_vectors("action_vectors")]
+    #[case::excessive_overlay_regions("overlay_regions")]
+    #[case::excessive_polyline_points("polyline_points")]
+    fn validate_and_normalize_rejects_excessive_guidespec_bounds(#[case] case_kind: &str) {
+        let mut spec = GuideSpec::from_json_str(sample_blockout_json()).unwrap();
+        match case_kind {
+            "stroke_width" => {
+                spec.action_vectors[0].stroke_width_px = f64::from(MAX_GUIDE_CANVAS_DIM) + 1.0;
+            }
+            "depth_bands" => {
+                let template = spec.depth_bands[0].clone();
+                spec.depth_bands = vec![template; MAX_GUIDE_DEPTH_BANDS + 1];
+            }
+            "mannequins" => {
+                let template = spec.mannequins[0].clone();
+                spec.mannequins = vec![template; MAX_GUIDE_MANNEQUINS + 1];
+            }
+            "action_vectors" => {
+                let template = spec.action_vectors[0].clone();
+                spec.action_vectors = vec![template; MAX_GUIDE_ACTION_VECTORS + 1];
+            }
+            "overlay_regions" => {
+                let region = OverlayRegion {
+                    id: "r".to_string(),
+                    label: "R".to_string(),
+                    kind: OverlayRegionKind::Rect,
+                    points: vec![
+                        NormalizedPoint {
+                            x_ratio: 0.1,
+                            y_ratio: 0.1,
+                        },
+                        NormalizedPoint {
+                            x_ratio: 0.2,
+                            y_ratio: 0.2,
+                        },
+                    ],
+                    stroke_hex: "#FFFFFF".to_string(),
+                    halo_hex: "#000000".to_string(),
+                    fill_hex: "#FFFFFF".to_string(),
+                    opacity: 0.1,
+                };
+                spec.overlay_regions = vec![region; MAX_GUIDE_OVERLAY_REGIONS + 1];
+            }
+            "polyline_points" => {
+                spec.overlay_regions.push(OverlayRegion {
+                    id: "poly".to_string(),
+                    label: "Poly".to_string(),
+                    kind: OverlayRegionKind::Polyline,
+                    points: vec![
+                        NormalizedPoint {
+                            x_ratio: 0.1,
+                            y_ratio: 0.1,
+                        };
+                        MAX_GUIDE_REGION_POINTS + 1
+                    ],
+                    stroke_hex: "#FFFFFF".to_string(),
+                    halo_hex: "#000000".to_string(),
+                    fill_hex: "#FFFFFF".to_string(),
+                    opacity: 0.0,
+                });
+            }
+            other => panic!("unexpected case: {other}"),
+        }
+        let err = spec
+            .validate_and_normalize()
+            .expect_err("oversized GuideSpec bounds must fail closed");
         assert!(matches!(err, CoreError::GuideRenderFailed(_)));
     }
 }

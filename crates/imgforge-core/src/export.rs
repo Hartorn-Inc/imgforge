@@ -26,7 +26,7 @@
 //!    or `grid_2x2`) and write deterministic output files atomically.
 
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::{FilterType, crop_imm};
@@ -35,13 +35,21 @@ use palette::white_point::D65;
 use palette::{Clamp, IntoColor, Lab, LinSrgb, Srgb};
 use serde::{Deserialize, Serialize};
 
-use crate::backend::PNG_SIGNATURE;
 use crate::calibration::{STUDIO_BG_RGB, parse_hex_rgb};
 use crate::color_qa::srgb_u8_to_lab;
 use crate::error::CoreError;
 use crate::lifecycle::{sha256_hex, validate_slug};
 use crate::scene_spec::{Visibility, check_visibility_compatibility};
-use crate::store::{RunStore, read_regular_file_nofollow, write_atomic};
+use crate::store::{
+    MAX_CUBE_LUT_BYTES, MAX_IMAGE_DIM, MAX_IMAGE_TOTAL_PIXELS, RunStore, decode_png_checked,
+    read_regular_file_nofollow, read_regular_file_nofollow_bounded, write_atomic,
+};
+
+/// Minimum square resolution for `vtt_token` exports (`16x16`).
+pub const MIN_VTT_TOKEN_SIZE_PX: u32 = 16;
+
+/// Maximum square resolution for `vtt_token` exports (`4096x4096`).
+pub const MAX_VTT_TOKEN_SIZE_PX: u32 = 4_096;
 
 /// Default square resolution for `vtt_token` exports (`512x512`).
 pub const DEFAULT_VTT_TOKEN_SIZE_PX: u32 = 512;
@@ -231,6 +239,7 @@ pub fn execute_export(
     request: &ExportRequest,
 ) -> Result<ExportResult, CoreError> {
     validate_slug(&request.output_slug, "Export").map_err(CoreError::ExportFailed)?;
+    validate_export_profile_preflight(&request.profile)?;
 
     let (source_id, source_visibility, source_png_path) = match &request.source {
         ExportSource::Run { slug, version } => {
@@ -280,7 +289,11 @@ pub fn execute_export(
             match_grade_applied = true;
         }
         if let Some(ref lut_path) = grade_opts.cube_lut_path {
-            let lut_bytes = read_regular_file_nofollow(lut_path, "Export .cube LUT")?;
+            let lut_bytes = read_regular_file_nofollow_bounded(
+                lut_path,
+                "Export .cube LUT",
+                MAX_CUBE_LUT_BYTES,
+            )?;
             let lut_str = std::str::from_utf8(&lut_bytes).map_err(|err| {
                 CoreError::ExportFailed(format!(".cube LUT is not valid UTF-8: {err}"))
             })?;
@@ -337,21 +350,50 @@ pub fn execute_export(
                         "vtt_map scale_factor ({factor}) must be finite and > 0.0"
                     )));
                 }
-                (
-                    ((f64::from(working_img.width()) * factor).round() as u32).max(1),
-                    ((f64::from(working_img.height()) * factor).round() as u32).max(1),
-                )
+                let raw_w = f64::from(working_img.width()) * factor;
+                let raw_h = f64::from(working_img.height()) * factor;
+                if !raw_w.is_finite()
+                    || !raw_h.is_finite()
+                    || raw_w > f64::from(MAX_IMAGE_DIM)
+                    || raw_h > f64::from(MAX_IMAGE_DIM)
+                {
+                    return Err(CoreError::ExportFailed(format!(
+                        "vtt_map scaled dimensions ({raw_w}x{raw_h}) exceed maximum {MAX_IMAGE_DIM}"
+                    )));
+                }
+                let rounded_w = raw_w.round();
+                let rounded_h = raw_h.round();
+                if rounded_w < 1.0
+                    || rounded_h < 1.0
+                    || rounded_w > f64::from(MAX_IMAGE_DIM)
+                    || rounded_h > f64::from(MAX_IMAGE_DIM)
+                {
+                    return Err(CoreError::ExportFailed(format!(
+                        "vtt_map rounded scaled dimensions ({rounded_w}x{rounded_h}) out of bounds 1..={MAX_IMAGE_DIM}"
+                    )));
+                }
+                (rounded_w as u32, rounded_h as u32)
             } else {
                 if opts.grid_px == 0 {
                     return Err(CoreError::ExportFailed(
                         "vtt_map grid_px must be >= 1".to_string(),
                     ));
                 }
-                (
-                    opts.cols.saturating_mul(opts.grid_px),
-                    opts.rows.saturating_mul(opts.grid_px),
-                )
+                let target_w = opts.cols.checked_mul(opts.grid_px).ok_or_else(|| {
+                    CoreError::ExportFailed(format!(
+                        "vtt_map width overflow: cols ({}) * grid_px ({})",
+                        opts.cols, opts.grid_px
+                    ))
+                })?;
+                let target_h = opts.rows.checked_mul(opts.grid_px).ok_or_else(|| {
+                    CoreError::ExportFailed(format!(
+                        "vtt_map height overflow: rows ({}) * grid_px ({})",
+                        opts.rows, opts.grid_px
+                    ))
+                })?;
+                (target_w, target_h)
             };
+            validate_export_dimensions(target_w, target_h, true, "vtt_map")?;
 
             let resized = if working_img.width() == target_w && working_img.height() == target_h {
                 working_img
@@ -379,6 +421,7 @@ pub fn execute_export(
             let mut webp_bytes = Vec::new();
             let w = working_img.width();
             let h = working_img.height();
+            validate_export_dimensions(w, h, false, "web_webp")?;
             DynamicImage::ImageRgba8(working_img)
                 .write_to(&mut Cursor::new(&mut webp_bytes), ImageFormat::WebP)
                 .map_err(|err| CoreError::ExportFailed(format!("encoding web_webp: {err}")))?;
@@ -437,9 +480,9 @@ pub fn render_vtt_token(
     src: &RgbaImage,
     opts: &VttTokenOptions,
 ) -> Result<(RgbaImage, Option<RgbImage>), CoreError> {
-    if opts.size_px < 16 {
+    if !(MIN_VTT_TOKEN_SIZE_PX..=MAX_VTT_TOKEN_SIZE_PX).contains(&opts.size_px) {
         return Err(CoreError::ExportFailed(format!(
-            "vtt_token size_px ({}) must be >= 16",
+            "vtt_token size_px ({}) must be within {MIN_VTT_TOKEN_SIZE_PX}..={MAX_VTT_TOKEN_SIZE_PX}",
             opts.size_px
         )));
     }
@@ -449,6 +492,10 @@ pub fn render_vtt_token(
         .as_deref()
         .map(parse_hex_rgb)
         .transpose()?;
+    validate_export_dimensions(src.width(), src.height(), false, "vtt_token source image")?;
+    if backdrop_rgb_opt.is_some() {
+        validate_export_dimensions(opts.size_px, opts.size_px, true, "vtt_token JPEG")?;
+    }
 
     let side = src.width().min(src.height());
     if side == 0 {
@@ -556,6 +603,7 @@ pub fn render_vtt_token(
 pub fn split_grid_2x2(src: &RgbaImage) -> Result<[(&'static str, RgbaImage); 4], CoreError> {
     let w = src.width();
     let h = src.height();
+    validate_export_dimensions(w, h, false, "grid_2x2")?;
     if w < 2 || h < 2 {
         return Err(CoreError::ExportFailed(format!(
             "grid_2x2 requires at least 2x2 image dimensions (got {w}x{h})"
@@ -876,19 +924,85 @@ fn parse_rgb_triple(line: &str, line_num: usize) -> Result<[f32; 3], CoreError> 
     Ok(vals)
 }
 
-fn decode_png_checked(path: &Path, bytes: &[u8]) -> Result<DynamicImage, CoreError> {
-    if bytes.len() < PNG_SIGNATURE.len() || bytes[..PNG_SIGNATURE.len()] != PNG_SIGNATURE {
-        return Err(CoreError::InvalidPng {
-            path: path.to_path_buf(),
-            reason: "missing valid 8-byte PNG signature".to_string(),
-        });
+fn validate_export_dimensions(
+    w: u32,
+    h: u32,
+    for_jpeg: bool,
+    context: &str,
+) -> Result<(), CoreError> {
+    if w == 0 || h == 0 || w > MAX_IMAGE_DIM || h > MAX_IMAGE_DIM {
+        return Err(CoreError::ExportFailed(format!(
+            "{context} dimensions {w}x{h} out of bounds 1..={MAX_IMAGE_DIM}"
+        )));
     }
-    image::load_from_memory_with_format(bytes, ImageFormat::Png).map_err(|err| {
-        CoreError::InvalidPng {
-            path: path.to_path_buf(),
-            reason: format!("PNG decode failed: {err}"),
+    if for_jpeg && (w > u32::from(u16::MAX) || h > u32::from(u16::MAX)) {
+        return Err(CoreError::ExportFailed(format!(
+            "{context} JPEG dimensions {w}x{h} exceed u16::MAX ({})",
+            u16::MAX
+        )));
+    }
+    let total = u64::from(w).checked_mul(u64::from(h)).ok_or_else(|| {
+        CoreError::ExportFailed(format!("{context} pixel count overflow for {w}x{h}"))
+    })?;
+    if total > MAX_IMAGE_TOTAL_PIXELS {
+        return Err(CoreError::ExportFailed(format!(
+            "{context} total pixel count {total} ({w}x{h}) exceeds maximum {MAX_IMAGE_TOTAL_PIXELS}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_export_profile_preflight(profile: &ExportProfile) -> Result<(), CoreError> {
+    match profile {
+        ExportProfile::VttToken(opts) => {
+            if !(MIN_VTT_TOKEN_SIZE_PX..=MAX_VTT_TOKEN_SIZE_PX).contains(&opts.size_px) {
+                return Err(CoreError::ExportFailed(format!(
+                    "vtt_token size_px ({}) must be within {MIN_VTT_TOKEN_SIZE_PX}..={MAX_VTT_TOKEN_SIZE_PX}",
+                    opts.size_px
+                )));
+            }
+            let _ = parse_hex_rgb(&opts.ring_color_hex)?;
+            if let Some(ref bg) = opts.jpeg_backdrop_hex {
+                let _ = parse_hex_rgb(bg)?;
+            }
+            Ok(())
         }
-    })
+        ExportProfile::VttMap(opts) => {
+            if opts.cols == 0 || opts.rows == 0 {
+                return Err(CoreError::ExportFailed(
+                    "vtt_map cols and rows must both be >= 1".to_string(),
+                ));
+            }
+            if let Some(factor) = opts.scale_factor {
+                if !factor.is_finite() || factor <= 0.0 || factor > f64::from(MAX_IMAGE_DIM) {
+                    return Err(CoreError::ExportFailed(format!(
+                        "vtt_map scale_factor ({factor}) must be finite and within (0.0, {MAX_IMAGE_DIM}]"
+                    )));
+                }
+            } else {
+                if opts.grid_px == 0 {
+                    return Err(CoreError::ExportFailed(
+                        "vtt_map grid_px must be >= 1".to_string(),
+                    ));
+                }
+                let target_w = opts.cols.checked_mul(opts.grid_px).ok_or_else(|| {
+                    CoreError::ExportFailed(format!(
+                        "vtt_map width overflow: cols ({}) * grid_px ({})",
+                        opts.cols, opts.grid_px
+                    ))
+                })?;
+                let target_h = opts.rows.checked_mul(opts.grid_px).ok_or_else(|| {
+                    CoreError::ExportFailed(format!(
+                        "vtt_map height overflow: rows ({}) * grid_px ({})",
+                        opts.rows, opts.grid_px
+                    ))
+                })?;
+                validate_export_dimensions(target_w, target_h, true, "vtt_map")?;
+            }
+            Ok(())
+        }
+        ExportProfile::WebWebp | ExportProfile::Grid2x2 => Ok(()),
+    }
 }
 
 fn flatten_rgba_to_rgb(src: &RgbaImage, bg: [u8; 3]) -> RgbImage {
@@ -914,6 +1028,7 @@ fn flatten_rgba_to_rgb(src: &RgbaImage, bg: [u8; 3]) -> RgbImage {
 }
 
 fn encode_jpeg_rgb(rgb: &RgbImage, quality: u8) -> Result<Vec<u8>, CoreError> {
+    validate_export_dimensions(rgb.width(), rgb.height(), true, "JPEG export")?;
     let q = quality.clamp(1, 100);
     let mut buf = Vec::new();
     let mut encoder = JpegEncoder::new_with_quality(&mut buf, q);
@@ -933,6 +1048,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
     use std::fs;
+    use std::path::Path;
 
     use image::ImageBuffer;
     use rstest::rstest;
@@ -1246,6 +1362,98 @@ mod tests {
     fn cube_lut_parser_rejects_malformed_entry_counts_fail_closed() {
         let bad_lut = "LUT_3D_SIZE 33\n0.0 0.0 0.0\n1.0 1.0 1.0\n";
         let err = CubeLut::parse(bad_lut).expect_err("truncated .cube LUT must fail closed");
+        assert!(matches!(err, CoreError::ExportFailed(_)));
+    }
+
+    #[rstest]
+    #[case::vtt_map_cols_grid_overflow(ExportProfile::VttMap(VttMapOptions {
+        cols: u32::MAX,
+        rows: 10,
+        grid_px: 140,
+        scale_factor: None,
+        jpeg_quality: 90,
+    }))]
+    #[case::vtt_map_rows_grid_overflow(ExportProfile::VttMap(VttMapOptions {
+        cols: 10,
+        rows: u32::MAX,
+        grid_px: 140,
+        scale_factor: None,
+        jpeg_quality: 90,
+    }))]
+    #[case::vtt_map_exceeds_max_axis_dim(ExportProfile::VttMap(VttMapOptions {
+        cols: 200,
+        rows: 10,
+        grid_px: 140,
+        scale_factor: None,
+        jpeg_quality: 90,
+    }))]
+    #[case::vtt_map_exceeds_total_pixels(ExportProfile::VttMap(VttMapOptions {
+        cols: 100,
+        rows: 100,
+        grid_px: 100,
+        scale_factor: None,
+        jpeg_quality: 90,
+    }))]
+    #[case::vtt_map_huge_scale_factor_no_saturation(ExportProfile::VttMap(VttMapOptions {
+        cols: 10,
+        rows: 10,
+        grid_px: 100,
+        scale_factor: Some(1e12),
+        jpeg_quality: 90,
+    }))]
+    #[case::vtt_map_infinite_scale_factor(ExportProfile::VttMap(VttMapOptions {
+        cols: 10,
+        rows: 10,
+        grid_px: 100,
+        scale_factor: Some(f64::INFINITY),
+        jpeg_quality: 90,
+    }))]
+    #[case::vtt_map_scaled_axis_exceeds_max_dim(ExportProfile::VttMap(VttMapOptions {
+        cols: 10,
+        rows: 10,
+        grid_px: 100,
+        scale_factor: Some(500.0),
+        jpeg_quality: 90,
+    }))]
+    #[case::vtt_token_size_below_min(ExportProfile::VttToken(VttTokenOptions {
+        size_px: 15,
+        ..VttTokenOptions::default()
+    }))]
+    #[case::vtt_token_size_above_max(ExportProfile::VttToken(VttTokenOptions {
+        size_px: MAX_VTT_TOKEN_SIZE_PX + 1,
+        ..VttTokenOptions::default()
+    }))]
+    #[case::vtt_token_size_u32_max(ExportProfile::VttToken(VttTokenOptions {
+        size_px: u32::MAX,
+        ..VttTokenOptions::default()
+    }))]
+    fn export_rejects_overflowing_and_oversized_dimensions_fail_closed(
+        #[case] profile: ExportProfile,
+    ) {
+        let root = TempDir::new().unwrap();
+        let store = seed_run(
+            root.path(),
+            "harbor-dock",
+            Visibility::Public,
+            64,
+            64,
+            [90, 110, 130, 255],
+        );
+        let err = execute_export(
+            Some(&store),
+            &ExportRequest {
+                source: ExportSource::Run {
+                    slug: "harbor-dock".to_string(),
+                    version: 1,
+                },
+                output_slug: "harbor-dock".to_string(),
+                profile_visibility: Visibility::Public,
+                out_dir: root.path().join("exports"),
+                profile,
+                match_grade: None,
+            },
+        )
+        .expect_err("oversized or overflowing Export profile must fail closed");
         assert!(matches!(err, CoreError::ExportFailed(_)));
     }
 }
