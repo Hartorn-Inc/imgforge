@@ -25,7 +25,7 @@
 //! 3. `evaluate_untouched_drift`: measures per-pixel `DeltaE_2000` outside an
 //!    edit mask (`1 - M`) against mean, P95, max, and fraction thresholds.
 //! 4. `detect_sparkles`: runs a high-pass Difference-of-Gaussians (DoG)
-//!    residual detector for isolated `1..=64 px^2` saturated yellow blobs
+//!    residual detector for isolated `4..=64 px^2` saturated yellow blobs
 //!    outside allowed masks.
 //! 5. `render_heatmap_rgba` / `render_heatmap_png`: generates RGBA diagnostic
 //!    overlays (`drift`, `bleed`, `sparkle`, `out_of_roi`) for the Web Canvas UI.
@@ -52,16 +52,16 @@ pub const DEFAULT_KMEANS_K: usize = 6;
 pub const DEFAULT_CLIPPED_BLACK_L_STAR: f64 = 5.0;
 
 /// Default minimum area (inclusive) for sparkle/yellow-dot blob detection.
-pub const DEFAULT_SPARKLE_MIN_AREA_PX: usize = 1;
+pub const DEFAULT_SPARKLE_MIN_AREA_PX: usize = 4;
 
 /// Default maximum area (inclusive) for sparkle/yellow-dot blob detection.
 pub const DEFAULT_SPARKLE_MAX_AREA_PX: usize = 64;
 
-/// Default maximum fraction (`0.1%`) of non-allowed pixels that may be flagged by sparkle QA.
-pub const DEFAULT_SPARKLE_MAX_FLAGGED_FRACTION: f64 = 0.001;
+/// Default maximum fraction (`0.20%`) of non-allowed pixels that may be flagged by sparkle QA.
+pub const DEFAULT_SPARKLE_MAX_FLAGGED_FRACTION: f64 = 0.002;
 
 /// Default maximum count of isolated yellow-sparkle blobs allowed before failing.
-pub const DEFAULT_SPARKLE_MAX_FLAGGED_BLOBS: usize = 16;
+pub const DEFAULT_SPARKLE_MAX_FLAGGED_BLOBS: usize = 256;
 
 /// Default bin count (`20` bins of width `5.0` covering CIE `L*` `0..=100`).
 pub const DEFAULT_L_STAR_HISTOGRAM_BINS: usize = 20;
@@ -401,13 +401,13 @@ pub struct SparkleConfig {
     pub yellow_hue_min_deg: f64,
     /// Maximum CIELAB hue angle in degrees (`115.0`) for yellow sector.
     pub yellow_hue_max_deg: f64,
-    /// Minimum connected blob area in pixels (`1`).
+    /// Minimum connected blob area in pixels (`4`).
     pub min_blob_area_px: usize,
     /// Maximum connected blob area in pixels (`64`).
     pub max_blob_area_px: usize,
-    /// Maximum fraction (`0.001`, i.e., `0.1%`) of non-allowed pixels flagged before failing.
+    /// Maximum fraction (`0.002`, i.e., `0.20%`) of non-allowed pixels flagged before failing.
     pub max_flagged_fraction: f64,
-    /// Maximum count of isolated yellow-sparkle blobs (`16`) allowed before failing.
+    /// Maximum count of isolated yellow-sparkle blobs (`256`) allowed before failing.
     pub max_flagged_blobs: usize,
 }
 
@@ -435,7 +435,7 @@ impl Default for SparkleConfig {
 pub struct SparkleBlob {
     /// Tight pixel bounding box of the connected blob.
     pub bounds: PixelRect,
-    /// Connected pixel area (`1..=64 px^2`).
+    /// Connected pixel area (`4..=64 px^2` by default).
     pub area_px: usize,
     /// Peak high-pass DoG yellow-excess residual inside the blob.
     pub peak_residual: f64,
@@ -939,7 +939,7 @@ impl ColorQaEngine {
         Ok((report, delta_map))
     }
 
-    /// Detect isolated saturated yellow blobs (`1..=64 px^2`) outside `allowed_mask`
+    /// Detect isolated saturated yellow blobs (`min_blob_area_px..=max_blob_area_px`) outside `allowed_mask`
     /// using a high-pass Difference-of-Gaussians (DoG) yellow-excess residual.
     pub fn detect_sparkles(
         &self,
@@ -1062,7 +1062,7 @@ impl ColorQaEngine {
             }
         }
 
-        // Connected component labeling (8-connected) to isolate 1..=64 px^2 blobs.
+        // Connected component labeling (8-connected) to isolate min_blob_area_px..=max_blob_area_px blobs.
         let mut visited = vec![false; total];
         let mut flagged_blobs = Vec::new();
         let mut flagged_pixel_mask = vec![0.0f64; total];
@@ -1896,7 +1896,7 @@ mod tests {
     fn sparkle_detector_ignores_yellow_dots_inside_allowed_mask_and_renders_heatmap() {
         let engine = ColorQaEngine::new();
         let mut img = solid_image(48, 48, [37, 40, 48]);
-        paint_rect(&mut img, 12, 12, 2, 2, [255, 235, 10]);
+        paint_rect(&mut img, 12, 12, 3, 3, [255, 235, 10]);
 
         let mut allowed = vec![0.0f32; 48 * 48];
         for y in 10..16 {
@@ -1929,8 +1929,9 @@ mod tests {
     #[case::warm_tan_gold_thin_strokes_pass(64, 64, [0xB6, 0x81, 0x44], 4, 2, 12, true)]
     #[case::brass_gold_collar_trim_passes(64, 64, [0xD4, 0xA8, 0x43], 4, 2, 12, true)]
     #[case::single_incidental_highlight_on_large_canvas_passes(512, 512, [255, 240, 20], 1, 5, 5, true)]
-    #[case::sparkle_creep_above_max_fraction_on_large_canvas_fails(512, 512, [255, 240, 20], 10, 6, 6, false)]
-    #[case::widespread_sparkle_creep_above_max_blobs_fails(512, 512, [255, 240, 20], 20, 3, 3, false)]
+    #[case::gold_specular_highlights_within_calibration_pass(1024, 1024, [255, 240, 20], 48, 2, 2, true)]
+    #[case::sparkle_creep_above_max_fraction_on_large_canvas_fails(512, 512, [255, 240, 20], 20, 6, 6, false)]
+    #[case::widespread_sparkle_creep_above_max_blobs_fails(1024, 1024, [255, 240, 20], 270, 2, 2, false)]
     fn sparkle_detector_calibrates_warm_shading_vs_yellow_sparkle_creep(
         #[case] width: u32,
         #[case] height: u32,

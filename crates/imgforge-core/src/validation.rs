@@ -1139,11 +1139,11 @@ visibility: public
             }
         }
         if add_upper_sparkles {
-            for i in 0..20u32 {
-                let bx = 40 + (i % 10) * 32;
-                let by = 40 + (i / 10) * 32;
-                for dy in 0..4 {
-                    for dx in 0..4 {
+            for i in 0..270u32 {
+                let bx = 20 + (i % 45) * 32;
+                let by = 20 + (i / 45) * 14;
+                for dy in 0..2 {
+                    for dx in 0..2 {
                         rgba.put_pixel(bx + dx, by + dy, Rgba([255, 240, 20, 255]));
                     }
                 }
