@@ -1,0 +1,32 @@
+schema_version: 1
+id: multi-actor-metric-scale
+title: Multi-Actor Metric Height Scale and Bounding Box Alignment
+kind: spatial_guide
+target_image_path: eval/fixtures/multi_actor_blockout.png
+guide_spec_path: eval/fixtures/multi_actor_blockout.json
+expected_subject_bboxes:
+  - id: actor-tall
+    pixel_rect:
+      x: 64
+      y: 120
+      width: 29
+      height: 95
+    expected_height_ratio: 0.3711
+  - id: actor-compact
+    pixel_rect:
+      x: 175
+      y: 154
+      width: 17
+      height: 61
+    expected_height_ratio: 0.2383
+prompt: Stage the tall sentinel on the left and the compact scout on the right matching the Blockout metric proportions.
+strategies:
+  - blockout_guide
+  - whole_image_fix
+trials: 1
+pairwise_traits:
+  - Left figure is noticeably taller than the right figure in proportion to 2.0m versus 1.2m
+  - Both figures stay aligned inside their left and right staging columns
+strategy_fixtures:
+  blockout_guide: eval/fixtures/multi_actor_blockout.png
+  whole_image_fix: eval/fixtures/multi_actor_unscaled.png

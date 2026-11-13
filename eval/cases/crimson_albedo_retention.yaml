@@ -1,0 +1,33 @@
+schema_version: 1
+id: crimson-albedo-retention
+title: Deep Crimson Albedo Retention Without Scarlet Drift
+kind: color_qa
+target_image_path: eval/fixtures/crimson_target.png
+expected_baseline_path: eval/fixtures/crimson_target.png
+roi:
+  x: 32
+  y: 32
+  width: 64
+  height: 64
+atmosphere_slug: neutral-studio
+palette_lock:
+  swatches:
+    - name: crimson_banner
+      color_hex: "#5A1218"
+      surface_slot: banner
+forbidden_hue_sectors:
+  - name: bright-scarlet-orange
+    min_hue_deg: 28.0
+    max_hue_deg: 65.0
+    min_chroma: 35.0
+    max_fraction: 0.02
+prompt: Preserve deep crimson #5A1218 textile albedo inside the central banner without warm orange drift.
+strategies:
+  - patch_crop_only
+  - whole_image_fix
+trials: 1
+pairwise_traits:
+  - Central banner retains deep crimson #5A1218 value without drifting toward bright scarlet or orange
+strategy_fixtures:
+  patch_crop_only: eval/fixtures/crimson_target.png
+  whole_image_fix: eval/fixtures/crimson_whole_drift.png

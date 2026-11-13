@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "1.0",
+  "id": "trajectory-overlay-001",
+  "title": "Diagonal Trajectory Vector OverlayGuide",
+  "variant": "OverlayGuide",
+  "targetImagePath": "eval/fixtures/trajectory_target.png",
+  "canvasWidth": 128,
+  "canvasHeight": 128,
+  "depthBands": [],
+  "mannequins": [],
+  "actionVectors": [
+    {
+      "id": "ray-vector-1",
+      "label": "Primary Trajectory Vector",
+      "fromXRatio": 0.18,
+      "fromYRatio": 0.82,
+      "toXRatio": 0.82,
+      "toYRatio": 0.18,
+      "strokeHex": "#F6AD55",
+      "haloHex": "#1A1D24",
+      "strokeWidthPx": 4.0,
+      "style": "solid"
+    }
+  ],
+  "overlayRegions": []
+}

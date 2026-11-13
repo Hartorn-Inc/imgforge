@@ -1,0 +1,22 @@
+schema_version: 1
+id: surface-detail-preservation
+title: Surface Detail Preservation Outside Patch ROI
+kind: edit_strategy
+target_image_path: eval/fixtures/surface_detail_target.png
+expected_baseline_path: eval/fixtures/surface_detail_baseline.png
+roi:
+  x: 44
+  y: 44
+  width: 40
+  height: 40
+prompt: Render a polished brass clasp inside the central ROI while keeping the surrounding tiled background identical.
+strategies:
+  - whole_image_fix
+  - patch_crop_only
+trials: 1
+pairwise_traits:
+  - Surrounding tile pattern outside the central ROI preserves crisp detail without tonal drift
+  - Perimeter transition around the central clasp is smooth without visible rectangular seams
+strategy_fixtures:
+  whole_image_fix: eval/fixtures/surface_detail_whole_seam.png
+  patch_crop_only: eval/fixtures/surface_detail_baseline.png

@@ -1,0 +1,30 @@
+schema_version: 1
+id: straight-blade-patch
+title: Straight Blade Geometry via PatchEdit
+kind: edit_strategy
+target_image_path: eval/fixtures/straight_blade_target.png
+expected_baseline_path: eval/fixtures/straight_blade_baseline.png
+mask_path: eval/fixtures/straight_blade_mask.png
+roi:
+  x: 24
+  y: 24
+  width: 80
+  height: 80
+expected_line_roi:
+  x: 28
+  y: 28
+  width: 72
+  height: 72
+prompt: Straighten the metallic blade edge into a crisp geometric diagonal while keeping surrounding stonework unchanged.
+strategies:
+  - whole_image_fix
+  - patch_blank_inside_mask
+  - patch_cue_outline
+trials: 1
+pairwise_traits:
+  - Blade silhouette forms a straight rigid edge without curvature
+  - Masonry border outside the edited mask remains identical to the original
+strategy_fixtures:
+  whole_image_fix: eval/fixtures/straight_blade_whole_drift.png
+  patch_blank_inside_mask: eval/fixtures/straight_blade_baseline.png
+  patch_cue_outline: eval/fixtures/straight_blade_baseline.png

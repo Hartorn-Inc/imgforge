@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "1.0",
+  "id": "multi-actor-blockout-001",
+  "title": "Two-Actor Metric Scale Blockout",
+  "variant": "Blockout",
+  "targetImagePath": null,
+  "canvasWidth": 256,
+  "canvasHeight": 256,
+  "depthBands": [
+    {
+      "id": "band-bg",
+      "label": "Background Horizon",
+      "plane": "background",
+      "yStartRatio": 0.0,
+      "yEndRatio": 0.45,
+      "fillHex": "#2C3344"
+    },
+    {
+      "id": "band-fg",
+      "label": "Foreground Stage",
+      "plane": "foreground",
+      "yStartRatio": 0.45,
+      "yEndRatio": 1.0,
+      "fillHex": "#4A5164"
+    }
+  ],
+  "mannequins": [
+    {
+      "id": "actor-tall",
+      "subjectSlug": "sentinel-alpha",
+      "label": "Tall Sentinel (2.0m)",
+      "xRatio": 0.3,
+      "yRatio": 0.85,
+      "heightMeters": 2.0,
+      "scaleFactor": 1.0,
+      "facing": "right",
+      "poseHint": "Standing upright facing right",
+      "paletteHex": "#63B3ED"
+    },
+    {
+      "id": "actor-compact",
+      "subjectSlug": "scout-beta",
+      "label": "Compact Scout (1.2m)",
+      "xRatio": 0.72,
+      "yRatio": 0.85,
+      "heightMeters": 1.2,
+      "scaleFactor": 1.0,
+      "facing": "left",
+      "poseHint": "Ready stance facing left",
+      "paletteHex": "#F6AD55"
+    }
+  ],
+  "actionVectors": [],
+  "overlayRegions": []
+}

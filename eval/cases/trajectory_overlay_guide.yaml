@@ -1,0 +1,22 @@
+schema_version: 1
+id: trajectory-overlay-guide
+title: Trajectory Vector Alignment via OverlayGuide
+kind: spatial_guide
+target_image_path: eval/fixtures/trajectory_target.png
+expected_baseline_path: eval/fixtures/trajectory_aligned.png
+guide_spec_path: eval/fixtures/trajectory_overlay.json
+expected_line_roi:
+  x: 20
+  y: 20
+  width: 88
+  height: 88
+prompt: Render a straight golden light beam along the OverlayGuide trajectory connecting both anchor markers.
+strategies:
+  - overlay_guide
+  - whole_image_fix
+trials: 1
+pairwise_traits:
+  - Trajectory beam follows a straight diagonal vector between the lower-left and upper-right anchors
+strategy_fixtures:
+  overlay_guide: eval/fixtures/trajectory_aligned.png
+  whole_image_fix: eval/fixtures/trajectory_curved.png
