@@ -61,7 +61,7 @@ Both edit paths verify `Visibility` across target image, optional mask PNG, refe
 
 ---
 
-## `PatchEdit` & `Export` Decision Flow
+## `PatchEdit` & `Export` Decision Flow & Extension Checklist
 
 ```text
   Edit Needed?
@@ -74,3 +74,10 @@ Both edit paths verify `Visibility` across target image, optional mask PNG, refe
   Deliverable Needed?
     └── Export (run_slug:ver or input) ──> Visibility gate -> optional --match-grade -> Profile PNG/JPG/WebP
 ```
+
+**Adding a `ColorQaEngine` detector/heatmap, `GuideRenderer` cue, or `ExportProfile`:**
+
+1. **Color QA (`crates/imgforge-core/src/color_qa.rs`):** Add new read-only detector metrics or `HeatmapKind` variants without mutating whole-image pixels, and surface failures through `ColorQaReport`.
+2. **Spatial Guidance (`crates/imgforge-core/src/guide_renderer.rs`):** Update `GuideSpec` (`#[serde(deny_unknown_fields)]`) and `GuideRenderer::render` in lockstep with `frontend/src/types/guideSpec.ts` and deterministic `tiny-skia`/`resvg` vector drawing.
+3. **Export (`crates/imgforge-core/src/export.rs`):** Add the `ExportProfile` variant and deterministic encoder in `execute_export` behind `check_visibility_compatibility`, keeping grading strictly gated behind explicit `--match-grade`.
+4. **CLI/MCP & Tests:** Expose any new profile or flag in `crates/imgforge-cli/src/main.rs` and `mcp.rs`, then add parametrized tests verifying fail-closed invariants and byte-deterministic output.

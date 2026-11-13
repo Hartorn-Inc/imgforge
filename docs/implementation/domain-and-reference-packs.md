@@ -2,7 +2,7 @@
 
 Companion implementation reference for style-neutral `Subject`s, first-class `Style`s and `Atmosphere`s, `Visibility` isolation, `project > user > builtin` precedence, `Lifecycle` + `manifest.lock.json`, style-scoped `ReferencePack` pipelines, host calibration strips, bounding-box slicing, and dynamic `Atlas` packing ([ADR 0003](../adr/0003-style-scoped-reference-packs.md), [ADR 0005](../adr/0005-host-composited-calibration-and-fail-closed-color-qa.md)).
 
-## Entity, Precedence & Chain Comparison
+## Domain Schema, Precedence & Chain Comparison
 
 | Concept | Storage Location | Precedence / Scope | Key Invariants | Source |
 |---|---|---|---|---|
@@ -52,7 +52,7 @@ Every container and card directory is verified with `verify_optional_contained_d
 
 ---
 
-## ReferencePack & Promotion Flow
+## ReferencePack Flow & Extension Checklist
 
 ```text
   Subject card.yaml + Style card.yaml (+ optional Seed PNG)
@@ -68,3 +68,10 @@ Every container and card directory is verified with `verify_optional_contained_d
          ▼  validate_reference_pack (SHA-256 + swatch DeltaE<=0.5 + sparkle QA + VisionCritic)
   Lifecycle::Validated ──> promote_reference_pack ──> Lifecycle::Canonical (manifest.lock.json)
 ```
+
+**Adding a built-in `Style`/`Atmosphere` preset or a `ReferenceSheetRole`:**
+
+1. Register any new built-in preset slug in `BUILTIN_STYLE_SLUGS` or `BUILTIN_ATMOSPHERE_SLUGS`, define its positive-only card in `builtin_style`/`builtin_atmosphere`, and add a deterministic PNG entry to `exemplar_cache` in `crates/imgforge-core/src/presets.rs`.
+2. Add any new sheet variant to `ReferenceSheetRole` (`filename`, `slice_prefix`) and wire its generation step inside `ReferencePackPipeline::generate` in `crates/imgforge-core/src/reference_pack.rs`.
+3. Update `validate_reference_pack` in `crates/imgforge-core/src/validation.rs` and `slicer.rs` `sheet_overrides` handling if the new role changes sheet counts or slicing rules.
+4. Add parametrized unit tests covering preset validation, `LibraryRegistry` precedence, and sheet slicing/validation in `crates/imgforge-core`.

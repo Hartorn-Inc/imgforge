@@ -15,7 +15,7 @@ When choosing exact CLI flags, MCP parameters, or resource payloads, read [`CLI-
    `--workspace <PATH>` > non-empty `IMGFORGE_WORKSPACE` > nearest `imgforge.toml` ascending from CWD.
    An invalid `--workspace` or `IMGFORGE_WORKSPACE` fails closed without falling back to CWD.
 2. **Tool-local OAuth (`imgforge auth`)** stores credentials at `$XDG_DATA_HOME/imgforge/codex/auth.json` (only when `$XDG_DATA_HOME` is non-empty and absolute; else `$HOME/.local/share/imgforge/codex/auth.json`) with `0700` directory and `0600` file permissions.
-   - Verify readiness via `imgforge auth status` (or `imgforge status`); provision via `imgforge auth login [--device-auth]`.
+   - Verify readiness via `imgforge auth status` (or `imgforge status` inside a workspace); provision via `imgforge auth login [--device-auth]`.
    - `CodexNativeBackend`, `SceneComposer`, and `VisionCritic` never read `~/.codex/auth.json` or `OPENAI_API_KEY`; each invocation materializes a private `TempCodexHome` and removes it on completion.
 3. **Library precedence** resolves `Subject`, `Style`, and `Atmosphere` cards strictly in order:
    `project` (`<workspace>/library/...`) > `user` (`$XDG_CONFIG_HOME/imgforge/...` or `$HOME/.config/imgforge/...`) > `builtin` (`Style` and `Atmosphere` only; `Subject` has no built-ins).
@@ -30,7 +30,7 @@ Pick the entry path that matches the task:
 
 Follow this progression for consistent multi-asset production:
 
-1. **Inspect workspace state:** Read MCP resources `imgforge://subjects`, `imgforge://styles-atmospheres`, `imgforge://manifest`, and `imgforge://runs` (or run `imgforge library list` and `imgforge status`).
+1. **Inspect workspace state:** Read MCP resources `imgforge://subjects`, `imgforge://styles-atmospheres`, `imgforge://manifest`, and `imgforge://runs` (or run `imgforge library list`, `imgforge run list`, and `imgforge status`).
 2. **Explore or bootstrap (optional):** Use `generate` in `explore` mode (`--explore` / `explore: true`) to iterate on a `Style`, `Atmosphere`, or `SceneSpec` with `0` references before committing to a `ReferencePack`. An approved `explore` `Run` PNG can serve as a `Seed` input.
 3. **Build a style-scoped `ReferencePack`:** Run `pack` (`action: "generate"` / `imgforge pack generate --subject <S> --style <ST> [--seed <PNG>]`).
    - `character` and `creature` subjects execute a **2-step anchor chain**: Step 1 renders `turnaround.png` (`1536x1024`, `#252830` backdrop, optional `Seed`), and Step 2 anchors `poses_expressions.png` and `inventory_flatlay.png` on `turnaround.png` plus `Style` exemplars.
@@ -40,7 +40,7 @@ Follow this progression for consistent multi-asset production:
 4. **Constrain complex staging with `SpatialGuide`:** Author a `GuideSpec` (`schemaVersion: "1.0"`) for `Blockout` (depth-band zones, scaled `resvg` `Subject` mannequins, `ActionVector`s) or `OverlayGuide` (haloed vector cues over an existing workspace PNG), render via `guide` (`action: "render"`), and pass the PNG to `generate` (`--spatial-guide` / `spatial_guide_path`).
 5. **Generate and inspect `Run`s:** Run `generate` to record `runs/<slug>/vNNN.png` and `vNNN.meta.json`.
    - `ColorQaEngine` runs fail-closed checks on `Atmosphere.exposure_floor` (`mean L*`, `P10 L*`, clipped black `L* < 5.0`), `PaletteLock` OKLab k-means (`K = 6`) + forbidden-hue bleed, and high-pass DoG yellow-sparkle blobs (`1..=64 px^2`).
-   - Whole-image QA never silently re-grades generated images; passing runs advance to `candidate`, while failing runs record as `draft` (or error unless `--allow-qa-fail` / `allow_qa_fail: true`).
+   - Whole-image QA never silently re-grades generated images; passing runs advance to `candidate` (unless `--draft` / `draft: true` is passed), while failing runs are recorded as `draft` and fail closed unless `--allow-qa-fail` / `allow_qa_fail: true` is set.
 6. **Refine targeted defects (`WholeImageEdit` vs `PatchEdit`):**
    - Use **`PatchEdit`** (`edit` `mode: "patch"`) for localized fixes (`roi` or `mask_path`). It extracts a `1:1` square crop with a `16..=32 px` collar, optionally applies `crop_only`, `blank_inside_mask` (`#252830`), or `cue_outline`, invokes `ImageBackend` at `WxW`, harmonizes tone/color via collar OKLab Reinhard transfer clamped to `[0.75, 1.35]`, blends with cosine distance-transform feathering and a 5-level Laplacian pyramid, and verifies zero `DeltaE_2000` drift outside the footprint.
    - Use **`WholeImageEdit`** (`edit` `mode: "whole"`) only for global adjustments; it enforces `ColorQaEngine` fail-closed without mutating untouched pixels or re-grading.

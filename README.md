@@ -56,7 +56,8 @@ Running the compiled binary natively on the WSL2 host enables:
 Provision tool-local ChatGPT Plus OAuth credentials before running generation commands:
 
 ```bash
-./target/release/imgforge auth
+./target/release/imgforge auth login           # Interactive browser OAuth (add --device-auth for headless flows)
+./target/release/imgforge auth status          # Verify local auth.json integrity and login readiness
 ```
 
 Credentials are stored exclusively at `$XDG_DATA_HOME/imgforge/codex/auth.json` (default `~/.local/share/imgforge/codex/auth.json`) with `0600` file permissions (`0700` on parent directories). During each `CodexNativeBackend` invocation, `imgforge` materializes a private `0600` copy inside a fresh temporary `CODEX_HOME` directory and cleans it up when the run completes.
