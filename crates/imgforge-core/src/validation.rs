@@ -33,14 +33,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use image::RgbaImage;
+use palette::{Lab, white_point::D65};
 use serde::{Deserialize, Serialize};
 
 use crate::calibration::{
-    StructuralValidationConfig, parse_hex_rgb, validate_reference_sheet_structure,
+    StructuralValidationConfig, parse_hex_rgb, studio_bg_distance,
+    validate_reference_sheet_structure,
 };
 use crate::color_qa::{
     ColorQaEngine, ColorQaReport, ExposureQaConfig, PaletteQaConfig, SparkleConfig, SubjectRoiSpec,
-    srgb_delta_e_2000,
+    delta_e_2000, srgb_delta_e_2000, srgb_u8_to_lab,
 };
 use crate::critic::{
     CriticReport, TraitCategory, TraitCheckInput, VisionCritic, VisionCriticRequest,
@@ -49,7 +52,9 @@ use crate::edit::OwnedSubjectRoi;
 use crate::error::CoreError;
 use crate::generate::SubjectRoiBinding;
 use crate::lifecycle::{Lifecycle, sha256_hex, validate_slug};
-use crate::reference_pack::{REFERENCE_SHEET_HEIGHT, REFERENCE_SHEET_WIDTH, ReferencePackManifest};
+use crate::reference_pack::{
+    REFERENCE_SHEET_HEIGHT, REFERENCE_SHEET_WIDTH, ReferencePackManifest, ReferenceSheetRole,
+};
 use crate::registry::{LibraryRegistry, inspect_asset_image_visibility};
 use crate::scene_spec::check_visibility_compatibility;
 use crate::slicer::SlicesManifest;
@@ -408,6 +413,8 @@ pub async fn validate_reference_pack(
     let mut checks = Vec::new();
     let qa_engine = ColorQaEngine::new();
     let mut primary_sheet_path: Option<PathBuf> = None;
+    let mut turnaround_sheet: Option<(PathBuf, RgbaImage, u32, String)> = None;
+    let mut poses_sheet: Option<(PathBuf, RgbaImage, u32, String)> = None;
 
     // 1. Verify every sheet PNG, structural #252830 coverage, calibration swatches, and sparkle QA.
     for sheet in &manifest.sheets {
@@ -484,6 +491,26 @@ pub async fn validate_reference_pack(
             )));
         }
 
+        match sheet.role {
+            ReferenceSheetRole::Turnaround => {
+                turnaround_sheet = Some((
+                    sheet_path,
+                    rgba,
+                    sheet.calibration_strip.strip_y,
+                    sheet.filename.clone(),
+                ));
+            }
+            ReferenceSheetRole::PosesExpressions => {
+                poses_sheet = Some((
+                    sheet_path,
+                    rgba,
+                    sheet.calibration_strip.strip_y,
+                    sheet.filename.clone(),
+                ));
+            }
+            ReferenceSheetRole::InventoryFlatlay | ReferenceSheetRole::SingleSheet => {}
+        }
+
         checks.push(format!(
             "sheet '{}' OK ({}x{}, bg={:.1}%, swatches={}, {} sparkles)",
             sheet.filename,
@@ -492,6 +519,36 @@ pub async fn validate_reference_pack(
             structural.bg_coverage * 100.0,
             sheet.calibration_strip.palette_swatch_cells.len(),
             sparkle_rep.flagged_blobs.len()
+        ));
+    }
+
+    // 1b. Deterministic cross-sheet foreground color consistency check (poses_expressions vs turnaround).
+    if let (
+        Some((_, turn_rgba, turn_strip_y, turn_name)),
+        Some((_, poses_rgba, poses_strip_y, poses_name)),
+    ) = (&turnaround_sheet, &poses_sheet)
+    {
+        let turn_lab = compute_foreground_mean_lab(
+            turn_rgba,
+            *turn_strip_y,
+            request.structural_config.bg_color_tolerance,
+            turn_name,
+        )?;
+        let poses_lab = compute_foreground_mean_lab(
+            poses_rgba,
+            *poses_strip_y,
+            request.structural_config.bg_color_tolerance,
+            poses_name,
+        )?;
+        let mean_l_shift = f64::from((poses_lab.l - turn_lab.l).abs());
+        let mean_color_delta_e = delta_e_2000(turn_lab, poses_lab);
+        if mean_l_shift > 10.0 || mean_color_delta_e > 10.0 {
+            return Err(CoreError::ColorQaFailed(format!(
+                "cross-sheet color drift between '{poses_name}' and '{turn_name}' exceeds threshold (dL*={mean_l_shift:.2}, dE00={mean_color_delta_e:.2}, max=10.00)"
+            )));
+        }
+        checks.push(format!(
+            "cross-sheet color OK (poses vs turnaround: dL*={mean_l_shift:.2}, dE00={mean_color_delta_e:.2})"
         ));
     }
 
@@ -578,6 +635,42 @@ pub async fn validate_reference_pack(
             });
         }
         checks.push("VisionCritic OK".to_string());
+
+        if request.traits.is_empty()
+            && let (Some((turnaround_path, _, _, _)), Some((poses_path, _, _, _))) =
+                (&turnaround_sheet, &poses_sheet)
+        {
+            let poses_traits = vec![
+                TraitCheckInput {
+                    trait_id: "pose-color-identity".to_string(),
+                    category: TraitCategory::Identity,
+                    criterion: "All poses and facial portraits match the turnaround reference's exact garment base colors, hair tone, and facial identity under neutral studio lighting".to_string(),
+                },
+                TraitCheckInput {
+                    trait_id: "zero-leaked-text".to_string(),
+                    category: TraitCategory::ZeroLeakedText,
+                    criterion: "No stray text, labels, watermarks, or captions appear on the sheet".to_string(),
+                },
+            ];
+            let poses_report = vc
+                .evaluate(&VisionCriticRequest {
+                    target_image: poses_path.clone(),
+                    reference_images: vec![turnaround_path.clone()],
+                    traits: poses_traits,
+                })
+                .await?;
+            if !poses_report.passed {
+                return Err(CoreError::StructuredOutputInvalid {
+                    stage: "VisionCritic",
+                    reason: format!(
+                        "ReferencePack '{pack_id}' poses_expressions failed VisionCritic: {}",
+                        poses_report.summary
+                    ),
+                });
+            }
+            checks.push("VisionCritic poses_expressions OK".to_string());
+        }
+
         Some(report)
     } else {
         None
@@ -598,6 +691,50 @@ pub async fn validate_reference_pack(
         checks,
         critic_report,
     })
+}
+
+fn compute_foreground_mean_lab(
+    rgba: &RgbaImage,
+    strip_y: u32,
+    bg_color_tolerance: f64,
+    sheet_filename: &str,
+) -> Result<Lab<D65, f32>, CoreError> {
+    let max_y = strip_y.min(rgba.height());
+    let mut sum_l = 0.0f64;
+    let mut sum_a = 0.0f64;
+    let mut sum_b = 0.0f64;
+    let mut count = 0usize;
+
+    for y in 0..max_y {
+        for x in 0..rgba.width() {
+            let px = rgba.get_pixel(x, y).0;
+            if px[3] == 0 {
+                continue;
+            }
+            let rgb = [px[0], px[1], px[2]];
+            if studio_bg_distance(rgb) <= bg_color_tolerance {
+                continue;
+            }
+            let lab = srgb_u8_to_lab(rgb);
+            sum_l += f64::from(lab.l);
+            sum_a += f64::from(lab.a);
+            sum_b += f64::from(lab.b);
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return Err(CoreError::ColorQaFailed(format!(
+            "sheet '{sheet_filename}' contains zero non-background foreground pixels above calibration strip"
+        )));
+    }
+
+    let n = count as f64;
+    Ok(Lab::new(
+        (sum_l / n) as f32,
+        (sum_a / n) as f32,
+        (sum_b / n) as f32,
+    ))
 }
 
 /// Promote a `Validated` `Run` to `Canonical` in `library/manifest.lock.json`,
@@ -1183,6 +1320,211 @@ visibility: public
             assert!(
                 matches!(err, CoreError::ColorQaFailed(_)),
                 "expected ColorQaFailed, got {err:?}"
+            );
+        }
+    }
+
+    fn write_pack_critic_stub(dir: &Path, args_log: &Path) -> (PathBuf, PathBuf) {
+        let auth_dir = dir.join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&auth_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let auth_file = auth_dir.join("auth.json");
+        fs::write(&auth_file, r#"{"token":"ok"}"#).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let stub = dir.join("codex-pack-critic");
+        let script = format!(
+            r##"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n---\n' "$*" >> "{args_log}"
+ALL_ARGS="$*"
+OUT=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if printf '%s\n' "$ALL_ARGS" | grep -q "pose-color-identity"; then
+  cat <<'JSON' > "$OUT"
+{{"schema_version":1,"passed":true,"checks":[{{"trait_id":"pose-color-identity","category":"identity","passed":true,"observation":"poses match turnaround colors"}},{{"trait_id":"zero-leaked-text","category":"zero_leaked_text","passed":true,"observation":"clean"}}],"summary":"step 2 ok"}}
+JSON
+elif printf '%s\n' "$ALL_ARGS" | grep -q "style-adherence"; then
+  cat <<'JSON' > "$OUT"
+{{"schema_version":1,"passed":true,"checks":[{{"trait_id":"zero-leaked-text","category":"zero_leaked_text","passed":true,"observation":"clean"}},{{"trait_id":"style-adherence","category":"style_adherence","passed":true,"observation":"style matches"}}],"summary":"step 1 ok"}}
+JSON
+else
+  cat <<'JSON' > "$OUT"
+{{"schema_version":1,"passed":true,"checks":[{{"trait_id":"zero-leaked-text","category":"zero_leaked_text","passed":true,"observation":"clean"}}],"summary":"ok"}}
+JSON
+fi
+"##,
+            args_log = args_log.display()
+        );
+        fs::write(&stub, script).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        (auth_dir, stub)
+    }
+
+    #[rstest]
+    #[case::matching_colors_without_critic_passes(None, false, true)]
+    #[case::matching_colors_with_critic_invokes_step2_turnaround_anchor(None, true, true)]
+    #[case::warmer_darker_poses_shift_fails_closed_before_critic(Some([75, 42, 24]), true, false)]
+    #[tokio::test]
+    async fn validate_reference_pack_gates_cross_sheet_color_and_runs_step2_critic(
+        #[case] override_poses_fg: Option<[u8; 3]>,
+        #[case] run_critic: bool,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        let ws = root.path();
+        let library_dir = ws.join("library");
+        let subj_dir = library_dir.join("subjects/courier-ren");
+        fs::create_dir_all(&subj_dir).unwrap();
+        fs::write(
+            subj_dir.join("card.yaml"),
+            r##"schema_version: 1
+kind: character
+slug: courier-ren
+display_name: Courier Ren
+height_m: 1.74
+exclusive_surface_map:
+  bindings:
+    - slot: coat
+      material: waxed canvas
+      color_hex: "#2C3E50"
+palette_lock:
+  swatches:
+    - name: coat_slate
+      color_hex: "#2C3E50"
+      surface_slot: coat
+visibility: public
+"##,
+        )
+        .unwrap();
+
+        let registry = LibraryRegistry::new(Some(library_dir.clone()), None);
+        let pipeline =
+            ReferencePackPipeline::new(&MockPackBackend, &registry, None, library_dir.clone());
+        pipeline
+            .generate(&ReferencePackRequest::new(
+                "courier-ren",
+                "franco-belgian-line",
+            ))
+            .await
+            .unwrap();
+
+        let pack_dir = library_dir.join("subjects/courier-ren/packs/franco-belgian-line");
+        let pack_path = pack_dir.join("pack.json");
+
+        if let Some(fg_rgb) = override_poses_fg {
+            let mut manifest: ReferencePackManifest =
+                serde_json::from_slice(&fs::read(&pack_path).unwrap()).unwrap();
+            let poses_rec = manifest
+                .sheets
+                .iter_mut()
+                .find(|s| s.role == ReferenceSheetRole::PosesExpressions)
+                .expect("poses_expressions sheet present");
+            let poses_path = pack_dir.join(&poses_rec.filename);
+            let mut rgba = image::open(&poses_path).unwrap().to_rgba8();
+            let strip_y = poses_rec.calibration_strip.strip_y;
+            for y in 0..strip_y {
+                for x in 0..rgba.width() {
+                    let px = rgba.get_pixel(x, y).0;
+                    if studio_bg_distance([px[0], px[1], px[2]]) > 28.0 {
+                        rgba.put_pixel(x, y, Rgba([fg_rgb[0], fg_rgb[1], fg_rgb[2], 255]));
+                    }
+                }
+            }
+            let mut updated_png = Vec::new();
+            DynamicImage::ImageRgba8(rgba)
+                .write_to(&mut Cursor::new(&mut updated_png), ImageFormat::Png)
+                .unwrap();
+            write_atomic(&poses_path, &updated_png, &poses_rec.filename).unwrap();
+            poses_rec.sha256 = sha256_hex(&updated_png);
+            write_atomic(
+                &pack_path,
+                &serde_json::to_vec_pretty(&manifest).unwrap(),
+                "pack.json",
+            )
+            .unwrap();
+        }
+
+        let args_log = ws.join("critic_calls.log");
+        let (auth_dir, stub_bin) = write_pack_critic_stub(ws, &args_log);
+        let critic =
+            VisionCritic::with_codex_bin(auth_dir, stub_bin.to_string_lossy().into_owned());
+
+        let mut req = ValidateReferencePackRequest::new("courier-ren", "franco-belgian-line");
+        req.run_critic = run_critic;
+
+        let res = validate_reference_pack(&library_dir, &registry, Some(&critic), &req).await;
+        assert_eq!(res.is_ok(), expect_ok, "result: {:?}", res);
+
+        if expect_ok {
+            let val = res.unwrap();
+            assert_eq!(val.manifest.lifecycle, Lifecycle::Validated);
+            assert!(
+                val.checks
+                    .iter()
+                    .any(|c| c.starts_with("cross-sheet color OK (poses vs turnaround:")),
+                "expected cross-sheet color check in {:?}",
+                val.checks
+            );
+            if run_critic {
+                assert!(
+                    val.checks
+                        .iter()
+                        .any(|c| c == "VisionCritic poses_expressions OK"),
+                    "expected Step 2 VisionCritic check in {:?}",
+                    val.checks
+                );
+                let log = fs::read_to_string(&args_log).unwrap();
+                let calls: Vec<&str> = log
+                    .split("\n---\n")
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                assert_eq!(calls.len(), 2, "expected 2 critic calls, got:\n{log}");
+                let turn_path = pack_dir.join("turnaround.png");
+                let poses_path = pack_dir.join("poses_expressions.png");
+                assert!(
+                    calls[0].contains(&format!("-i {}", turn_path.display())),
+                    "first critic call must inspect turnaround.png: {}",
+                    calls[0]
+                );
+                assert!(
+                    calls[1].contains(&format!(
+                        "-i {} -i {}",
+                        poses_path.display(),
+                        turn_path.display()
+                    )),
+                    "second critic call must inspect poses_expressions.png anchored on turnaround.png: {}",
+                    calls[1]
+                );
+                assert!(
+                    calls[1].contains("pose-color-identity")
+                        && calls[1].contains("zero-leaked-text"),
+                    "second critic call must check pose-color-identity and zero-leaked-text: {}",
+                    calls[1]
+                );
+            } else {
+                assert!(
+                    !args_log.exists(),
+                    "critic must not run when run_critic=false"
+                );
+            }
+        } else {
+            let err = res.unwrap_err();
+            assert!(
+                matches!(err, CoreError::ColorQaFailed(_)),
+                "expected ColorQaFailed on warm/dark shift, got {err:?}"
+            );
+            assert!(
+                !args_log.exists(),
+                "cross-sheet color QA failure must fail closed before invoking VisionCritic"
             );
         }
     }

@@ -906,6 +906,15 @@ pub fn compile_pack_sheet_prompt(
             }
         }
     );
+    if matches!(
+        role,
+        ReferenceSheetRole::PosesExpressions | ReferenceSheetRole::InventoryFlatlay
+    ) {
+        let _ = writeln!(
+            out,
+            "anchor_color_lock: preserve the exact unshaded garment base colors, hair tone, skin tone, and neutral studio illumination of the attached turnaround reference sheet; adopt ONLY the linework and brushwork treatment from style exemplars without absorbing scene lighting or warm/cool background casts"
+        );
+    }
 
     let _ = writeln!(out, "\n[SUBJECT]");
     let _ = writeln!(out, "slug: {}", subject.slug);
@@ -945,6 +954,13 @@ pub fn compile_pack_sheet_prompt(
         .map(|b| format!("{}={} {}", b.slot, b.material, b.color_hex))
         .collect();
     let _ = writeln!(out, "exclusive_surface_map: {}", surfaces.join("; "));
+    let swatches: Vec<String> = subject
+        .palette_lock
+        .swatches
+        .iter()
+        .map(|s| format!("{}={}", s.name, s.color_hex))
+        .collect();
+    let _ = writeln!(out, "palette_lock: {}", swatches.join("; "));
 
     let _ = writeln!(out, "\n[STYLE]");
     let _ = writeln!(out, "slug: {}", style.slug);
@@ -1667,6 +1683,42 @@ exemplars:
         assert!(
             !prompt.contains("positive_weapon_geometry"),
             "role {role:?} should omit positive_weapon_geometry when list is empty:\n{prompt}"
+        );
+    }
+
+    #[rstest]
+    #[case::turnaround_has_palette_lock_without_anchor_color_lock(
+        ReferenceSheetRole::Turnaround,
+        false
+    )]
+    #[case::poses_expressions_has_anchor_color_lock_and_palette_lock(
+        ReferenceSheetRole::PosesExpressions,
+        true
+    )]
+    #[case::inventory_flatlay_has_anchor_color_lock_and_palette_lock(
+        ReferenceSheetRole::InventoryFlatlay,
+        true
+    )]
+    #[case::single_sheet_has_palette_lock_without_anchor_color_lock(
+        ReferenceSheetRole::SingleSheet,
+        false
+    )]
+    fn compile_pack_sheet_prompt_emits_anchor_color_lock_and_palette_lock_per_role(
+        #[case] role: ReferenceSheetRole,
+        #[case] expect_anchor_color_lock: bool,
+    ) {
+        let subject = sample_prompt_subject(true);
+        let style = sample_prompt_style();
+        let prompt = compile_pack_sheet_prompt(&subject, &style, role);
+
+        assert!(
+            prompt.contains("palette_lock: coat_slate=#2C3E50"),
+            "role {role:?} prompt must include palette_lock swatches:\n{prompt}"
+        );
+        assert_eq!(
+            prompt.contains("anchor_color_lock: preserve the exact unshaded garment base colors, hair tone, skin tone, and neutral studio illumination of the attached turnaround reference sheet; adopt ONLY the linework and brushwork treatment from style exemplars without absorbing scene lighting or warm/cool background casts"),
+            expect_anchor_color_lock,
+            "role {role:?} anchor_color_lock mismatch:\n{prompt}"
         );
     }
 }

@@ -137,7 +137,11 @@ if [ "$SUBCMD" = "exec" ] || true; then
 
 if [ -n "$OUT_PATH" ]; then
   if grep -q '"CriticReport"' "$(dirname "$OUT_PATH")/critic_report.schema.json" 2>/dev/null; then
-    if printf '%s\n' "$ALL_ARGS" | grep -q "style-adherence"; then
+    if printf '%s\n' "$ALL_ARGS" | grep -q "pose-color-identity"; then
+      cat <<'JSON' > "$OUT_PATH"
+{{"schema_version":1,"passed":true,"checks":[{{"trait_id":"pose-color-identity","category":"identity","passed":true,"observation":"poses match turnaround colors and identity"}},{{"trait_id":"zero-leaked-text","category":"zero_leaked_text","passed":true,"observation":"clean"}}],"summary":"all passed"}}
+JSON
+    elif printf '%s\n' "$ALL_ARGS" | grep -q "style-adherence"; then
       cat <<'JSON' > "$OUT_PATH"
 {{"schema_version":1,"passed":true,"checks":[{{"trait_id":"zero-leaked-text","category":"zero_leaked_text","passed":true,"observation":"clean"}},{{"trait_id":"style-adherence","category":"style_adherence","passed":true,"observation":"matches style"}}],"summary":"all passed"}}
 JSON
