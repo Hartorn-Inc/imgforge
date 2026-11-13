@@ -57,6 +57,9 @@ pub const DEFAULT_SPARKLE_MIN_AREA_PX: usize = 1;
 /// Default maximum area (inclusive) for sparkle/yellow-dot blob detection.
 pub const DEFAULT_SPARKLE_MAX_AREA_PX: usize = 64;
 
+/// Default bin count (`20` bins of width `5.0` covering CIE `L*` `0..=100`).
+pub const DEFAULT_L_STAR_HISTOGRAM_BINS: usize = 20;
+
 // === 1. Color Space Conversion Helpers ===
 
 /// Convert an sRGB `u8` triple to perceptual `Oklab<f32>`.
@@ -1272,6 +1275,156 @@ impl ColorQaEngine {
             kind,
         )
     }
+
+    /// Compute binned CIE `L*` histogram and downsampled OKLab vectorscope points for UI inspection.
+    pub fn compute_l_star_histogram_and_vectorscope(
+        &self,
+        image: &RgbaImage,
+        max_samples: usize,
+    ) -> Result<ColorInspectionTelemetry, CoreError> {
+        compute_l_star_histogram_and_vectorscope(image, max_samples)
+    }
+}
+
+/// Single bin of a CIE `L*` luminance histogram (`0..=100`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LStarHistogramBin {
+    /// Zero-based bin index (`0..DEFAULT_L_STAR_HISTOGRAM_BINS`).
+    pub bin_index: usize,
+    /// Inclusive lower CIE `L*` bound for this bin.
+    pub min_l_star: f64,
+    /// Upper CIE `L*` bound for this bin.
+    pub max_l_star: f64,
+    /// Number of opaque pixels falling into this bin.
+    pub count: usize,
+    /// Fraction of opaque pixels (`0.0..=1.0`) falling into this bin.
+    pub fraction: f64,
+}
+
+/// Single downsampled OKLab + CIE `L*` point rendered in the Web Canvas vectorscope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OklabVectorscopePoint {
+    /// OKLab `L` perceptual lightness (`0.0..=1.0`).
+    pub oklab_l: f32,
+    /// OKLab `a` green-red axis.
+    pub a: f32,
+    /// OKLab `b` blue-yellow axis.
+    pub b: f32,
+    /// CIE `L*` luminance (`0.0..=100.0`).
+    pub l_star: f64,
+    /// Uppercase `#RRGGBB` sRGB representation of the sampled pixel.
+    pub hex: String,
+}
+
+/// Combined CIE `L*` histogram and OKLab vectorscope payload computed in Rust core.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColorInspectionTelemetry {
+    /// Source image width in pixels.
+    pub width: u32,
+    /// Source image height in pixels.
+    pub height: u32,
+    /// Total number of non-transparent pixels evaluated (`alpha > 0`).
+    pub opaque_pixel_count: usize,
+    /// 20-bin CIE `L*` histogram across `0.0..=100.0`.
+    pub l_star_bins: Vec<LStarHistogramBin>,
+    /// Deterministically downsampled OKLab `(a, b, lStar, hex)` vectorscope points.
+    pub vectorscope_points: Vec<OklabVectorscopePoint>,
+}
+
+/// Compute a 20-bin CIE `L*` histogram (`0..100`) and deterministically downsampled OKLab
+/// `(a*, b*, L*, hex)` vectorscope points for the Web Canvas Run Inspector.
+pub fn compute_l_star_histogram_and_vectorscope(
+    image: &RgbaImage,
+    max_samples: usize,
+) -> Result<ColorInspectionTelemetry, CoreError> {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return Err(CoreError::ColorQaFailed(
+            "cannot compute L* histogram and vectorscope on a 0-pixel image".to_string(),
+        ));
+    }
+
+    let bin_width = 100.0 / (DEFAULT_L_STAR_HISTOGRAM_BINS as f64);
+    let mut counts = [0usize; DEFAULT_L_STAR_HISTOGRAM_BINS];
+    let mut opaque_pixel_count = 0usize;
+
+    for px in image.pixels() {
+        if px.0[3] == 0 {
+            continue;
+        }
+        opaque_pixel_count += 1;
+        let lab = srgb_u8_to_lab([px.0[0], px.0[1], px.0[2]]);
+        let l_star = f64::from(lab.l).clamp(0.0, 100.0);
+        let bin = ((l_star / bin_width).floor() as usize).min(DEFAULT_L_STAR_HISTOGRAM_BINS - 1);
+        counts[bin] += 1;
+    }
+
+    let l_star_bins = (0..DEFAULT_L_STAR_HISTOGRAM_BINS)
+        .map(|bin_index| {
+            let count = counts[bin_index];
+            let fraction = if opaque_pixel_count > 0 {
+                count as f64 / opaque_pixel_count as f64
+            } else {
+                0.0
+            };
+            LStarHistogramBin {
+                bin_index,
+                min_l_star: bin_index as f64 * bin_width,
+                max_l_star: (bin_index + 1) as f64 * bin_width,
+                count,
+                fraction,
+            }
+        })
+        .collect();
+
+    let target_samples = if opaque_pixel_count == 0 || max_samples == 0 {
+        0
+    } else {
+        max_samples.min(opaque_pixel_count)
+    };
+    let mut vectorscope_points = Vec::with_capacity(target_samples);
+
+    if target_samples > 0 {
+        let mut opaque_idx = 0usize;
+        let mut sampled = 0usize;
+        let mut next_pick = 0usize;
+
+        for px in image.pixels() {
+            if px.0[3] == 0 {
+                continue;
+            }
+            if opaque_idx == next_pick {
+                let rgb = [px.0[0], px.0[1], px.0[2]];
+                let ok = srgb_u8_to_oklab(rgb);
+                let lab = srgb_u8_to_lab(rgb);
+                vectorscope_points.push(OklabVectorscopePoint {
+                    oklab_l: ok.l,
+                    a: ok.a,
+                    b: ok.b,
+                    l_star: f64::from(lab.l),
+                    hex: format_hex_rgb(rgb),
+                });
+                sampled += 1;
+                if sampled >= target_samples {
+                    break;
+                }
+                next_pick = (sampled * opaque_pixel_count) / target_samples;
+            }
+            opaque_idx += 1;
+        }
+    }
+
+    Ok(ColorInspectionTelemetry {
+        width,
+        height,
+        opaque_pixel_count,
+        l_star_bins,
+        vectorscope_points,
+    })
 }
 
 // === 7. Deterministic Internal Helpers ===
@@ -1693,5 +1846,35 @@ mod tests {
         let decoded = image::load_from_memory(&heatmap_png).unwrap().to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0).0, [0, 0, 0, 0]);
         assert!(decoded.get_pixel(12, 12).0[3] > 0);
+    }
+
+    #[rstest]
+    #[case::solid_mid_tone_single_bin(32, 32, [120, 120, 120, 255], 16, 16, "#787878", true)]
+    #[case::solid_white_clamps_to_last_bin(16, 16, [255, 255, 255, 255], 64, 64, "#FFFFFF", true)]
+    #[case::zero_max_samples_returns_histogram_only(16, 16, [44, 62, 80, 255], 0, 0, "#2C3E50", true)]
+    #[case::fully_transparent_returns_zero_opaque(16, 16, [0, 0, 0, 0], 32, 0, "#000000", true)]
+    #[case::zero_pixel_image_rejected(0, 16, [0, 0, 0, 255], 32, 0, "#000000", false)]
+    fn computes_l_star_histogram_and_downsampled_oklab_vectorscope(
+        #[case] w: u32,
+        #[case] h: u32,
+        #[case] fill: [u8; 4],
+        #[case] max_samples: usize,
+        #[case] expected_points: usize,
+        #[case] expected_hex: &str,
+        #[case] expect_ok: bool,
+    ) {
+        let img: RgbaImage = ImageBuffer::from_pixel(w, h, Rgba(fill));
+        let res = compute_l_star_histogram_and_vectorscope(&img, max_samples);
+        assert_eq!(res.is_ok(), expect_ok);
+        if let Ok(telemetry) = res {
+            assert_eq!(telemetry.l_star_bins.len(), DEFAULT_L_STAR_HISTOGRAM_BINS);
+            let total_binned: usize = telemetry.l_star_bins.iter().map(|b| b.count).sum();
+            assert_eq!(total_binned, telemetry.opaque_pixel_count);
+            assert_eq!(telemetry.vectorscope_points.len(), expected_points);
+            if let Some(pt) = telemetry.vectorscope_points.first() {
+                assert_eq!(pt.hex, expected_hex);
+                assert!(pt.l_star >= 0.0 && pt.l_star <= 100.0);
+            }
+        }
     }
 }

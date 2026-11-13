@@ -607,7 +607,8 @@ fn read_optional_card_yaml(
     Ok(Some(raw))
 }
 
-fn load_and_verify_style_exemplars(
+/// Load and verify all `1..=3` PNG exemplars inside `style_dir` with symlink-free containment.
+pub fn load_and_verify_style_exemplars(
     style_dir: &Path,
     style: &Style,
 ) -> Result<Vec<(PathBuf, Vec<u8>)>, CoreError> {

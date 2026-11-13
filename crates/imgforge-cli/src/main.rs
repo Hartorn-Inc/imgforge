@@ -1813,7 +1813,16 @@ async fn main() -> anyhow::Result<()> {
                 .port
                 .or_else(|| ws.as_ref().map(|w| w.config.server.port))
                 .unwrap_or(8080);
-            serve_ui(AppState::new(auth_dir), port).await?;
+            let backend: std::sync::Arc<dyn imgforge_core::ImageBackend> = std::sync::Arc::new(
+                CodexNativeBackend::with_codex_bin(auth_dir.clone(), codex_bin.clone()),
+            );
+            let state = AppState::with_workspace_and_backend(
+                ws.as_ref().map(|w| w.root.clone()),
+                auth_dir,
+                codex_bin,
+                Some(backend),
+            );
+            serve_ui(state, port).await?;
         }
         Commands::Mcp(args) => {
             if let Some(ref explicit_ws) = cli.workspace {

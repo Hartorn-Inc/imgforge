@@ -55,12 +55,14 @@ pub use calibration::{
     validate_reference_sheet_structure,
 };
 pub use color_qa::{
-    ColorQaEngine, ColorQaReport, DEFAULT_CLIPPED_BLACK_L_STAR, DEFAULT_KMEANS_K,
-    DEFAULT_SPARKLE_MAX_AREA_PX, DEFAULT_SPARKLE_MIN_AREA_PX, ExposureMetrics, ExposureQaConfig,
-    ExposureReport, ForbiddenHueIntrusion, ForbiddenHueSector, HeatmapKind, OklabClusterSummary,
-    PaletteAdherenceReport, PaletteQaConfig, SparkleBlob, SparkleConfig, SparkleReport,
-    SubjectRoiSpec, UntouchedDriftConfig, UntouchedDriftReport, delta_e_2000, oklab_to_lab,
-    oklab_to_srgb_u8, srgb_delta_e_2000, srgb_u8_to_lab, srgb_u8_to_oklab,
+    ColorInspectionTelemetry, ColorQaEngine, ColorQaReport, DEFAULT_CLIPPED_BLACK_L_STAR,
+    DEFAULT_KMEANS_K, DEFAULT_L_STAR_HISTOGRAM_BINS, DEFAULT_SPARKLE_MAX_AREA_PX,
+    DEFAULT_SPARKLE_MIN_AREA_PX, ExposureMetrics, ExposureQaConfig, ExposureReport,
+    ForbiddenHueIntrusion, ForbiddenHueSector, HeatmapKind, LStarHistogramBin, OklabClusterSummary,
+    OklabVectorscopePoint, PaletteAdherenceReport, PaletteQaConfig, SparkleBlob, SparkleConfig,
+    SparkleReport, SubjectRoiSpec, UntouchedDriftConfig, UntouchedDriftReport,
+    compute_l_star_histogram_and_vectorscope, delta_e_2000, oklab_to_lab, oklab_to_srgb_u8,
+    srgb_delta_e_2000, srgb_u8_to_lab, srgb_u8_to_oklab,
 };
 pub use composer::{
     ComposedScene, MAX_UNTRUSTED_PROSE_BYTES, SCENE_SPEC_OUTPUT_SCHEMA, SceneComposer,
@@ -102,21 +104,22 @@ pub use guide_renderer::{
     SUPPORTED_GUIDE_SPEC_SCHEMA_VERSION, SpatialGuideVariant, SubjectMannequin, VectorStrokeStyle,
     build_recommended_blockout,
 };
-pub use lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex};
+pub use lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex, validate_slug};
 pub use presets::{
     BUILTIN_ATMOSPHERE_SLUGS, BUILTIN_STYLE_SLUGS, builtin_atmosphere, builtin_atmospheres,
     builtin_style, builtin_style_exemplar_png, builtin_styles,
 };
 pub use prompt_compiler::{CompiledPrompt, PromptCompiler, compile_scene_spec_with_registry};
 pub use reference_pack::{
-    GeneratedReferencePack, GeneratedSheetRecord, REFERENCE_SHEET_HEIGHT, REFERENCE_SHEET_WIDTH,
-    ReferencePackManifest, ReferencePackPipeline, ReferencePackRequest, ReferenceSheetRole,
-    compile_pack_sheet_prompt,
+    DiscoveredReferencePack, GeneratedReferencePack, GeneratedSheetRecord, REFERENCE_SHEET_HEIGHT,
+    REFERENCE_SHEET_WIDTH, ReferencePackManifest, ReferencePackPipeline, ReferencePackRequest,
+    ReferenceSheetRole, compile_pack_sheet_prompt, list_workspace_reference_packs,
+    reslice_reference_pack_sheet,
 };
 pub use registry::{
     CARD_FILENAME, LibraryRegistry, LibrarySource, ResolvedAtmosphere, ResolvedStyle,
-    ResolvedSubject, inspect_asset_image_visibility, resolve_user_config_dir,
-    resolve_user_config_dir_from_env,
+    ResolvedSubject, inspect_asset_image_visibility, load_and_verify_style_exemplars,
+    resolve_user_config_dir, resolve_user_config_dir_from_env,
 };
 pub use scene_spec::{
     CameraSpec, DepthBandSpec, DepthPlane, ExclusiveSurfaceMap, ForegroundSlot, HandBinding,
@@ -130,8 +133,10 @@ pub use store::{
     MANIFEST_LOCK_FILENAME, MAX_CUBE_LUT_BYTES, MAX_IMAGE_DECODE_ALLOC_BYTES, MAX_IMAGE_DIM,
     MAX_IMAGE_TOTAL_PIXELS, MAX_REGULAR_FILE_BYTES, MAX_TEXT_FILE_BYTES, ManifestEntry,
     ManifestEntryKind, ManifestLock, ManifestLockStore, RecordRunParams, RecordedRun,
-    RunBackendMetadata, RunMetadata, RunQaReports, RunStore, read_regular_file_nofollow_bounded,
-    read_text_file_nofollow_bounded, write_atomic,
+    RunBackendMetadata, RunMetadata, RunQaReports, RunStore, decode_png_checked,
+    read_regular_file_nofollow, read_text_file_nofollow_bounded, validate_strict_relative_path,
+    verify_contained_path_no_symlinks, verify_existing_dir_prefix_no_symlinks,
+    verify_optional_contained_dir_no_symlinks, write_atomic,
 };
 pub use style::{MAX_STYLE_EXEMPLARS, MIN_STYLE_EXEMPLARS, Style};
 pub use subject::{PaletteLock, PaletteSwatch, Subject, SubjectHandBindings, SubjectKind};

@@ -978,7 +978,7 @@ pub fn write_atomic(dest: &Path, bytes: &[u8], label: &str) -> Result<(), CoreEr
 
 /// Validate that `raw` is a strict relative path with only normal segments (no `/`, `\`, `..`, `.`,
 /// NUL, or control characters).
-pub(crate) fn validate_strict_relative_path(raw: &str, label: &str) -> Result<PathBuf, String> {
+pub fn validate_strict_relative_path(raw: &str, label: &str) -> Result<PathBuf, String> {
     if raw.is_empty()
         || raw != raw.trim()
         || raw.contains('\\')
@@ -1010,7 +1010,7 @@ pub(crate) fn validate_strict_relative_path(raw: &str, label: &str) -> Result<Pa
 
 /// Walk every path component from `root` down to `root/rel` via `fs::symlink_metadata` to ensure
 /// zero symlinks in `root`, intermediate directories, or leaf target, and verify canonical containment.
-pub(crate) fn verify_contained_path_no_symlinks(
+pub fn verify_contained_path_no_symlinks(
     root: &Path,
     rel: &Path,
     target_is_dir: bool,
@@ -1109,7 +1109,7 @@ pub(crate) fn verify_contained_path_no_symlinks(
 
 /// Verify all existing directory segments from `root` down toward `root/rel` are non-symlink
 /// directories confined inside `canonical_root`, stopping cleanly when a segment does not exist yet.
-pub(crate) fn verify_existing_dir_prefix_no_symlinks(
+pub fn verify_existing_dir_prefix_no_symlinks(
     root: &Path,
     rel: &Path,
     label: &str,
@@ -1208,7 +1208,7 @@ pub(crate) fn verify_existing_dir_prefix_no_symlinks(
 /// Probe an optional directory `root/rel`: returns `Ok(None)` if any segment does not exist,
 /// returns `Ok(Some(path))` if every segment is a non-symlink directory inside `canonical_root`,
 /// and fails closed if any existing segment is a symlink, non-directory, or escapes `canonical_root`.
-pub(crate) fn verify_optional_contained_dir_no_symlinks(
+pub fn verify_optional_contained_dir_no_symlinks(
     root: &Path,
     rel: &Path,
     label: &str,
@@ -1257,7 +1257,7 @@ pub(crate) fn checked_pixel_count(
 }
 
 /// Decode PNG bytes fail-closed with explicit `image::Limits` and total-pixel bounds.
-pub(crate) fn decode_png_checked(path: &Path, bytes: &[u8]) -> Result<DynamicImage, CoreError> {
+pub fn decode_png_checked(path: &Path, bytes: &[u8]) -> Result<DynamicImage, CoreError> {
     decode_png_checked_with_limits(
         path,
         bytes,
@@ -1326,10 +1326,7 @@ pub(crate) fn decode_png_checked_with_limits(
 }
 
 /// Read a regular non-symlink file using `O_NOFOLLOW` on Unix up to `MAX_REGULAR_FILE_BYTES`.
-pub(crate) fn read_regular_file_nofollow(
-    path: &Path,
-    context_label: &str,
-) -> Result<Vec<u8>, CoreError> {
+pub fn read_regular_file_nofollow(path: &Path, context_label: &str) -> Result<Vec<u8>, CoreError> {
     read_regular_file_nofollow_bounded(path, context_label, MAX_REGULAR_FILE_BYTES)
 }
 

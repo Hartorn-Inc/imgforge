@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
 imgforge-core = { path = "../imgforge-core" }
 mime_guess.workspace = true
@@ -28,8 +29,10 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+futures-util = "0.3.34"
 http-body-util.workspace = true
 image.workspace = true
 rmcp = { version = "3.10.0", features = ["client"] }
 rstest.workspace = true
+tokio-tungstenite = "0.30.0"
 tower.workspace = true

@@ -154,7 +154,7 @@ pub fn now_utc_iso() -> String {
 }
 
 /// Validate a safe lowercase kebab-case/alphanumeric entity slug (preventing path traversal).
-pub(crate) fn validate_slug(slug: &str, entity_kind: &str) -> Result<(), String> {
+pub fn validate_slug(slug: &str, entity_kind: &str) -> Result<(), String> {
     if slug.is_empty() {
         return Err(format!("{entity_kind} slug must not be empty"));
     }

@@ -39,15 +39,18 @@ use crate::calibration::{
     composite_calibration_strip_png, validate_reference_sheet_structure,
 };
 use crate::error::CoreError;
-use crate::lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex};
+use crate::lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex, validate_slug};
 use crate::registry::{
     LibraryRegistry, ResolvedStyle, ResolvedSubject, inspect_asset_image_visibility,
 };
 use crate::scene_spec::{Visibility, check_visibility_compatibility};
-use crate::slicer::{RectOverride, SliceRecord, SlicerConfig, SlicesManifest, slice_sheet_image};
+use crate::slicer::{
+    OverrideMode, RectOverride, SliceRecord, SlicerConfig, SlicesManifest, slice_sheet_image,
+};
 use crate::store::{
-    RunStore, decode_png_checked, read_regular_file_nofollow, verify_contained_path_no_symlinks,
-    verify_existing_dir_prefix_no_symlinks, write_atomic,
+    RunStore, decode_png_checked, read_regular_file_nofollow, validate_strict_relative_path,
+    verify_contained_path_no_symlinks, verify_existing_dir_prefix_no_symlinks,
+    verify_optional_contained_dir_no_symlinks, write_atomic,
 };
 use crate::style::Style;
 use crate::subject::{Subject, SubjectKind};
@@ -530,6 +533,289 @@ impl<'a> ReferencePackPipeline<'a> {
             sheet_path,
         ))
     }
+}
+
+/// Discovered workspace `ReferencePack` paired with its parsed manifests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoveredReferencePack {
+    /// Directory containing `pack.json`, `slices.json`, sheets, and `slices/`.
+    pub pack_dir: PathBuf,
+    /// Parsed `pack.json` manifest.
+    pub manifest: ReferencePackManifest,
+    /// Optional parsed `slices.json` manifest.
+    pub slices_manifest: Option<SlicesManifest>,
+}
+
+/// Discover all style-scoped `ReferencePack` entries under `<library_dir>/subjects/*/packs/*/`.
+pub fn list_workspace_reference_packs(
+    library_dir: &Path,
+) -> Result<Vec<DiscoveredReferencePack>, CoreError> {
+    let Some(subjects_dir) =
+        verify_optional_contained_dir_no_symlinks(library_dir, Path::new("subjects"), "subjects")?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut subject_slugs = Vec::new();
+    for entry_res in fs::read_dir(&subjects_dir).map_err(|err| CoreError::Io {
+        context: format!("listing subjects directory {}", subjects_dir.display()),
+        source: err,
+    })? {
+        let entry = entry_res.map_err(|err| CoreError::Io {
+            context: format!("reading subjects directory {}", subjects_dir.display()),
+            source: err,
+        })?;
+        let meta = fs::symlink_metadata(entry.path()).map_err(|err| CoreError::Io {
+            context: format!("inspecting subject entry {}", entry.path().display()),
+            source: err,
+        })?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str()
+            && validate_slug(name, "Subject").is_ok()
+        {
+            subject_slugs.push(name.to_string());
+        }
+    }
+    subject_slugs.sort();
+
+    let mut packs = Vec::new();
+    for subject_slug in subject_slugs {
+        let rel_packs = Path::new("subjects").join(&subject_slug).join("packs");
+        let Some(packs_dir) =
+            verify_optional_contained_dir_no_symlinks(library_dir, &rel_packs, "packs")?
+        else {
+            continue;
+        };
+        let mut style_slugs = Vec::new();
+        for entry_res in fs::read_dir(&packs_dir).map_err(|err| CoreError::Io {
+            context: format!("listing packs directory {}", packs_dir.display()),
+            source: err,
+        })? {
+            let entry = entry_res.map_err(|err| CoreError::Io {
+                context: format!("reading packs directory {}", packs_dir.display()),
+                source: err,
+            })?;
+            let meta = fs::symlink_metadata(entry.path()).map_err(|err| CoreError::Io {
+                context: format!("inspecting pack entry {}", entry.path().display()),
+                source: err,
+            })?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str()
+                && validate_slug(name, "Style").is_ok()
+                && entry.path().join("pack.json").exists()
+            {
+                style_slugs.push(name.to_string());
+            }
+        }
+        style_slugs.sort();
+
+        for style_slug in style_slugs {
+            let rel_pack = rel_packs.join(&style_slug);
+            let pack_dir = verify_contained_path_no_symlinks(
+                library_dir,
+                &rel_pack,
+                true,
+                "ReferencePack directory",
+            )?;
+            let pack_json_path = verify_contained_path_no_symlinks(
+                &pack_dir,
+                Path::new("pack.json"),
+                false,
+                "pack.json",
+            )?;
+            let pack_bytes = read_regular_file_nofollow(&pack_json_path, "pack.json")?;
+            let manifest: ReferencePackManifest =
+                serde_json::from_slice(&pack_bytes).map_err(|err| {
+                    CoreError::ReferencePackFailed(format!(
+                        "parsing {}: {err}",
+                        pack_json_path.display()
+                    ))
+                })?;
+
+            let slices_path = pack_dir.join("slices.json");
+            let slices_manifest = match fs::symlink_metadata(&slices_path) {
+                Ok(_) => {
+                    let verified_slices = verify_contained_path_no_symlinks(
+                        &pack_dir,
+                        Path::new("slices.json"),
+                        false,
+                        "slices.json",
+                    )?;
+                    let bytes = read_regular_file_nofollow(&verified_slices, "slices.json")?;
+                    Some(serde_json::from_slice(&bytes).map_err(|err| {
+                        CoreError::ReferencePackFailed(format!(
+                            "parsing {}: {err}",
+                            verified_slices.display()
+                        ))
+                    })?)
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(CoreError::Io {
+                        context: format!("inspecting {}", slices_path.display()),
+                        source: err,
+                    });
+                }
+            };
+
+            packs.push(DiscoveredReferencePack {
+                pack_dir,
+                manifest,
+                slices_manifest,
+            });
+        }
+    }
+
+    Ok(packs)
+}
+
+/// Apply manual `RectOverride` boxes to one sheet of an existing mutable `ReferencePack`,
+/// re-export `slices/*.png`, and atomically update `slices.json` and `pack.json`.
+pub fn reslice_reference_pack_sheet(
+    library_dir: &Path,
+    subject_slug: &str,
+    style_slug: &str,
+    sheet_role: ReferenceSheetRole,
+    override_mode: OverrideMode,
+    overrides: Vec<RectOverride>,
+) -> Result<SlicesManifest, CoreError> {
+    validate_slug(subject_slug, "Subject").map_err(CoreError::SubjectInvalid)?;
+    validate_slug(style_slug, "Style").map_err(CoreError::StyleInvalid)?;
+
+    let rel_pack = Path::new("subjects")
+        .join(subject_slug)
+        .join("packs")
+        .join(style_slug);
+    let pack_dir =
+        verify_contained_path_no_symlinks(library_dir, &rel_pack, true, "ReferencePack directory")?;
+    let pack_path =
+        verify_contained_path_no_symlinks(&pack_dir, Path::new("pack.json"), false, "pack.json")?;
+    let pack_bytes = read_regular_file_nofollow(&pack_path, "pack.json")?;
+    let mut manifest: ReferencePackManifest = serde_json::from_slice(&pack_bytes)
+        .map_err(|err| CoreError::ReferencePackFailed(format!("parsing pack.json: {err}")))?;
+
+    let pack_id = format!("pack:{}/{}", manifest.subject_slug, manifest.style_slug);
+    manifest.lifecycle.ensure_mutable(&pack_id)?;
+
+    let sheet_rec = manifest
+        .sheets
+        .iter()
+        .find(|s| s.role == sheet_role)
+        .cloned()
+        .ok_or_else(|| {
+            CoreError::ReferencePackFailed(format!(
+                "ReferencePack '{subject_slug}/{style_slug}' has no sheet for role '{}'",
+                sheet_role.filename()
+            ))
+        })?;
+
+    let rel_sheet = validate_strict_relative_path(&sheet_rec.filename, "sheet filename")
+        .map_err(CoreError::ReferencePackFailed)?;
+    let sheet_path =
+        verify_contained_path_no_symlinks(&pack_dir, &rel_sheet, false, &sheet_rec.filename)?;
+    let sheet_bytes = read_regular_file_nofollow(&sheet_path, &sheet_rec.filename)?;
+    let rgba = decode_png_checked(&sheet_path, &sheet_bytes)?.to_rgba8();
+
+    let slicer_cfg = SlicerConfig {
+        exclude_bottom_rows: sheet_rec.calibration_strip.strip_height,
+        id_prefix: Some(sheet_role.slice_prefix().to_string()),
+        overrides,
+        override_mode,
+        ..SlicerConfig::default()
+    };
+    let extracted = slice_sheet_image(&rgba, &slicer_cfg)?;
+
+    let rel_slices_dir = Path::new("slices");
+    verify_existing_dir_prefix_no_symlinks(&pack_dir, rel_slices_dir, "slices output directory")?;
+    fs::create_dir_all(pack_dir.join(rel_slices_dir)).map_err(|err| CoreError::Io {
+        context: format!("creating slices directory in {}", pack_dir.display()),
+        source: err,
+    })?;
+    verify_contained_path_no_symlinks(&pack_dir, rel_slices_dir, true, "slices output directory")?;
+
+    let mut new_records = Vec::with_capacity(extracted.len());
+    let mut new_ids = HashSet::with_capacity(extracted.len());
+    for slice in extracted {
+        let rel_slice = validate_strict_relative_path(&slice.record.file, "slice file")
+            .map_err(CoreError::ReferencePackFailed)?;
+        let dest = pack_dir.join(&rel_slice);
+        if let Ok(meta) = fs::symlink_metadata(&dest)
+            && meta.file_type().is_symlink()
+        {
+            return Err(CoreError::Io {
+                context: format!("inspecting slice PNG {}", dest.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("refusing symlink at slice destination {}", dest.display()),
+                ),
+            });
+        }
+        write_atomic(&dest, &slice.png_bytes, &slice.record.id)?;
+        new_ids.insert(slice.record.id.clone());
+        new_records.push(slice.record);
+    }
+
+    let updated_slices = if manifest.sheets.len() <= 1 {
+        new_records
+    } else {
+        let prefix = format!("{}_", sheet_role.slice_prefix());
+        let mut combined: Vec<SliceRecord> = manifest
+            .slices
+            .iter()
+            .filter(|s| !s.id.starts_with(&prefix) && !new_ids.contains(&s.id))
+            .cloned()
+            .collect();
+        combined.extend(new_records);
+        combined
+    };
+
+    let mut seen_ids = HashSet::with_capacity(updated_slices.len());
+    for s in &updated_slices {
+        if !seen_ids.insert(s.id.as_str()) {
+            return Err(CoreError::ReferencePackFailed(format!(
+                "duplicate slice_id '{}' after reslicing",
+                s.id
+            )));
+        }
+    }
+
+    let slices_manifest = SlicesManifest {
+        schema_version: 1,
+        sheet_filename: sheet_rec.filename,
+        sheet_width: rgba.width(),
+        sheet_height: rgba.height(),
+        calibration_strip_height: sheet_rec.calibration_strip.strip_height,
+        slices: updated_slices.clone(),
+    };
+    let slices_json_bytes = serde_json::to_vec_pretty(&slices_manifest)
+        .map_err(|err| CoreError::ReferencePackFailed(err.to_string()))?;
+    let slices_manifest_path = pack_dir.join("slices.json");
+    write_atomic(&slices_manifest_path, &slices_json_bytes, "slices.json")?;
+
+    let mut artifact_hashes = BTreeMap::new();
+    for sheet in &manifest.sheets {
+        artifact_hashes.insert(sheet.filename.clone(), sheet.sha256.clone());
+    }
+    for slice in &updated_slices {
+        artifact_hashes.insert(slice.file.clone(), slice.sha256.clone());
+    }
+    artifact_hashes.insert("slices.json".to_string(), sha256_hex(&slices_json_bytes));
+
+    manifest.slices = updated_slices;
+    manifest.artifact_hashes = artifact_hashes;
+    if manifest.lifecycle == Lifecycle::Validated {
+        manifest.lifecycle = Lifecycle::Draft;
+    }
+
+    let updated_pack_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|err| CoreError::ReferencePackFailed(err.to_string()))?;
+    write_atomic(&pack_path, &updated_pack_bytes, "pack.json")?;
+
+    Ok(slices_manifest)
 }
 
 fn validate_request_overrides(
@@ -1112,5 +1398,118 @@ visibility: public
                 "backend must not be invoked on Seed visibility violation"
             );
         }
+    }
+
+    #[test]
+    fn reslice_reference_pack_sheet_updates_slices_and_blocks_canonical_packs() {
+        let root = TempDir::new().unwrap();
+        let ws = root.path();
+        let library_dir = ws.join("library");
+        let pack_dir = library_dir.join("subjects/brass-lantern/packs/franco-belgian-line");
+        fs::create_dir_all(pack_dir.join("slices")).unwrap();
+
+        let mut sheet: RgbaImage = ImageBuffer::from_pixel(
+            REFERENCE_SHEET_WIDTH,
+            REFERENCE_SHEET_HEIGHT,
+            Rgba([STUDIO_BG_RGB[0], STUDIO_BG_RGB[1], STUDIO_BG_RGB[2], 255]),
+        );
+        for y in 120..420 {
+            for x in 120..320 {
+                sheet.put_pixel(x, y, Rgba([200, 160, 100, 255]));
+            }
+        }
+        let mut sheet_bytes = Vec::new();
+        DynamicImage::ImageRgba8(sheet)
+            .write_to(&mut Cursor::new(&mut sheet_bytes), ImageFormat::Png)
+            .unwrap();
+        fs::write(pack_dir.join("sheet.png"), &sheet_bytes).unwrap();
+
+        let sheet_sha = sha256_hex(&sheet_bytes);
+        let manifest = ReferencePackManifest {
+            schema_version: 1,
+            version: 1,
+            subject_slug: "brass-lantern".to_string(),
+            style_slug: "franco-belgian-line".to_string(),
+            subject_kind: SubjectKind::Prop,
+            visibility: Visibility::Public,
+            lifecycle: Lifecycle::Draft,
+            seed: None,
+            sheets: vec![GeneratedSheetRecord {
+                role: ReferenceSheetRole::SingleSheet,
+                filename: "sheet.png".to_string(),
+                sha256: sheet_sha.clone(),
+                structural_report: SheetStructuralReport {
+                    width: REFERENCE_SHEET_WIDTH,
+                    height: REFERENCE_SHEET_HEIGHT,
+                    bg_coverage: 0.9,
+                    border_bg_coverage: 1.0,
+                    foreground_pixels: 60_000,
+                },
+                calibration_strip: crate::calibration::CalibrationStripLayout {
+                    strip_y: REFERENCE_SHEET_HEIGHT - 72,
+                    strip_height: 72,
+                    cell_size_px: 48,
+                    gray_wedge_cells: Vec::new(),
+                    palette_swatch_cells: Vec::new(),
+                },
+                thread_id: None,
+            }],
+            slices: Vec::new(),
+            artifact_hashes: BTreeMap::from([("sheet.png".to_string(), sheet_sha)]),
+            created_at_iso: now_utc_iso(),
+        };
+        write_atomic(
+            &pack_dir.join("pack.json"),
+            &serde_json::to_vec_pretty(&manifest).unwrap(),
+            "pack.json",
+        )
+        .unwrap();
+
+        let resliced = reslice_reference_pack_sheet(
+            &library_dir,
+            "brass-lantern",
+            "franco-belgian-line",
+            ReferenceSheetRole::SingleSheet,
+            OverrideMode::ReplaceAll,
+            vec![RectOverride {
+                id: "lantern_main".to_string(),
+                rect: PixelRect {
+                    x: 100,
+                    y: 100,
+                    width: 240,
+                    height: 340,
+                },
+                label: Some("Main".to_string()),
+            }],
+        )
+        .expect("reslice succeeds on draft pack");
+        assert_eq!(resliced.slices.len(), 1);
+        assert_eq!(resliced.slices[0].id, "lantern_main");
+        assert!(pack_dir.join("slices/lantern_main.png").is_file());
+
+        let discovered = list_workspace_reference_packs(&library_dir).unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].manifest.slices.len(), 1);
+
+        // Canonical pack must fail closed on reslice
+        let mut canon_manifest: ReferencePackManifest =
+            serde_json::from_slice(&fs::read(pack_dir.join("pack.json")).unwrap()).unwrap();
+        canon_manifest.lifecycle = Lifecycle::Canonical;
+        write_atomic(
+            &pack_dir.join("pack.json"),
+            &serde_json::to_vec_pretty(&canon_manifest).unwrap(),
+            "pack.json",
+        )
+        .unwrap();
+        let err = reslice_reference_pack_sheet(
+            &library_dir,
+            "brass-lantern",
+            "franco-belgian-line",
+            ReferenceSheetRole::SingleSheet,
+            OverrideMode::ReplaceAll,
+            Vec::new(),
+        )
+        .expect_err("canonical pack cannot be resliced");
+        assert!(matches!(err, CoreError::CanonicalImmutable { .. }));
     }
 }
