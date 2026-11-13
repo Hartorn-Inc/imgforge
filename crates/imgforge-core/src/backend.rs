@@ -47,6 +47,9 @@ pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x
 /// Maximum permitted relative aspect-ratio deviation (`5%`).
 pub const MAX_ASPECT_RATIO_ERROR: f64 = 0.05;
 
+/// Maximum character count for sanitized JSONL diagnostic summaries on missing-PNG errors.
+pub const MAX_FAILURE_DETAIL_CHARS: usize = 300;
+
 /// Input parameters for a single `ImageBackend::generate` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageGenerationRequest {
@@ -105,7 +108,8 @@ pub fn format_aspect_ratio(width: u32, height: u32) -> String {
 }
 
 /// Build the full prompt passed to `codex exec` including target `WxH` dimensions,
-/// aspect ratio, and positive-only reference/textless rendering guidance.
+/// aspect ratio, explicit `image_gen` tool execution directives, and positive-only
+/// reference/textless rendering guidance.
 #[must_use]
 pub fn build_generation_prompt(request: &ImageGenerationRequest) -> String {
     let aspect = format_aspect_ratio(request.width, request.height);
@@ -118,7 +122,8 @@ pub fn build_generation_prompt(request: &ImageGenerationRequest) -> String {
         "[RENDER_TARGET]\n\
          dimensions: {}x{}\n\
          aspect_ratio: {}\n\
-         instruction: {} at {}x{} ({}) framing as purely visual artwork with clean, unlabeled surfaces and zero rendered text or labels.\n\n\
+         tool: image_gen (required; invoke the built-in image_gen tool directly to generate and save a raster PNG image; never reply with text-only commentary, clarifying questions, or code, and do not inspect repository files)\n\
+         instruction: {} at {}x{} ({}) framing via image_gen as purely visual artwork with clean, unlabeled surfaces and zero rendered text or labels.\n\n\
          {}",
         request.width,
         request.height,
@@ -180,10 +185,23 @@ impl ImageBackend for CodexNativeBackend {
                 "compiled prompt must not be empty".to_string(),
             ));
         }
+        let mut resolved_refs = Vec::with_capacity(request.reference_images.len());
         for ref_path in &request.reference_images {
             let ref_bytes =
                 read_regular_file_nofollow(ref_path, "CodexNativeBackend reference PNG")?;
             let _ = decode_png_checked(ref_path, &ref_bytes)?;
+            let abs_ref = if ref_path.is_absolute() {
+                ref_path.clone()
+            } else {
+                std::env::current_dir()
+                    .map_err(|err| CoreError::Io {
+                        context: "resolving working directory for CodexNativeBackend reference PNG"
+                            .to_string(),
+                        source: err,
+                    })?
+                    .join(ref_path)
+            };
+            resolved_refs.push(abs_ref);
         }
 
         let temp_codex_home = TempCodexHome::create(&self.auth_dir)?;
@@ -191,10 +209,12 @@ impl ImageBackend for CodexNativeBackend {
 
         let mut cmd = Command::new(&self.codex_bin);
         cmd.kill_on_drop(true);
+        cmd.current_dir(temp_codex_home.path());
         cmd.args(["exec", "--ephemeral", "--json"]);
-        for ref_path in &request.reference_images {
+        for ref_path in &resolved_refs {
             cmd.arg("-i").arg(ref_path);
         }
+        cmd.arg("--skip-git-repo-check");
         cmd.arg("--").arg(&full_prompt);
         cmd.env("CODEX_HOME", temp_codex_home.path());
         cmd.env_remove("OPENAI_API_KEY");
@@ -227,7 +247,21 @@ impl ImageBackend for CodexNativeBackend {
         let thread_id = extract_thread_id_from_jsonl(&stdout_str);
 
         let generated_root = temp_codex_home.path().join("generated_images");
-        let png_path = locate_generated_png(&generated_root, thread_id.as_deref())?;
+        let png_path = match locate_generated_png(&generated_root, thread_id.as_deref()) {
+            Ok(path) => path,
+            Err(CoreError::GeneratedImageNotFound {
+                search_root,
+                thread_id,
+                ..
+            }) => {
+                return Err(CoreError::GeneratedImageNotFound {
+                    search_root,
+                    thread_id,
+                    detail: extract_failure_detail_from_jsonl(&stdout_str),
+                });
+            }
+            Err(other) => return Err(other),
+        };
 
         let raw_bytes = read_regular_png_nofollow(&png_path)?;
 
@@ -276,6 +310,117 @@ fn is_safe_thread_id(raw: &str) -> bool {
         && raw
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Extract a concise, single-line sanitized diagnostic summary (`<= 300` chars)
+/// from the last `error`, `turn.failed`, or `agent_message` event in `codex exec --json`
+/// JSONL output.
+#[must_use]
+pub fn extract_failure_detail_from_jsonl(jsonl: &str) -> Option<String> {
+    let mut last_detail: Option<String> = None;
+
+    for line in jsonl.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+
+        let event_type = value.get("type").and_then(|v| v.as_str());
+        let candidate: Option<(&str, String)> = match event_type {
+            Some("error") => extract_error_text(&value).map(|msg| ("error", msg)),
+            Some("turn.failed") => extract_error_text(&value)
+                .or_else(|| {
+                    value
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .map(|msg| ("turn.failed", msg)),
+            Some("agent_message") => {
+                extract_agent_message_text(&value).map(|msg| ("agent_message", msg))
+            }
+            _ => value
+                .get("item")
+                .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("agent_message"))
+                .and_then(extract_agent_message_text)
+                .map(|msg| ("agent_message", msg)),
+        };
+
+        if let Some((kind, raw_msg)) = candidate {
+            let sanitized = sanitize_single_line(&raw_msg);
+            if !sanitized.is_empty() {
+                last_detail = Some(truncate_detail(
+                    &format!("{kind}: {sanitized}"),
+                    MAX_FAILURE_DETAIL_CHARS,
+                ));
+            }
+        }
+    }
+
+    last_detail
+}
+
+fn extract_error_text(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|err| {
+            err.get("message")
+                .and_then(|v| v.as_str())
+                .or_else(|| err.as_str())
+        })
+        .or_else(|| value.get("message").and_then(|v| v.as_str()))
+        .or_else(|| value.get("detail").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
+
+fn extract_agent_message_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value
+        .get("text")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("message").and_then(|v| v.as_str()))
+    {
+        return Some(text.to_string());
+    }
+
+    if let Some(content) = value.get("content") {
+        if let Some(text) = content.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(parts) = content.as_array() {
+            let joined: Vec<&str> = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|v| v.as_str()))
+                .filter(|part| !part.trim().is_empty())
+                .collect();
+            if !joined.is_empty() {
+                return Some(joined.join(" "));
+            }
+        }
+    }
+
+    None
+}
+
+fn sanitize_single_line(raw: &str) -> String {
+    let replaced: String = raw
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    replaced.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_detail(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated: String = text.chars().take(keep).collect();
+    truncated.push_str("...");
+    truncated
 }
 
 fn ensure_real_directory(dir: &Path, label: &str) -> Result<bool, CoreError> {
@@ -388,6 +533,7 @@ pub fn locate_generated_png(
         return Err(CoreError::GeneratedImageNotFound {
             search_root: generated_root.to_path_buf(),
             thread_id: thread_id.map(str::to_string),
+            detail: None,
         });
     }
 
@@ -407,6 +553,7 @@ pub fn locate_generated_png(
     Err(CoreError::GeneratedImageNotFound {
         search_root: generated_root.to_path_buf(),
         thread_id: thread_id.map(str::to_string),
+        detail: None,
     })
 }
 
@@ -521,6 +668,47 @@ mod tests {
     }
 
     #[rstest]
+    #[case::item_completed_agent_message(
+        "{\"type\":\"thread.started\",\"thread_id\":\"thr_1\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"agent_message\",\"text\":\"Please clarify the target region.\"}}\n{\"type\":\"turn.completed\"}\n",
+        Some("agent_message: Please clarify the target region.")
+    )]
+    #[case::direct_agent_message_multiline_sanitized(
+        "{\"type\":\"agent_message\",\"text\":\"Line one\\n\\tLine\\u0007 two\"}\n",
+        Some("agent_message: Line one Line two")
+    )]
+    #[case::turn_failed_after_agent_message_picks_last(
+        "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Working on it\"}}\n{\"type\":\"turn.failed\",\"error\":{\"message\":\"image_gen tool timed out\"}}\n",
+        Some("turn.failed: image_gen tool timed out")
+    )]
+    #[case::error_event_overrides_prior_message(
+        "{\"type\":\"error\",\"message\":\"stream interrupted\"}\n",
+        Some("error: stream interrupted")
+    )]
+    #[case::unrelated_or_malformed_lines_return_none(
+        "not json\n{\"type\":\"thread.started\",\"thread_id\":\"thr_1\"}\n{\"type\":\"turn.completed\"}\n",
+        None
+    )]
+    fn extracts_failure_detail_from_jsonl_events(
+        #[case] jsonl: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            extract_failure_detail_from_jsonl(jsonl).as_deref(),
+            expected
+        );
+    }
+
+    #[test]
+    fn extract_failure_detail_from_jsonl_bounds_long_messages_to_300_chars() {
+        let long_text = "x".repeat(500);
+        let jsonl = format!(r#"{{"type":"error","message":"{long_text}"}}"#);
+        let detail = extract_failure_detail_from_jsonl(&jsonl).expect("detail should be present");
+        assert_eq!(detail.chars().count(), MAX_FAILURE_DETAIL_CHARS);
+        assert!(detail.starts_with("error: "));
+        assert!(detail.ends_with("..."));
+    }
+
+    #[rstest]
     #[case::exact_dimensions(1024, 1024, 1024, 1024, true)]
     #[case::scaled_square_codex_quirk_1254(1254, 1254, 1024, 1024, true)]
     #[case::within_5_percent_ar_tolerance(1040, 1000, 1000, 1000, true)]
@@ -567,6 +755,7 @@ mod tests {
         fs::write(&generated_png_fixture, make_solid_png(1254, 1254)).unwrap();
 
         let recorded_codex_home = root.path().join("codex_home.txt");
+        let recorded_cwd = root.path().join("codex_cwd.txt");
         let recorded_args = root.path().join("codex_args.txt");
         let stub_bin = root.path().join("codex-stub");
 
@@ -574,6 +763,7 @@ mod tests {
             r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s' "$CODEX_HOME" > "{home_log}"
+pwd > "{cwd_log}"
 printf '%s\n' "$@" > "{args_log}"
 if [ -n "${{OPENAI_API_KEY:-}}" ]; then
   echo "OPENAI_API_KEY must be unset" >&2
@@ -584,6 +774,7 @@ cp "{fixture}" "$CODEX_HOME/generated_images/thr_001/out.png"
 printf '{{"type":"thread.started","thread_id":"thr_001"}}\n'
 "#,
             home_log = recorded_codex_home.display(),
+            cwd_log = recorded_cwd.display(),
             args_log = recorded_args.display(),
             fixture = generated_png_fixture.display()
         );
@@ -613,8 +804,10 @@ printf '{{"type":"thread.started","thread_id":"thr_001"}}\n'
             .expect("valid PNG");
         assert_eq!((decoded.width(), decoded.height()), (1024, 1024));
 
-        // Verify RAII cleanup of isolated CODEX_HOME
+        // Verify RAII cleanup of isolated CODEX_HOME and CWD isolation
         let used_home = PathBuf::from(fs::read_to_string(&recorded_codex_home).unwrap());
+        let used_cwd = PathBuf::from(fs::read_to_string(&recorded_cwd).unwrap().trim());
+        assert_eq!(used_cwd, used_home);
         assert_ne!(used_home, auth_dir);
         assert!(
             !used_home.exists(),
@@ -623,10 +816,75 @@ printf '{{"type":"thread.started","thread_id":"thr_001"}}\n'
 
         let args = fs::read_to_string(&recorded_args).unwrap();
         assert!(args.contains("exec\n--ephemeral\n--json\n-i\n"));
+        assert!(args.contains("--skip-git-repo-check"));
         assert!(args.contains(&ref_img.to_string_lossy().into_owned()));
         assert!(args.contains("1024x1024"));
         assert!(args.contains("1:1"));
+        assert!(args.contains("image_gen"));
         assert!(args.contains("attached reference"));
+    }
+
+    #[rstest]
+    #[case::agent_message_text_only(
+        r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Which brush style would you prefer?"}}"#,
+        "agent_message: Which brush style would you prefer?"
+    )]
+    #[case::turn_failed_reason(
+        r#"{"type":"turn.failed","error":{"message":"image_gen call was skipped"}}"#,
+        "turn.failed: image_gen call was skipped"
+    )]
+    #[tokio::test]
+    async fn codex_native_backend_surfaces_jsonl_diagnostic_when_no_png_found_and_cleans_up(
+        #[case] event_line: &str,
+        #[case] expected_detail: &str,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let auth_dir = root.path().join("auth");
+        create_secure_auth_dir(&auth_dir);
+
+        let recorded_codex_home = root.path().join("codex_home_diag.txt");
+        let stub_bin = root.path().join("codex-no-png");
+        let script = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s' "$CODEX_HOME" > "{home_log}"
+printf '{{"type":"thread.started","thread_id":"thr_diag"}}\n'
+printf '%s\n' '{event_line}'
+"#,
+            home_log = recorded_codex_home.display(),
+            event_line = event_line
+        );
+        fs::write(&stub_bin, script).unwrap();
+        fs::set_permissions(&stub_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend =
+            CodexNativeBackend::with_codex_bin(auth_dir, stub_bin.to_string_lossy().into_owned());
+        let err = backend
+            .generate(&ImageGenerationRequest {
+                prompt: "harbor lantern".to_string(),
+                width: 512,
+                height: 512,
+                reference_images: Vec::new(),
+            })
+            .await
+            .expect_err("missing generated PNG must fail closed with diagnostic detail");
+
+        match &err {
+            CoreError::GeneratedImageNotFound {
+                thread_id, detail, ..
+            } => {
+                assert_eq!(thread_id.as_deref(), Some("thr_diag"));
+                assert_eq!(detail.as_deref(), Some(expected_detail));
+            }
+            other => panic!("expected GeneratedImageNotFound, got {other:?}"),
+        }
+        assert!(err.to_string().contains(expected_detail));
+
+        let used_home = PathBuf::from(fs::read_to_string(&recorded_codex_home).unwrap());
+        assert!(
+            !used_home.exists(),
+            "TempCodexHome must be removed even when GeneratedImageNotFound occurs"
+        );
     }
 
     #[tokio::test]
@@ -759,6 +1017,7 @@ printf '{{"type":"thread.started","thread_id":"thr_err"}}\n'
         });
         assert!(prompt.contains(expected_dim));
         assert!(prompt.contains(expected_ar));
+        assert!(prompt.contains("image_gen"));
         assert!(prompt.contains("unlabeled surfaces"));
         assert_eq!(prompt.contains("attached reference"), expect_ref_phrase);
     }

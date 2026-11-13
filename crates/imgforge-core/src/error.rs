@@ -15,8 +15,25 @@
 //! 1. Subsystems return `Result<T, CoreError>` on any invariant violation.
 //! 2. The CLI and `axum` handlers map `CoreError` to non-zero exit codes or HTTP errors.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
+
+fn format_generated_image_not_found(
+    search_root: &Path,
+    thread_id: &Option<String>,
+    detail: &Option<String>,
+) -> String {
+    match detail.as_deref() {
+        Some(msg) => format!(
+            "no generated PNG found under {} (thread_id={thread_id:?}): {msg}",
+            search_root.display()
+        ),
+        None => format!(
+            "no generated PNG found under {} (thread_id={thread_id:?})",
+            search_root.display()
+        ),
+    }
+}
 
 /// Canonical fail-closed error type for `imgforge-core`.
 #[derive(Debug, Error)]
@@ -101,12 +118,14 @@ pub enum CoreError {
     },
 
     /// `CodexNativeBackend` could not locate a generated PNG under `$CODEX_HOME/generated_images`.
-    #[error("no generated PNG found under {search_root} (thread_id={thread_id:?})")]
+    #[error("{}", format_generated_image_not_found(.search_root, .thread_id, .detail))]
     GeneratedImageNotFound {
         /// Isolated `generated_images` directory searched.
         search_root: PathBuf,
         /// Optional `thread_id` parsed from JSONL output.
         thread_id: Option<String>,
+        /// Optional sanitized diagnostic detail extracted from `codex exec --json` output.
+        detail: Option<String>,
     },
 
     /// Located output file did not match the 8-byte PNG signature or failed PNG decoding.

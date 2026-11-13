@@ -421,6 +421,43 @@ pub struct PatchEditResult {
     pub png_bytes: Vec<u8>,
 }
 
+/// Build the positive-only `PatchEdit` prompt framing Image 1 as the `1:1` square
+/// target crop to edit via `image_gen` while preserving the outer collar border
+/// and explaining the active `PatchPrepMode`.
+#[must_use]
+pub fn build_patch_edit_prompt(
+    user_prompt: &str,
+    prep_mode: PatchPrepMode,
+    has_extra_refs: bool,
+) -> String {
+    let prep_instruction = match prep_mode {
+        PatchPrepMode::CropOnly => {
+            "Edit only the requested subject or detail within the center region of Image 1 while keeping the surrounding collar pixels consistent."
+        }
+        PatchPrepMode::BlankInsideMask => {
+            "Fill the neutral #252830 masked interior area inside Image 1 with the requested edit while matching the surrounding collar lighting, perspective, and brushwork seamlessly."
+        }
+        PatchPrepMode::CueOutline => {
+            "The #F6AD55 / #1A1D24 outline in Image 1 marks the target edit boundary; apply the requested edit inside that boundary and paint clean continuous artwork over the guide line so only finished artwork appears in the output."
+        }
+    };
+
+    let extra_refs_instruction = if has_extra_refs {
+        "Use the additional attached reference image(s) for visual consistency with the target subject, style, and materials."
+    } else {
+        "Match the existing style, materials, and lighting of Image 1."
+    };
+
+    format!(
+        "Image 1 is the 1:1 square target crop to edit via image_gen. \
+         Preserve the outer collar border, lighting, palette, linework, and surrounding composition seamlessly. \
+         {prep_instruction} \
+         {extra_refs_instruction} \
+         Requested edit: {}",
+        user_prompt.trim()
+    )
+}
+
 /// Execute `PatchEdit` on a target PNG using `ImageBackend` and record a `Run`.
 pub async fn execute_patch_edit(
     backend: &dyn ImageBackend,
@@ -517,9 +554,15 @@ pub async fn execute_patch_edit(
         input_hashes.insert(format!("ref_{idx}"), sha256_hex(&bytes));
     }
 
+    let patch_prompt = build_patch_edit_prompt(
+        &request.compiled_prompt,
+        request.config.prep_mode,
+        !request.reference_images.is_empty(),
+    );
+
     let backend_output = backend
         .generate(&ImageGenerationRequest {
-            prompt: request.compiled_prompt.clone(),
+            prompt: patch_prompt,
             width: crop_rect.width,
             height: crop_rect.height,
             reference_images: refs,
@@ -1707,6 +1750,54 @@ mod tests {
     }
 
     #[rstest]
+    #[case::crop_only_no_extra_refs(
+        PatchPrepMode::CropOnly,
+        false,
+        "center region of Image 1",
+        "Match the existing style"
+    )]
+    #[case::blank_inside_mask_no_extra_refs(
+        PatchPrepMode::BlankInsideMask,
+        false,
+        "#252830",
+        "Match the existing style"
+    )]
+    #[case::cue_outline_with_extra_refs(
+        PatchPrepMode::CueOutline,
+        true,
+        "#F6AD55 / #1A1D24",
+        "additional attached reference"
+    )]
+    #[case::crop_only_with_extra_refs(
+        PatchPrepMode::CropOnly,
+        true,
+        "center region of Image 1",
+        "additional attached reference"
+    )]
+    fn build_patch_edit_prompt_frames_prep_mode_and_refs_positively(
+        #[case] prep_mode: PatchPrepMode,
+        #[case] has_extra_refs: bool,
+        #[case] expected_prep_marker: &str,
+        #[case] expected_ref_marker: &str,
+    ) {
+        let prompt =
+            build_patch_edit_prompt("replace broken lantern handle", prep_mode, has_extra_refs);
+        assert!(prompt.contains("Image 1 is the 1:1 square target crop to edit via image_gen"));
+        assert!(prompt.contains("Preserve the outer collar border"));
+        assert!(prompt.contains(expected_prep_marker));
+        assert!(prompt.contains(expected_ref_marker));
+        assert!(prompt.contains("Requested edit: replace broken lantern handle"));
+
+        let lower = prompt.to_ascii_lowercase();
+        for forbidden in ["no ", "not ", "never ", "without ", "avoid ", "free of"] {
+            assert!(
+                !lower.contains(forbidden),
+                "PatchEdit prompt must remain positive-only (found '{forbidden}'): {prompt}"
+            );
+        }
+    }
+
+    #[rstest]
     #[case::roi_rect_crop_only(PatchPrepMode::CropOnly, false)]
     #[case::roi_rect_blank_inside_mask(PatchPrepMode::BlankInsideMask, false)]
     #[case::alpha_mask_png_cue_outline(PatchPrepMode::CueOutline, true)]
@@ -1771,10 +1862,21 @@ mod tests {
         .await
         .expect("PatchEdit succeeds");
 
-        // Backend was invoked at 1:1 square WxW.
+        // Backend was invoked at 1:1 square WxW with PatchEdit framing, while RunMetadata keeps user prompt.
         let reqs = seen.lock().unwrap();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].width, reqs[0].height);
+        assert!(reqs[0].prompt.contains("1:1"));
+        assert!(reqs[0].prompt.contains("image_gen"));
+        assert!(
+            reqs[0]
+                .prompt
+                .contains("adjust lantern brass highlight cleanly")
+        );
+        assert_eq!(
+            result.run.metadata.compiled_prompt,
+            "adjust lantern brass highlight cleanly"
+        );
         assert_eq!(result.crop_rect.width, result.crop_rect.height);
 
         // Zero drift outside crop/collar footprint.

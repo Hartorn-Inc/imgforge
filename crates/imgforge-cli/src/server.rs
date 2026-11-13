@@ -718,6 +718,23 @@ impl From<CoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            if self.status == StatusCode::INTERNAL_SERVER_ERROR {
+                tracing::error!(
+                    status = self.status.as_u16(),
+                    code = self.code,
+                    message = %self.message,
+                    "imgforge API request failed with internal server error"
+                );
+            } else {
+                tracing::warn!(
+                    status = self.status.as_u16(),
+                    code = self.code,
+                    message = %self.message,
+                    "imgforge API request failed with 5xx server error"
+                );
+            }
+        }
         (
             self.status,
             Json(serde_json::json!({
@@ -4030,5 +4047,45 @@ JSON
         .await;
         assert_eq!(st_leak, StatusCode::FORBIDDEN);
         assert_eq!(leak_err["error"], "visibility_violation");
+    }
+
+    #[test]
+    fn api_error_maps_5xx_failures_and_preserves_generated_image_diagnostic_detail() {
+        let missing_png = ApiError::from(CoreError::GeneratedImageNotFound {
+            search_root: PathBuf::from("/tmp/imgforge-codex-test/generated_images"),
+            thread_id: Some("thr_diag".to_string()),
+            detail: Some("agent_message: Need style details before calling image_gen".to_string()),
+        });
+        assert_eq!(missing_png.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(missing_png.code, "backend_failed");
+        assert!(
+            missing_png
+                .message
+                .contains("agent_message: Need style details before calling image_gen")
+        );
+
+        let resp = missing_png.into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let io_err = ApiError::from(CoreError::Io {
+            context: "writing temp patch".to_string(),
+            source: std::io::Error::other("disk full"),
+        });
+        assert_eq!(io_err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(io_err.code, "io_error");
+        assert_eq!(
+            io_err.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        let auth_err = ApiError::from(CoreError::AuthMissing {
+            auth_file: PathBuf::from("/tmp/missing/auth.json"),
+        });
+        assert_eq!(auth_err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(auth_err.code, "auth_unavailable");
+        assert_eq!(
+            auth_err.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

@@ -45,8 +45,8 @@ pub use auth::{
 };
 pub use backend::{
     CodexNativeBackend, ImageBackend, ImageGenerationOutput, ImageGenerationRequest, PNG_SIGNATURE,
-    build_generation_prompt, extract_thread_id_from_jsonl, format_aspect_ratio,
-    locate_generated_png, validate_and_resample_png,
+    build_generation_prompt, extract_failure_detail_from_jsonl, extract_thread_id_from_jsonl,
+    format_aspect_ratio, locate_generated_png, validate_and_resample_png,
 };
 pub use calibration::{
     CALIBRATION_CELL_SIZE_PX, CALIBRATION_STRIP_HEIGHT_PX, CalibrationStripLayout,
@@ -83,9 +83,9 @@ pub use edit::{
     MIN_COLLAR_WIDTH_PX, OwnedSubjectRoi, PatchEditConfig, PatchEditRequest, PatchEditResult,
     PatchPrepMode, PatchTargetMask, REINHARD_GAIN_MAX, REINHARD_GAIN_MIN, ReinhardGainSummary,
     WholeImageEditRequest, WholeImageEditResult, apply_collar_reinhard_oklab,
-    build_laplacian_pyramid, composite_calibrated_patch, euclidean_distance_transform,
-    execute_patch_edit, execute_whole_image_edit, laplacian_pyramid_blend,
-    reconstruct_laplacian_pyramid,
+    build_laplacian_pyramid, build_patch_edit_prompt, composite_calibrated_patch,
+    euclidean_distance_transform, execute_patch_edit, execute_whole_image_edit,
+    laplacian_pyramid_blend, reconstruct_laplacian_pyramid,
 };
 pub use error::CoreError;
 pub use eval::{
