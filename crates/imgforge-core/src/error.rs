@@ -234,6 +234,10 @@ pub enum CoreError {
     #[error("Export failed: {0}")]
     ExportFailed(String),
 
+    /// Strategy evaluation harness (`imgforge eval`) failed.
+    #[error("Eval harness failed: {0}")]
+    EvalFailed(String),
+
     /// Underlying filesystem or process I/O error.
     #[error("I/O error during {context}: {source}")]
     Io {

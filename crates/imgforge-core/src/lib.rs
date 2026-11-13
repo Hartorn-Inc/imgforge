@@ -17,6 +17,7 @@ pub mod config;
 pub mod critic;
 pub mod edit;
 pub mod error;
+pub mod eval;
 pub mod export;
 pub mod generate;
 pub mod guide_renderer;
@@ -87,6 +88,20 @@ pub use edit::{
     reconstruct_laplacian_pyramid,
 };
 pub use error::CoreError;
+pub use eval::{
+    BoundaryDiscontinuityReport, ContactSheetArtifact, DEFAULT_EVAL_MAX_CONCURRENCY,
+    DEFAULT_EXTERNAL_SCORER_TIMEOUT_SECS, DebiasedPairwiseOutcome, DeterministicMetricsReport,
+    EvalCaseKind, EvalCaseSpec, EvalCaseSummary, EvalRunConfig, EvalState, EvalStrategy,
+    EvalSummary, EvalTrialResult, ExpectedSubjectBbox, ExternalScorerRequest,
+    ExternalScorerResponse, LineStraightnessReport, MAX_EXTERNAL_SCORER_LINE_BYTES, NormalizedRect,
+    PAIRWISE_JUDGE_OUTPUT_SCHEMA, PAIRWISE_TRAITS_END, PAIRWISE_TRAITS_START,
+    PairwiseComparisonRecord, PairwiseJudge, PairwiseJudgeOutput, PairwiseTraitVerdict,
+    PairwiseVerdictChoice, SUPPORTED_EVAL_SCHEMA_VERSION, SpatialGuideAlignmentReport,
+    SpatialGuideBboxMatch, build_pairwise_judge_prompt, compute_boundary_discontinuity_score,
+    compute_case_deterministic_metrics, compute_line_straightness_residual, compute_masked_ssim,
+    evaluate_spatial_guide_alignment, execute_eval, invoke_external_scorer, load_eval_cases_dir,
+    reconcile_swapped_verdicts, render_contact_sheet, validate_pairwise_judge_json,
+};
 pub use export::{
     CubeLut, DEFAULT_CDF_DAMP_STRENGTH, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
     DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportResult, ExportSource,
