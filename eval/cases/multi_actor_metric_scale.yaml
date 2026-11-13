@@ -8,17 +8,17 @@ expected_subject_bboxes:
   - id: actor-tall
     pixel_rect:
       x: 64
-      y: 120
+      y: 110
       width: 29
-      height: 95
-    expected_height_ratio: 0.3711
+      height: 105
+    expected_height_ratio: 0.4102
   - id: actor-compact
     pixel_rect:
       x: 175
-      y: 154
+      y: 153
       width: 17
-      height: 61
-    expected_height_ratio: 0.2383
+      height: 63
+    expected_height_ratio: 0.2461
 prompt: Stage the tall sentinel on the left and the compact scout on the right matching the Blockout metric proportions.
 strategies:
   - blockout_guide

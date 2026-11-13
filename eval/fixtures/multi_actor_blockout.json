@@ -12,14 +12,14 @@
       "label": "Background Horizon",
       "plane": "background",
       "yStartRatio": 0.0,
-      "yEndRatio": 0.45,
+      "yEndRatio": 0.35,
       "fillHex": "#2C3344"
     },
     {
       "id": "band-fg",
       "label": "Foreground Stage",
       "plane": "foreground",
-      "yStartRatio": 0.45,
+      "yStartRatio": 0.35,
       "yEndRatio": 1.0,
       "fillHex": "#4A5164"
     }

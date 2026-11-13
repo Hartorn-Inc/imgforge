@@ -26,16 +26,17 @@ use imgforge_core::auth::DEFAULT_CODEX_BIN;
 use imgforge_core::{
     AtlasPackRequest, AtlasSliceSelection, AuthManager, CodexNativeBackend, CoreError,
     DEFAULT_ATLAS_HEIGHT, DEFAULT_ATLAS_PADDING_PX, DEFAULT_ATLAS_WIDTH, DEFAULT_CDF_DAMP_STRENGTH,
-    DEFAULT_COLLAR_WIDTH_PX, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
-    DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportSource, ExposureQaConfig,
-    GenerateRequest, GenerateSceneInput, GenerationMode, GuideRenderer, GuideSpec, LibraryRegistry,
-    Lifecycle, MAX_TEXT_FILE_BYTES, ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi,
-    PaletteQaConfig, PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect,
+    DEFAULT_COLLAR_WIDTH_PX, DEFAULT_EVAL_MAX_CONCURRENCY, DEFAULT_TOKEN_RING_HEX,
+    DEFAULT_VTT_MAP_GRID_PX, DEFAULT_VTT_TOKEN_SIZE_PX, EvalRunConfig, EvalStrategy, ExportProfile,
+    ExportRequest, ExportSource, ExposureQaConfig, GenerateRequest, GenerateSceneInput,
+    GenerationMode, GuideRenderer, GuideSpec, LibraryRegistry, Lifecycle, MAX_TEXT_FILE_BYTES,
+    ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi, PairwiseJudge, PaletteQaConfig,
+    PatchEditConfig, PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect,
     ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore, SceneComposer,
     SceneSpec, SlicerConfig, SparkleConfig, SubjectRoiBinding, TraitCategory, TraitCheckInput,
     UntouchedDriftConfig, ValidateReferencePackRequest, ValidateRunRequest, Visibility,
     VisionCritic, VisionCriticRequest, VttMapOptions, VttTokenOptions, WholeImageEditRequest,
-    check_visibility_compatibility, compile_scene_spec_with_registry, execute_export,
+    check_visibility_compatibility, compile_scene_spec_with_registry, execute_eval, execute_export,
     execute_generate, execute_patch_edit, execute_whole_image_edit, inspect_workspace_status,
     pack_dynamic_atlas, promote_reference_pack, promote_run, read_text_file_nofollow_bounded,
     resolve_codex_auth_dir_from_env, resolve_user_config_dir_from_env, resolve_workspace_from_env,
@@ -93,6 +94,8 @@ enum Commands {
     Library(LibraryArgs),
     /// Generate, slice, and dynamically pack style-scoped ReferencePack sheets and Atlases.
     Pack(PackArgs),
+    /// Run reproducible & resumable strategy evaluation harness across frozen cases.
+    Eval(EvalArgs),
     /// Start the embedded Web Canvas SPA server strictly on 127.0.0.1:<port>.
     Ui(UiArgs),
     /// Start the `rmcp` Model Context Protocol server (stdio by default, or --http 127.0.0.1:<port>).
@@ -488,6 +491,66 @@ struct CriticArgs {
     /// Trait check specification formatted as `id:category:criterion` or plain `criterion`.
     #[arg(long = "trait", value_name = "SPEC", required = true)]
     traits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliEvalStrategy {
+    #[value(name = "whole_image_fix", alias = "whole-image-fix")]
+    WholeImageFix,
+    #[value(name = "patch_crop_only", alias = "patch-crop-only")]
+    PatchCropOnly,
+    #[value(name = "patch_blank_inside_mask", alias = "patch-blank-inside-mask")]
+    PatchBlankInsideMask,
+    #[value(name = "patch_cue_outline", alias = "patch-cue-outline")]
+    PatchCueOutline,
+    #[value(name = "overlay_guide", alias = "overlay-guide")]
+    OverlayGuide,
+    #[value(name = "blockout_guide", alias = "blockout-guide")]
+    BlockoutGuide,
+}
+
+impl From<CliEvalStrategy> for EvalStrategy {
+    fn from(val: CliEvalStrategy) -> Self {
+        match val {
+            CliEvalStrategy::WholeImageFix => Self::WholeImageFix,
+            CliEvalStrategy::PatchCropOnly => Self::PatchCropOnly,
+            CliEvalStrategy::PatchBlankInsideMask => Self::PatchBlankInsideMask,
+            CliEvalStrategy::PatchCueOutline => Self::PatchCueOutline,
+            CliEvalStrategy::OverlayGuide => Self::OverlayGuide,
+            CliEvalStrategy::BlockoutGuide => Self::BlockoutGuide,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct EvalArgs {
+    /// Directory containing frozen eval case YAML specifications.
+    #[arg(long, value_name = "DIR", default_value = "eval/cases")]
+    cases_dir: PathBuf,
+    /// Output directory receiving eval_state.json, trials/, sheets/, and eval_summary.{json,md}.
+    #[arg(long, value_name = "DIR", default_value = "eval/results")]
+    out_dir: PathBuf,
+    /// Run deterministic CV metrics only without invoking ImageBackend or VLM judge.
+    #[arg(long)]
+    metrics_only: bool,
+    /// Maximum concurrent generative/VLM evaluation jobs (clamped >= 1).
+    #[arg(long, default_value_t = DEFAULT_EVAL_MAX_CONCURRENCY)]
+    max_concurrency: usize,
+    /// Ignore existing eval_state.json checkpoints and re-run all selected tuples.
+    #[arg(long)]
+    force: bool,
+    /// Filter evaluation to specific case ID(s) (repeatable).
+    #[arg(long = "case", value_name = "ID")]
+    cases: Vec<String>,
+    /// Filter evaluation to specific strategy name(s) (repeatable).
+    #[arg(long = "strategy", value_enum, value_name = "STRATEGY")]
+    strategies: Vec<CliEvalStrategy>,
+    /// Optional external JSONL stdin/stdout scorer executable path or command.
+    #[arg(long, value_name = "CMD_OR_PATH")]
+    external_scorer: Option<String>,
+    /// Emit machine-readable JSON eval summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1807,6 +1870,45 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Commands::Eval(args) => {
+            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+            let registry = match ws.as_ref() {
+                Some(resolved) => LibraryRegistry::from_workspace(resolved),
+                None => LibraryRegistry::new(None, resolve_user_config_dir_from_env()),
+            };
+            let base_root = ws.as_ref().map(|w| w.root.clone());
+            let cfg = EvalRunConfig {
+                cases_dir: args.cases_dir,
+                base_root,
+                out_dir: args.out_dir,
+                metrics_only: args.metrics_only,
+                max_concurrency: args.max_concurrency.max(1),
+                force: args.force,
+                filter_cases: args.cases,
+                filter_strategies: args.strategies.into_iter().map(Into::into).collect(),
+                external_scorer: args.external_scorer,
+                ..EvalRunConfig::default()
+            };
+
+            let summary = if cfg.metrics_only {
+                execute_eval(None, None, &registry, &cfg).await?
+            } else {
+                let backend =
+                    CodexNativeBackend::with_codex_bin(auth_dir.clone(), codex_bin.clone());
+                let judge = PairwiseJudge::with_codex_bin(auth_dir, codex_bin);
+                execute_eval(Some(&backend), Some(&judge), &registry, &cfg).await?
+            };
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("{}", summary.markdown_summary);
+            }
+
+            if !summary.overall_passed {
+                bail!("one or more evaluation trials failed");
+            }
+        }
         Commands::Ui(args) => {
             let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
             let port = args
@@ -1950,6 +2052,57 @@ mod tests {
                 assert_eq!(parsed.rois.len(), roi_len);
             }
             None => assert!(res.is_err()),
+        }
+    }
+
+    #[rstest]
+    #[case::metrics_only_defaults(
+        &["imgforge", "eval", "--metrics-only"],
+        true,
+        2,
+        false,
+        None
+    )]
+    #[case::full_flags_with_filters(
+        &[
+            "imgforge",
+            "eval",
+            "--cases-dir",
+            "eval/cases",
+            "--out-dir",
+            "/tmp/eval-out",
+            "--max-concurrency",
+            "4",
+            "--force",
+            "--case",
+            "straight-blade-patch",
+            "--strategy",
+            "patch_cue_outline",
+            "--external-scorer",
+            "/usr/local/bin/scorer",
+            "--json"
+        ],
+        false,
+        4,
+        true,
+        Some("/usr/local/bin/scorer")
+    )]
+    fn parses_eval_cli_flags_and_strategies(
+        #[case] argv: &[&str],
+        #[case] expect_metrics_only: bool,
+        #[case] expect_concurrency: usize,
+        #[case] expect_force: bool,
+        #[case] expect_scorer: Option<&str>,
+    ) {
+        let cli = Cli::try_parse_from(argv).expect("eval CLI flags should parse");
+        match cli.command {
+            Commands::Eval(args) => {
+                assert_eq!(args.metrics_only, expect_metrics_only);
+                assert_eq!(args.max_concurrency, expect_concurrency);
+                assert_eq!(args.force, expect_force);
+                assert_eq!(args.external_scorer.as_deref(), expect_scorer);
+            }
+            other => panic!("expected Commands::Eval, got {other:?}"),
         }
     }
 }

@@ -1207,16 +1207,12 @@ fn extract_row_modal_foreground_bboxes(image: &RgbaImage) -> Vec<PixelRect> {
                 *row_counts.entry([p[0], p[1], p[2]]).or_insert(0) += 1;
             }
         }
-        let Some((&bg_rgb, &bg_count)) = row_counts
+        let Some((&bg_rgb, _)) = row_counts
             .iter()
             .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
         else {
             continue;
         };
-        // Full-width horizontal divider or solid row (>90% single color) carries no silhouettes.
-        if bg_count * 10 >= w * 9 {
-            continue;
-        }
         for x in 0..w {
             let p = image.get_pixel(x as u32, y as u32).0;
             if p[3] == 0 {
@@ -3799,5 +3795,159 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
         let err = EvalCaseSpec::from_yaml_str(raw_yaml)
             .expect_err("invalid EvalCaseSpec YAML must fail closed");
         assert!(matches!(err, CoreError::EvalFailed(_)));
+    }
+
+    #[rstest]
+    #[case::straight_blade_patch("straight-blade-patch", 3)]
+    #[case::surface_detail_preservation("surface-detail-preservation", 2)]
+    #[case::multi_actor_metric_scale("multi-actor-metric-scale", 2)]
+    #[case::trajectory_overlay_guide("trajectory-overlay-guide", 2)]
+    #[case::crimson_albedo_retention("crimson-albedo-retention", 2)]
+    #[tokio::test]
+    async fn frozen_eval_cases_execute_metrics_only_and_discriminate_strategies(
+        #[case] case_id: &str,
+        #[case] expected_trial_count: usize,
+    ) {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("resolve repo root");
+        let cases_dir = repo_root.join("eval/cases");
+        let out_dir = TempDir::new().unwrap();
+        let registry = LibraryRegistry::new(None, None);
+
+        let cfg = EvalRunConfig {
+            cases_dir,
+            base_root: Some(repo_root),
+            out_dir: out_dir.path().to_path_buf(),
+            metrics_only: true,
+            max_concurrency: 2,
+            force: false,
+            filter_cases: vec![case_id.to_string()],
+            filter_strategies: Vec::new(),
+            external_scorer: None,
+            external_scorer_timeout: Duration::from_secs(5),
+            contact_sheet_panel_px: 96,
+        };
+
+        let summary = execute_eval(None, None, &registry, &cfg)
+            .await
+            .expect("frozen case --metrics-only execution succeeds");
+        assert_eq!(summary.cases.len(), 1);
+        assert_eq!(summary.trials.len(), expected_trial_count);
+        assert!(!summary.contact_sheets.is_empty());
+        assert!(out_dir.path().join("eval_summary.json").is_file());
+        assert!(out_dir.path().join("eval_summary.md").is_file());
+
+        match case_id {
+            "straight-blade-patch" => {
+                let whole = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::WholeImageFix)
+                    .unwrap();
+                let cue = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::PatchCueOutline)
+                    .unwrap();
+                assert!(cue.passed);
+                assert!(
+                    cue.metrics
+                        .line_straightness
+                        .as_ref()
+                        .unwrap()
+                        .rms_residual_px
+                        < whole
+                            .metrics
+                            .line_straightness
+                            .as_ref()
+                            .unwrap()
+                            .rms_residual_px
+                );
+            }
+            "surface-detail-preservation" => {
+                let whole = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::WholeImageFix)
+                    .unwrap();
+                let patch = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::PatchCropOnly)
+                    .unwrap();
+                assert!(patch.passed);
+                assert!(
+                    patch.metrics.untouched_ssim.unwrap() > whole.metrics.untouched_ssim.unwrap()
+                );
+                assert!(
+                    patch.metrics.boundary_discontinuity.as_ref().unwrap().score
+                        < whole.metrics.boundary_discontinuity.as_ref().unwrap().score
+                );
+            }
+            "multi-actor-metric-scale" => {
+                let blockout = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::BlockoutGuide)
+                    .unwrap();
+                let whole = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::WholeImageFix)
+                    .unwrap();
+                let b_align = blockout.metrics.spatial_alignment.as_ref().unwrap();
+                let w_align = whole.metrics.spatial_alignment.as_ref().unwrap();
+                assert!(b_align.mean_iou > 0.99);
+                assert!(b_align.max_height_ratio_error < 1e-3);
+                assert!(b_align.mean_iou > w_align.mean_iou);
+                assert!(b_align.max_height_ratio_error < w_align.max_height_ratio_error);
+            }
+            "trajectory-overlay-guide" => {
+                let overlay = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::OverlayGuide)
+                    .unwrap();
+                let whole = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::WholeImageFix)
+                    .unwrap();
+                assert!(overlay.passed);
+                assert!(
+                    overlay
+                        .metrics
+                        .line_straightness
+                        .as_ref()
+                        .unwrap()
+                        .rms_residual_px
+                        < whole
+                            .metrics
+                            .line_straightness
+                            .as_ref()
+                            .unwrap()
+                            .rms_residual_px
+                );
+            }
+            "crimson-albedo-retention" => {
+                let patch = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::PatchCropOnly)
+                    .unwrap();
+                let whole = summary
+                    .trials
+                    .iter()
+                    .find(|t| t.strategy == EvalStrategy::WholeImageFix)
+                    .unwrap();
+                assert!(patch.passed);
+                assert!(
+                    patch.metrics.color_qa.max_delta_e2000 < whole.metrics.color_qa.max_delta_e2000
+                );
+            }
+            other => panic!("unexpected case_id: {other}"),
+        }
     }
 }
