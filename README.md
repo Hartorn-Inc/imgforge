@@ -12,6 +12,17 @@ See [`GLOSSARY.md`](GLOSSARY.md) for the canonical domain vocabulary (`Subject`,
 - **Style-Scoped References**: `Subject` identity (`card.yaml`, `PaletteLock`, `ExclusiveSurfaceMap`) stays style-neutral while `ReferencePack` sheets are scoped per `(Subject, Style)` pair. See [ADR 0003](docs/adr/0003-style-scoped-reference-packs.md).
 - **Isolated Codex Native Backend**: `CodexNativeBackend` invokes `codex exec` with built-in `image_gen` backed by ChatGPT Plus OAuth inside an isolated per-job `CODEX_HOME`, enforcing `<= 5%` aspect-ratio tolerance with host Lanczos resampling and `PatchEdit` blending. See [ADR 0002](docs/adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec.md).
 
+## Documentation & Skills
+
+| Artifact | Purpose |
+|---|---|
+| [`GLOSSARY.md`](GLOSSARY.md) | Canonical domain vocabulary and forbidden aliases |
+| [`docs/implementation/architecture-and-backend.md`](docs/implementation/architecture-and-backend.md) | Workspace discovery, `imgforge auth`, `CodexNativeBackend`, `PromptCompiler`, `SceneComposer`, `VisionCritic`, CLI, MCP, and Web Canvas server |
+| [`docs/implementation/domain-and-reference-packs.md`](docs/implementation/domain-and-reference-packs.md) | `Subject`, `Style`, `Atmosphere`, `Visibility`, `Lifecycle`, `manifest.lock.json`, `ReferencePack`, calibration strip, slicer, and `Atlas` |
+| [`docs/implementation/imaging-color-qa-and-export.md`](docs/implementation/imaging-color-qa-and-export.md) | `ColorQaEngine`, `WholeImageEdit`, `PatchEdit`, `GuideRenderer`, and `Export` profiles |
+| [`skills/imgforge/SKILL.md`](skills/imgforge/SKILL.md) | Portable agent workflow skill for `imgforge` CLI & MCP tools |
+| [`skills/scene-composition/SKILL.md`](skills/scene-composition/SKILL.md) | Portable skill for direct `SceneSpec` authoring without `SceneComposer` |
+
 ## Build & Verification (Docker + Make)
 
 All build, format, lint, and test commands run inside the pinned `Dockerfile` (`Rust 1.100.0` + `Node 22.23.5 LTS` on Debian Bookworm) via `Makefile`. No Rust or Node toolchains need to be installed on the host.
