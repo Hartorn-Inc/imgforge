@@ -218,6 +218,22 @@ pub enum CoreError {
     #[error("manifest.lock.json invalid: {0}")]
     ManifestLockInvalid(String),
 
+    /// Fail-closed OKLab / CIELAB `DeltaE_2000` Color QA gate failed.
+    #[error("Color QA failed: {0}")]
+    ColorQaFailed(String),
+
+    /// Unified `WholeImageEdit` or `PatchEdit` pipeline failed.
+    #[error("Edit pipeline failed: {0}")]
+    EditFailed(String),
+
+    /// `GuideSpec` validation or `GuideRenderer` rasterization failed.
+    #[error("GuideRenderer failed: {0}")]
+    GuideRenderFailed(String),
+
+    /// Deterministic `Export` pipeline failed.
+    #[error("Export failed: {0}")]
+    ExportFailed(String),
+
     /// Underlying filesystem or process I/O error.
     #[error("I/O error during {context}: {source}")]
     Io {

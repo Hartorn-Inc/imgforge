@@ -2,7 +2,8 @@
 //!
 //! PURPOSE:
 //! Exposes the `imgforge` binary CLI (`auth`, `compose`, `validate`, `generate`,
-//! `critic`, `ui`, and `status`) on top of `imgforge-core` and the embedded Web Canvas UI.
+//! `edit`, `guide`, `export`, `critic`, `library`, `pack`, `ui`, and `status`)
+//! on top of `imgforge-core` and the embedded Web Canvas UI.
 //!
 //! THREAT MODEL / DESIGN RATIONALE ("WHY"):
 //! Explicit `--workspace` flags fail closed when invalid rather than falling back to
@@ -24,10 +25,16 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use imgforge_core::auth::DEFAULT_CODEX_BIN;
 use imgforge_core::{
     AtlasPackRequest, AtlasSliceSelection, AuthManager, CodexNativeBackend, CoreError,
-    DEFAULT_ATLAS_HEIGHT, DEFAULT_ATLAS_PADDING_PX, DEFAULT_ATLAS_WIDTH, ImageBackend,
-    ImageGenerationRequest, LibraryRegistry, ManifestLockStore, PromptCompiler,
-    ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, SceneComposer, SceneSpec,
-    SlicerConfig, TraitCategory, TraitCheckInput, Visibility, VisionCritic, VisionCriticRequest,
+    DEFAULT_ATLAS_HEIGHT, DEFAULT_ATLAS_PADDING_PX, DEFAULT_ATLAS_WIDTH, DEFAULT_CDF_DAMP_STRENGTH,
+    DEFAULT_COLLAR_WIDTH_PX, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
+    DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportSource, ExposureQaConfig,
+    GuideRenderer, GuideSpec, ImageBackend, ImageGenerationRequest, LibraryRegistry,
+    ManifestLockStore, MatchGradeOptions, OwnedSubjectRoi, PaletteQaConfig, PatchEditConfig,
+    PatchEditRequest, PatchPrepMode, PatchTargetMask, PixelRect, PromptCompiler,
+    ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, RunStore, SceneComposer,
+    SceneSpec, SlicerConfig, SparkleConfig, TraitCategory, TraitCheckInput, UntouchedDriftConfig,
+    Visibility, VisionCritic, VisionCriticRequest, VttMapOptions, VttTokenOptions,
+    WholeImageEditRequest, execute_export, execute_patch_edit, execute_whole_image_edit,
     pack_dynamic_atlas, resolve_codex_auth_dir_from_env, resolve_user_config_dir_from_env,
     resolve_workspace_from_env, slice_sheet_to_dir,
 };
@@ -66,6 +73,12 @@ enum Commands {
     Validate(ValidateArgs),
     /// Compile a SceneSpec and generate a verified PNG via CodexNativeBackend.
     Generate(GenerateArgs),
+    /// Run WholeImageEdit or PatchEdit with OKLab/DeltaE_2000 Color QA and Run recording.
+    Edit(EditArgs),
+    /// Validate or deterministically render a SpatialGuide from GuideSpec JSON.
+    Guide(GuideArgs),
+    /// Derive deterministic VTT/Web/Grid Export deliverables from a Run or PNG asset.
+    Export(ExportArgs),
     /// Run structured read-only VisionCritic checklist evaluation on a generated image.
     Critic(CriticArgs),
     /// Inspect and verify Subject, Style, Atmosphere, and manifest.lock.json entries.
@@ -143,6 +156,198 @@ struct GenerateArgs {
     /// Reference image path(s) forwarded to `codex exec -i <FILE>`.
     #[arg(short = 'i', long = "ref", value_name = "FILE")]
     references: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliPatchPrepMode {
+    CropOnly,
+    BlankInsideMask,
+    CueOutline,
+}
+
+impl From<CliPatchPrepMode> for PatchPrepMode {
+    fn from(val: CliPatchPrepMode) -> Self {
+        match val {
+            CliPatchPrepMode::CropOnly => Self::CropOnly,
+            CliPatchPrepMode::BlankInsideMask => Self::BlankInsideMask,
+            CliPatchPrepMode::CueOutline => Self::CueOutline,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct EditArgs {
+    #[command(subcommand)]
+    action: EditSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum EditSubcommand {
+    /// WholeImageEdit: global or multi-region edit with fail-closed ColorQaEngine gating.
+    Whole {
+        /// Target PNG image path to edit.
+        #[arg(long, value_name = "PATH")]
+        target: PathBuf,
+        /// Target Run stream slug.
+        #[arg(long)]
+        slug: String,
+        /// Positive-only compiled edit prompt.
+        #[arg(long)]
+        prompt: String,
+        /// Access classification for the recorded Run.
+        #[arg(long, value_enum, default_value_t = CliVisibility::Public)]
+        visibility: CliVisibility,
+        /// Optional Atmosphere slug enforcing exposure_floor.
+        #[arg(long)]
+        atmosphere: Option<String>,
+        /// Optional Subject slug(s) enforcing PaletteLock adherence.
+        #[arg(long = "subject")]
+        subjects: Vec<String>,
+        /// Reference anchor image path(s).
+        #[arg(short = 'i', long = "ref", value_name = "FILE")]
+        references: Vec<PathBuf>,
+        /// Record the Draft Run even when fail-closed Color QA rejects it (default fails closed).
+        #[arg(long)]
+        allow_qa_fail: bool,
+        /// Emit machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// PatchEdit: 1:1 square crop + collar OKLab Reinhard transfer + 5-level Laplacian blend.
+    Patch {
+        /// Target PNG image path to edit.
+        #[arg(long, value_name = "PATH")]
+        target: PathBuf,
+        /// Target Run stream slug.
+        #[arg(long)]
+        slug: String,
+        /// Positive-only localized edit prompt.
+        #[arg(long)]
+        prompt: String,
+        /// Access classification for the recorded Run.
+        #[arg(long, value_enum, default_value_t = CliVisibility::Public)]
+        visibility: CliVisibility,
+        /// ROI bounding box formatted as `x,y,width,height`.
+        #[arg(long, value_name = "X,Y,W,H", conflicts_with = "mask")]
+        roi: Option<String>,
+        /// Alpha/grayscale PNG mask path.
+        #[arg(long, value_name = "PATH", conflicts_with = "roi")]
+        mask: Option<PathBuf>,
+        /// Optional pre-edit target preparation mode.
+        #[arg(long, value_enum, default_value_t = CliPatchPrepMode::CropOnly)]
+        prep: CliPatchPrepMode,
+        /// Context collar ring width in pixels (16..=32).
+        #[arg(long, default_value_t = DEFAULT_COLLAR_WIDTH_PX)]
+        collar_width: u32,
+        /// Cosine distance-transform feather radius in pixels.
+        #[arg(long, default_value_t = 12)]
+        feather: u32,
+        /// Additional reference anchor image path(s).
+        #[arg(short = 'i', long = "ref", value_name = "FILE")]
+        references: Vec<PathBuf>,
+        /// Emit machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct GuideArgs {
+    #[command(subcommand)]
+    action: GuideSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum GuideSubcommand {
+    /// Validate a GuideSpec JSON document against the canonical schema.
+    Validate {
+        /// Path to the GuideSpec JSON file.
+        spec: PathBuf,
+    },
+    /// Deterministically render an OverlayGuide or Blockout SpatialGuide PNG.
+    Render {
+        /// Path to the GuideSpec JSON file.
+        #[arg(long, value_name = "PATH")]
+        spec: PathBuf,
+        /// Output PNG destination path.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Emit machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliExportProfile {
+    VttToken,
+    VttMap,
+    WebWebp,
+    Grid2x2,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// Source recorded Run formatted as `slug:version` (e.g. `harbor-dock:1` or `harbor-dock:v001`).
+    #[arg(long, value_name = "SLUG:VER", conflicts_with = "input")]
+    run: Option<String>,
+    /// Direct source PNG path (requires --slug or uses file stem).
+    #[arg(long, value_name = "PATH", conflicts_with = "run")]
+    input: Option<PathBuf>,
+    /// Source Visibility classification when exporting via --input.
+    #[arg(long, value_enum, default_value_t = CliVisibility::Public)]
+    source_visibility: CliVisibility,
+    /// Export profile to produce.
+    #[arg(long, value_enum)]
+    profile: CliExportProfile,
+    /// Allowed Visibility of the export destination (fails closed on leaks).
+    #[arg(long, value_enum, default_value_t = CliVisibility::Public)]
+    visibility: CliVisibility,
+    /// Output directory receiving deterministic deliverables.
+    #[arg(long, value_name = "DIR")]
+    out_dir: PathBuf,
+    /// Output basename slug (defaults to Run slug or input stem).
+    #[arg(long)]
+    slug: Option<String>,
+    /// Square size in pixels for vtt-token.
+    #[arg(long, default_value_t = DEFAULT_VTT_TOKEN_SIZE_PX)]
+    token_size: u32,
+    /// Role-colored outer ring #RRGGBB hex for vtt-token.
+    #[arg(long, default_value = DEFAULT_TOKEN_RING_HEX)]
+    ring_color: String,
+    /// Optional flat-backdrop #RRGGBB hex to also emit a vtt-token JPEG copy.
+    #[arg(long)]
+    jpeg_backdrop: Option<String>,
+    /// Grid column count for vtt-map.
+    #[arg(long, default_value_t = 24)]
+    cols: u32,
+    /// Grid row count for vtt-map.
+    #[arg(long, default_value_t = 18)]
+    rows: u32,
+    /// Pixels per grid cell for vtt-map when --scale-factor is omitted.
+    #[arg(long, default_value_t = DEFAULT_VTT_MAP_GRID_PX)]
+    grid_px: u32,
+    /// Optional explicit Lanczos3 upscale multiplier for vtt-map.
+    #[arg(long)]
+    scale_factor: Option<f64>,
+    /// JPEG quality (1..=100) for vtt-map and optional vtt-token JPEG.
+    #[arg(long, default_value_t = 90)]
+    jpeg_quality: u8,
+    /// Opt-in explicit color grading (ONLY supported on export).
+    #[arg(long)]
+    match_grade: bool,
+    /// Reference PNG path for damped L* CDF matching (requires --match-grade).
+    #[arg(long, value_name = "PATH", requires = "match_grade")]
+    grade_ref: Option<PathBuf>,
+    /// Damped L* CDF blend strength in 0.25..=0.45 (requires --match-grade).
+    #[arg(long, default_value_t = DEFAULT_CDF_DAMP_STRENGTH, requires = "match_grade")]
+    grade_strength: f64,
+    /// Adobe .cube 3D LUT file path (requires --match-grade).
+    #[arg(long, value_name = "PATH", requires = "match_grade")]
+    lut: Option<PathBuf>,
+    /// Emit machine-readable JSON summary.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -359,6 +564,44 @@ fn resolve_codex_bin(explicit_flag: Option<&str>, env_val: Option<&str>) -> anyh
     Ok(DEFAULT_CODEX_BIN.to_string())
 }
 
+fn parse_roi_arg(raw: &str) -> anyhow::Result<PixelRect> {
+    let parts: Vec<&str> = raw.split(',').collect();
+    if parts.len() != 4 {
+        bail!("--roi '{raw}' must be formatted as x,y,width,height");
+    }
+    let x: u32 = parts[0].trim().parse().context("parsing ROI x")?;
+    let y: u32 = parts[1].trim().parse().context("parsing ROI y")?;
+    let width: u32 = parts[2].trim().parse().context("parsing ROI width")?;
+    let height: u32 = parts[3].trim().parse().context("parsing ROI height")?;
+    if width == 0 || height == 0 {
+        bail!("--roi width and height must both be > 0");
+    }
+    Ok(PixelRect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn parse_run_ref_arg(raw: &str) -> anyhow::Result<(String, u32)> {
+    let (slug, ver_raw) = raw
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--run '{raw}' must be formatted as slug:version"))?;
+    let trimmed_slug = slug.trim();
+    if trimmed_slug.is_empty() {
+        bail!("--run '{raw}' slug must not be empty");
+    }
+    let digits = ver_raw.trim().strip_prefix('v').unwrap_or(ver_raw.trim());
+    let version: u32 = digits
+        .parse()
+        .with_context(|| format!("parsing version in --run '{raw}'"))?;
+    if version == 0 {
+        bail!("--run version must be >= 1");
+    }
+    Ok((trimmed_slug.to_string(), version))
+}
+
 fn parse_trait_arg(index: usize, raw: &str) -> anyhow::Result<TraitCheckInput> {
     let parts: Vec<&str> = raw.splitn(3, ':').collect();
     if parts.len() == 3 {
@@ -503,6 +746,314 @@ async fn main() -> anyhow::Result<()> {
                 output.thread_id,
                 args.out.display()
             );
+        }
+        Commands::Edit(args) => {
+            let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+            let runs_dir = resolved_ws.root.join(&resolved_ws.config.paths.runs_dir);
+            let run_store = RunStore::new(runs_dir);
+            let registry = LibraryRegistry::from_workspace(&resolved_ws);
+            let backend = CodexNativeBackend::with_codex_bin(auth_dir, codex_bin);
+
+            match args.action {
+                EditSubcommand::Whole {
+                    target,
+                    slug,
+                    prompt,
+                    visibility,
+                    atmosphere,
+                    subjects,
+                    references,
+                    allow_qa_fail,
+                    json,
+                } => {
+                    let exposure_floor = match atmosphere {
+                        Some(atmo_slug) => {
+                            let resolved = registry.resolve_atmosphere(&atmo_slug)?;
+                            Some((
+                                resolved.atmosphere.exposure_floor,
+                                ExposureQaConfig::default(),
+                            ))
+                        }
+                        None => None,
+                    };
+                    let mut subject_rois = Vec::with_capacity(subjects.len());
+                    for subj_slug in &subjects {
+                        let resolved = registry.resolve_subject(subj_slug)?;
+                        subject_rois.push(OwnedSubjectRoi {
+                            subject_slug: resolved.subject.slug,
+                            palette_lock: resolved.subject.palette_lock,
+                            rois: Vec::new(),
+                        });
+                    }
+                    let res = execute_whole_image_edit(
+                        &backend,
+                        &run_store,
+                        &WholeImageEditRequest {
+                            slug,
+                            visibility: visibility.into(),
+                            target_image_path: target,
+                            compiled_prompt: prompt,
+                            reference_images: references,
+                            exposure_floor,
+                            subject_rois,
+                            palette_config: PaletteQaConfig::default(),
+                            edit_mask: None,
+                            untouched_drift_config: UntouchedDriftConfig::default(),
+                            allowed_sparkle_mask: None,
+                            sparkle_config: SparkleConfig::default(),
+                            fail_closed_on_qa: !allow_qa_fail,
+                        },
+                    )
+                    .await?;
+
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "runId": res.run.metadata.run_id,
+                                "imagePath": res.run.image_path,
+                                "qaReport": res.qa_report,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "WholeImageEdit recorded Run '{}' (qa_passed={}) at {}",
+                            res.run.metadata.run_id,
+                            res.qa_report.passed,
+                            res.run.image_path.display()
+                        );
+                    }
+                }
+                EditSubcommand::Patch {
+                    target,
+                    slug,
+                    prompt,
+                    visibility,
+                    roi,
+                    mask,
+                    prep,
+                    collar_width,
+                    feather,
+                    references,
+                    json,
+                } => {
+                    let target_mask = match (roi, mask) {
+                        (Some(raw_roi), None) => PatchTargetMask::Roi(parse_roi_arg(&raw_roi)?),
+                        (None, Some(mask_path)) => PatchTargetMask::MaskImagePath(mask_path),
+                        (None, None) => bail!("either --roi X,Y,W,H or --mask PATH is required"),
+                        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both"),
+                    };
+                    let res = execute_patch_edit(
+                        &backend,
+                        &run_store,
+                        &PatchEditRequest {
+                            slug,
+                            visibility: visibility.into(),
+                            target_image_path: target,
+                            target_mask,
+                            compiled_prompt: prompt,
+                            reference_images: references,
+                            config: PatchEditConfig {
+                                collar_width_px: collar_width,
+                                feather_px: feather,
+                                prep_mode: prep.into(),
+                                ..PatchEditConfig::default()
+                            },
+                        },
+                    )
+                    .await?;
+
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "runId": res.run.metadata.run_id,
+                                "imagePath": res.run.image_path,
+                                "cropRect": res.crop_rect,
+                                "roiRect": res.roi_rect,
+                                "reinhardGains": res.reinhard_gains,
+                                "outOfRoiMaxDeltaE2000": res.out_of_roi_report.max_delta_e2000,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "PatchEdit recorded Run '{}' (crop={}x{}+{}+{}, out_of_roi max DeltaE_2000={:.4}) at {}",
+                            res.run.metadata.run_id,
+                            res.crop_rect.width,
+                            res.crop_rect.height,
+                            res.crop_rect.x,
+                            res.crop_rect.y,
+                            res.out_of_roi_report.max_delta_e2000,
+                            res.run.image_path.display()
+                        );
+                    }
+                }
+            }
+        }
+        Commands::Guide(args) => {
+            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+            match args.action {
+                GuideSubcommand::Validate { spec } => {
+                    let raw = fs::read_to_string(&spec)
+                        .with_context(|| format!("reading GuideSpec at {}", spec.display()))?;
+                    let parsed = GuideSpec::from_json_str(&raw)?;
+                    println!(
+                        "GuideSpec '{}' valid (variant={:?}, canvas={}x{}, bands={}, mannequins={}, vectors={}, regions={})",
+                        parsed.id,
+                        parsed.variant,
+                        parsed.canvas_width,
+                        parsed.canvas_height,
+                        parsed.depth_bands.len(),
+                        parsed.mannequins.len(),
+                        parsed.action_vectors.len(),
+                        parsed.overlay_regions.len()
+                    );
+                }
+                GuideSubcommand::Render { spec, out, json } => {
+                    let raw = fs::read_to_string(&spec)
+                        .with_context(|| format!("reading GuideSpec at {}", spec.display()))?;
+                    let parsed = GuideSpec::from_json_str(&raw)?;
+                    let ws_root = match ws {
+                        Some(resolved) => resolved.root,
+                        None => std::env::current_dir()
+                            .context("resolving current working directory")?,
+                    };
+                    let rendered = GuideRenderer::new().render(&parsed, &ws_root)?;
+                    if let Some(parent) = out.parent()
+                        && !parent.as_os_str().is_empty()
+                    {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!("creating output directory {}", parent.display())
+                        })?;
+                    }
+                    fs::write(&out, &rendered.png_bytes).with_context(|| {
+                        format!("writing SpatialGuide PNG to {}", out.display())
+                    })?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "id": parsed.id,
+                                "variant": parsed.variant,
+                                "width": rendered.width,
+                                "height": rendered.height,
+                                "outPath": out,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Rendered {:?} SpatialGuide ({}x{}) at {}",
+                            rendered.variant,
+                            rendered.width,
+                            rendered.height,
+                            out.display()
+                        );
+                    }
+                }
+            }
+        }
+        Commands::Export(args) => {
+            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+            let run_store = ws
+                .as_ref()
+                .map(|w| RunStore::new(w.root.join(&w.config.paths.runs_dir)));
+
+            let (source, default_slug) = match (args.run, args.input) {
+                (Some(run_ref), None) => {
+                    if run_store.is_none() {
+                        let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+                        let _ = resolved_ws;
+                    }
+                    let (slug, version) = parse_run_ref_arg(&run_ref)?;
+                    (
+                        ExportSource::Run {
+                            slug: slug.clone(),
+                            version,
+                        },
+                        slug,
+                    )
+                }
+                (None, Some(path)) => {
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("export")
+                        .to_string();
+                    (
+                        ExportSource::PngPath {
+                            path,
+                            asset_id: stem.clone(),
+                            visibility: args.source_visibility.into(),
+                        },
+                        stem,
+                    )
+                }
+                (None, None) => bail!("either --run SLUG:VER or --input PATH must be provided"),
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents both"),
+            };
+
+            let output_slug = args.slug.unwrap_or(default_slug);
+            let profile = match args.profile {
+                CliExportProfile::VttToken => ExportProfile::VttToken(VttTokenOptions {
+                    size_px: args.token_size,
+                    ring_color_hex: args.ring_color,
+                    jpeg_backdrop_hex: args.jpeg_backdrop,
+                    jpeg_quality: args.jpeg_quality,
+                    ..VttTokenOptions::default()
+                }),
+                CliExportProfile::VttMap => ExportProfile::VttMap(VttMapOptions {
+                    cols: args.cols,
+                    rows: args.rows,
+                    grid_px: args.grid_px,
+                    scale_factor: args.scale_factor,
+                    jpeg_quality: args.jpeg_quality,
+                }),
+                CliExportProfile::WebWebp => ExportProfile::WebWebp,
+                CliExportProfile::Grid2x2 => ExportProfile::Grid2x2,
+            };
+
+            let match_grade = if args.match_grade {
+                Some(MatchGradeOptions {
+                    reference_image_path: args.grade_ref,
+                    cdf_damp_strength: args.grade_strength,
+                    cube_lut_path: args.lut,
+                })
+            } else {
+                None
+            };
+
+            let result = execute_export(
+                run_store.as_ref(),
+                &ExportRequest {
+                    source,
+                    output_slug,
+                    profile_visibility: args.visibility.into(),
+                    out_dir: args.out_dir,
+                    profile,
+                    match_grade,
+                },
+            )?;
+
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Exported {} artifact(s) from '{}' (visibility={}, match_grade={})",
+                    result.artifacts.len(),
+                    result.source_id,
+                    result.source_visibility.as_str(),
+                    result.match_grade_applied
+                );
+                for art in &result.artifacts {
+                    println!(
+                        "  {}\t{}x{}\t{}",
+                        art.role,
+                        art.width,
+                        art.height,
+                        art.path.display()
+                    );
+                }
+            }
         }
         Commands::Critic(args) => {
             let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
@@ -788,6 +1339,35 @@ mod tests {
         let res = resolve_codex_bin(flag, env_val);
         match expected {
             Some(exp) => assert_eq!(res.expect("should resolve"), exp),
+            None => assert!(res.is_err()),
+        }
+    }
+
+    #[rstest]
+    #[case::valid_roi("10,20,64,64", Some(PixelRect { x: 10, y: 20, width: 64, height: 64 }))]
+    #[case::zero_width_rejected("10,20,0,64", None)]
+    #[case::missing_component_rejected("10,20,64", None)]
+    fn parses_roi_arg_strictly(#[case] raw: &str, #[case] expected: Option<PixelRect>) {
+        let res = parse_roi_arg(raw);
+        match expected {
+            Some(rect) => assert_eq!(res.expect("valid ROI"), rect),
+            None => assert!(res.is_err()),
+        }
+    }
+
+    #[rstest]
+    #[case::numeric_version("harbor-dock:2", Some(("harbor-dock", 2)))]
+    #[case::prefixed_version("harbor-dock:v003", Some(("harbor-dock", 3)))]
+    #[case::zero_version_rejected("harbor-dock:0", None)]
+    #[case::missing_colon_rejected("harbor-dock", None)]
+    fn parses_run_ref_arg_strictly(#[case] raw: &str, #[case] expected: Option<(&str, u32)>) {
+        let res = parse_run_ref_arg(raw);
+        match expected {
+            Some((slug, ver)) => {
+                let parsed = res.expect("valid run ref");
+                assert_eq!(parsed.0, slug);
+                assert_eq!(parsed.1, ver);
+            }
             None => assert!(res.is_err()),
         }
     }

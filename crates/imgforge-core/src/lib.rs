@@ -11,10 +11,14 @@ pub mod atmosphere;
 pub mod auth;
 pub mod backend;
 pub mod calibration;
+pub mod color_qa;
 pub mod composer;
 pub mod config;
 pub mod critic;
+pub mod edit;
 pub mod error;
+pub mod export;
+pub mod guide_renderer;
 pub mod lifecycle;
 pub mod presets;
 pub mod prompt_compiler;
@@ -48,6 +52,14 @@ pub use calibration::{
     composite_calibration_strip_png, compute_l_star_gray_wedge, parse_hex_rgb,
     validate_reference_sheet_structure,
 };
+pub use color_qa::{
+    ColorQaEngine, ColorQaReport, DEFAULT_CLIPPED_BLACK_L_STAR, DEFAULT_KMEANS_K,
+    DEFAULT_SPARKLE_MAX_AREA_PX, DEFAULT_SPARKLE_MIN_AREA_PX, ExposureMetrics, ExposureQaConfig,
+    ExposureReport, ForbiddenHueIntrusion, ForbiddenHueSector, HeatmapKind, OklabClusterSummary,
+    PaletteAdherenceReport, PaletteQaConfig, SparkleBlob, SparkleConfig, SparkleReport,
+    SubjectRoiSpec, UntouchedDriftConfig, UntouchedDriftReport, delta_e_2000, oklab_to_lab,
+    oklab_to_srgb_u8, srgb_delta_e_2000, srgb_u8_to_lab, srgb_u8_to_oklab,
+};
 pub use composer::{
     ComposedScene, MAX_UNTRUSTED_PROSE_BYTES, SCENE_SPEC_OUTPUT_SCHEMA, SceneComposer,
 };
@@ -61,7 +73,28 @@ pub use critic::{
     TraitCategory, TraitCheckInput, TraitCheckResult, VisionCritic, VisionCriticRequest,
     build_critic_prompt, validate_critic_report_for_traits, validate_critic_report_json,
 };
+pub use edit::{
+    DEFAULT_COLLAR_WIDTH_PX, DEFAULT_PYRAMID_LEVELS, LinearBuffer, MAX_COLLAR_WIDTH_PX,
+    MIN_COLLAR_WIDTH_PX, OwnedSubjectRoi, PatchEditConfig, PatchEditRequest, PatchEditResult,
+    PatchPrepMode, PatchTargetMask, REINHARD_GAIN_MAX, REINHARD_GAIN_MIN, ReinhardGainSummary,
+    WholeImageEditRequest, WholeImageEditResult, apply_collar_reinhard_oklab,
+    build_laplacian_pyramid, composite_calibrated_patch, euclidean_distance_transform,
+    execute_patch_edit, execute_whole_image_edit, laplacian_pyramid_blend,
+    reconstruct_laplacian_pyramid,
+};
 pub use error::CoreError;
+pub use export::{
+    CubeLut, DEFAULT_CDF_DAMP_STRENGTH, DEFAULT_TOKEN_RING_HEX, DEFAULT_VTT_MAP_GRID_PX,
+    DEFAULT_VTT_TOKEN_SIZE_PX, ExportProfile, ExportRequest, ExportResult, ExportSource,
+    ExportedArtifact, MAX_CDF_DAMP_STRENGTH, MIN_CDF_DAMP_STRENGTH, MatchGradeOptions,
+    VttMapOptions, VttTokenOptions, apply_damped_l_star_cdf_match, execute_export,
+    render_vtt_token, split_grid_2x2,
+};
+pub use guide_renderer::{
+    ActionVector, DepthBand, GuideDepthPlane, GuideRenderer, GuideSpec, MAX_GUIDE_CANVAS_DIM,
+    MannequinFacing, NormalizedPoint, OverlayRegion, OverlayRegionKind, RenderedSpatialGuide,
+    SUPPORTED_GUIDE_SPEC_SCHEMA_VERSION, SpatialGuideVariant, SubjectMannequin, VectorStrokeStyle,
+};
 pub use lifecycle::{Lifecycle, SeedInput, now_utc_iso, sha256_hex};
 pub use presets::{
     BUILTIN_ATMOSPHERE_SLUGS, BUILTIN_STYLE_SLUGS, builtin_atmosphere, builtin_atmospheres,
