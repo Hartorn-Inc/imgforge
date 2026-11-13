@@ -23,9 +23,13 @@ use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use imgforge_core::auth::DEFAULT_CODEX_BIN;
 use imgforge_core::{
-    AuthManager, CodexNativeBackend, CoreError, ImageBackend, ImageGenerationRequest,
-    PromptCompiler, ResolvedWorkspace, SceneComposer, SceneSpec, TraitCategory, TraitCheckInput,
-    VisionCritic, VisionCriticRequest, resolve_codex_auth_dir_from_env, resolve_workspace_from_env,
+    AtlasPackRequest, AtlasSliceSelection, AuthManager, CodexNativeBackend, CoreError,
+    DEFAULT_ATLAS_HEIGHT, DEFAULT_ATLAS_PADDING_PX, DEFAULT_ATLAS_WIDTH, ImageBackend,
+    ImageGenerationRequest, LibraryRegistry, ManifestLockStore, PromptCompiler,
+    ReferencePackPipeline, ReferencePackRequest, ResolvedWorkspace, SceneComposer, SceneSpec,
+    SlicerConfig, TraitCategory, TraitCheckInput, Visibility, VisionCritic, VisionCriticRequest,
+    pack_dynamic_atlas, resolve_codex_auth_dir_from_env, resolve_user_config_dir_from_env,
+    resolve_workspace_from_env, slice_sheet_to_dir,
 };
 use serde::Serialize;
 
@@ -64,6 +68,10 @@ enum Commands {
     Generate(GenerateArgs),
     /// Run structured read-only VisionCritic checklist evaluation on a generated image.
     Critic(CriticArgs),
+    /// Inspect and verify Subject, Style, Atmosphere, and manifest.lock.json entries.
+    Library(LibraryArgs),
+    /// Generate, slice, and dynamically pack style-scoped ReferencePack sheets and Atlases.
+    Pack(PackArgs),
     /// Start the embedded Web Canvas SPA server strictly on 127.0.0.1:<port>.
     Ui(UiArgs),
     /// Inspect resolved workspace configuration and tool-local auth readiness.
@@ -162,6 +170,155 @@ struct StatusArgs {
     /// Emit machine-readable JSON output.
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LibraryEntityKind {
+    Subject,
+    Style,
+    Atmosphere,
+}
+
+#[derive(Debug, Args)]
+struct LibraryArgs {
+    #[command(subcommand)]
+    action: LibrarySubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum LibrarySubcommand {
+    /// List resolved Subject, Style, and Atmosphere entities across project > user > builtin.
+    List {
+        /// Filter to a single entity kind.
+        #[arg(long, value_enum)]
+        kind: Option<LibraryEntityKind>,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a single resolved Subject, Style, or Atmosphere card.
+    Show {
+        /// Entity kind to inspect.
+        #[arg(value_enum)]
+        kind: LibraryEntityKind,
+        /// Entity slug.
+        slug: String,
+        /// Emit machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify SHA-256 checksums of all canonical entries in library/manifest.lock.json.
+    VerifyLock,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliVisibility {
+    Public,
+    Restricted,
+    Internal,
+}
+
+impl From<CliVisibility> for Visibility {
+    fn from(val: CliVisibility) -> Self {
+        match val {
+            CliVisibility::Public => Self::Public,
+            CliVisibility::Restricted => Self::Restricted,
+            CliVisibility::Internal => Self::Internal,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct PackArgs {
+    #[command(subcommand)]
+    action: PackSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum PackSubcommand {
+    /// Generate a style-scoped ReferencePack for a Subject and Style.
+    Generate {
+        /// Subject slug.
+        #[arg(long)]
+        subject: String,
+        /// Style slug.
+        #[arg(long)]
+        style: String,
+        /// Optional bootstrap Seed PNG path.
+        #[arg(long, value_name = "PATH")]
+        seed: Option<PathBuf>,
+        /// Optional Seed label.
+        #[arg(long)]
+        seed_label: Option<String>,
+        /// Emit machine-readable JSON summary.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Slice foreground components against #252830 from a ReferencePack sheet PNG.
+    Slice {
+        /// Path to the sheet PNG image.
+        #[arg(long, value_name = "PATH")]
+        sheet: PathBuf,
+        /// Output directory receiving slices/*.png and slices.json.
+        #[arg(long, value_name = "PATH")]
+        out_dir: PathBuf,
+        /// Bottom calibration strip height in pixels to exclude from slicing.
+        #[arg(long, default_value_t = 72)]
+        strip_height: u32,
+        /// Emit machine-readable JSON manifest.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Dynamically pack selected ReferencePack slices into a #252830 Atlas PNG.
+    Atlas {
+        /// Output PNG path (multi-page atlases append _pN before .png).
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Slice selector formatted as `subject_slug:style_slug:slice_id1[,slice_id2...]`.
+        #[arg(long = "slice", value_name = "SPEC", required = true)]
+        slices: Vec<String>,
+        /// Target Visibility classification for the Atlas.
+        #[arg(long, value_enum, default_value_t = CliVisibility::Public)]
+        visibility: CliVisibility,
+        /// Target Atlas canvas width in pixels.
+        #[arg(long, default_value_t = DEFAULT_ATLAS_WIDTH)]
+        width: u32,
+        /// Target Atlas canvas height in pixels.
+        #[arg(long, default_value_t = DEFAULT_ATLAS_HEIGHT)]
+        height: u32,
+        /// Emit machine-readable JSON placement report.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct LibrarySummaryRow {
+    kind: &'static str,
+    slug: String,
+    display_name: String,
+    source: imgforge_core::LibrarySource,
+}
+
+fn parse_atlas_selection(raw: &str) -> anyhow::Result<AtlasSliceSelection> {
+    let parts: Vec<&str> = raw.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        bail!("--slice '{raw}' must be formatted as subject_slug:style_slug:slice_id1[,slice_id2]");
+    }
+    let slice_ids: Vec<String> = parts[2]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if slice_ids.is_empty() {
+        bail!("--slice '{raw}' must include at least one slice_id");
+    }
+    Ok(AtlasSliceSelection {
+        subject_slug: parts[0].trim().to_string(),
+        style_slug: parts[1].trim().to_string(),
+        slice_ids,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -369,6 +526,207 @@ async fn main() -> anyhow::Result<()> {
                 bail!("VisionCritic failed one or more trait checks");
             }
         }
+        Commands::Library(args) => {
+            let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+            let registry = match ws.as_ref() {
+                Some(resolved) => LibraryRegistry::from_workspace(resolved),
+                None => LibraryRegistry::new(None, resolve_user_config_dir_from_env()),
+            };
+
+            match args.action {
+                LibrarySubcommand::List { kind, json } => {
+                    let mut rows = Vec::new();
+                    if kind.is_none() || matches!(kind, Some(LibraryEntityKind::Subject)) {
+                        for s in registry.list_subjects()? {
+                            rows.push(LibrarySummaryRow {
+                                kind: "subject",
+                                slug: s.subject.slug,
+                                display_name: s.subject.display_name,
+                                source: s.source,
+                            });
+                        }
+                    }
+                    if kind.is_none() || matches!(kind, Some(LibraryEntityKind::Style)) {
+                        for s in registry.list_styles()? {
+                            rows.push(LibrarySummaryRow {
+                                kind: "style",
+                                slug: s.style.slug,
+                                display_name: s.style.display_name,
+                                source: s.source,
+                            });
+                        }
+                    }
+                    if kind.is_none() || matches!(kind, Some(LibraryEntityKind::Atmosphere)) {
+                        for a in registry.list_atmospheres()? {
+                            rows.push(LibrarySummaryRow {
+                                kind: "atmosphere",
+                                slug: a.atmosphere.slug,
+                                display_name: a.atmosphere.display_name,
+                                source: a.source,
+                            });
+                        }
+                    }
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    } else {
+                        for row in &rows {
+                            println!(
+                                "{}\t{}\t{}\t({})",
+                                row.kind,
+                                row.slug,
+                                row.source.as_str(),
+                                row.display_name
+                            );
+                        }
+                    }
+                }
+                LibrarySubcommand::Show { kind, slug, json } => match kind {
+                    LibraryEntityKind::Subject => {
+                        let resolved = registry.resolve_subject(&slug)?;
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&resolved.subject)?);
+                        } else {
+                            println!("{}", resolved.subject.to_yaml_string()?);
+                        }
+                    }
+                    LibraryEntityKind::Style => {
+                        let resolved = registry.resolve_style(&slug)?;
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&resolved.style)?);
+                        } else {
+                            println!("{}", resolved.style.to_yaml_string()?);
+                        }
+                    }
+                    LibraryEntityKind::Atmosphere => {
+                        let resolved = registry.resolve_atmosphere(&slug)?;
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&resolved.atmosphere)?);
+                        } else {
+                            println!("{}", resolved.atmosphere.to_yaml_string()?);
+                        }
+                    }
+                },
+                LibrarySubcommand::VerifyLock => {
+                    let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+                    let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+                    let lock_store = ManifestLockStore::new(&library_dir);
+                    lock_store.verify_canonical_checksums(&resolved_ws.root)?;
+                    println!(
+                        "Verified canonical checksums at {}",
+                        lock_store.lock_path().display()
+                    );
+                }
+            }
+        }
+        Commands::Pack(args) => match args.action {
+            PackSubcommand::Generate {
+                subject,
+                style,
+                seed,
+                seed_label,
+                json,
+            } => {
+                let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+                let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+                let registry = LibraryRegistry::from_workspace(&resolved_ws);
+                let backend = CodexNativeBackend::with_codex_bin(auth_dir, codex_bin);
+                let pipeline = ReferencePackPipeline::new(&backend, &registry, library_dir);
+                let mut req = ReferencePackRequest::new(subject, style);
+                req.seed_path = seed;
+                req.seed_label = seed_label;
+                let generated = pipeline.generate(&req).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&generated.manifest)?);
+                } else {
+                    println!(
+                        "Generated ReferencePack ({} sheets, {} slices) at {}",
+                        generated.manifest.sheets.len(),
+                        generated.manifest.slices.len(),
+                        generated.pack_dir.display()
+                    );
+                }
+            }
+            PackSubcommand::Slice {
+                sheet,
+                out_dir,
+                strip_height,
+                json,
+            } => {
+                let _ws = resolve_optional_workspace(cli.workspace.as_ref())?;
+                let manifest = slice_sheet_to_dir(
+                    &sheet,
+                    &out_dir,
+                    &SlicerConfig {
+                        exclude_bottom_rows: strip_height,
+                        ..SlicerConfig::default()
+                    },
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&manifest)?);
+                } else {
+                    println!(
+                        "Sliced {} components from {} into {}",
+                        manifest.slices.len(),
+                        sheet.display(),
+                        out_dir.display()
+                    );
+                }
+            }
+            PackSubcommand::Atlas {
+                out,
+                slices,
+                visibility,
+                width,
+                height,
+                json,
+            } => {
+                let resolved_ws = resolve_workspace_from_env(cli.workspace.as_deref())?;
+                let library_dir = resolved_ws.root.join(&resolved_ws.config.paths.library_dir);
+                let registry = LibraryRegistry::from_workspace(&resolved_ws);
+
+                let mut selections = Vec::with_capacity(slices.len());
+                for raw in &slices {
+                    selections.push(parse_atlas_selection(raw)?);
+                }
+                let req = AtlasPackRequest {
+                    selections,
+                    target_visibility: visibility.into(),
+                    canvas_width: width,
+                    canvas_height: height,
+                    padding_px: DEFAULT_ATLAS_PADDING_PX,
+                };
+                let result = pack_dynamic_atlas(&registry, &library_dir, &req)?;
+
+                if let Some(parent) = out.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("creating Atlas output directory {}", parent.display())
+                    })?;
+                }
+                for page in &result.pages {
+                    let page_path = if result.pages.len() == 1 {
+                        out.clone()
+                    } else {
+                        let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("atlas");
+                        out.with_file_name(format!("{stem}_p{}.png", page.page_index + 1))
+                    };
+                    fs::write(&page_path, &page.png_bytes)
+                        .with_context(|| format!("writing Atlas PNG {}", page_path.display()))?;
+                }
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result.placements)?);
+                } else {
+                    println!(
+                        "Packed {} slices onto {} Atlas page(s) at {}",
+                        result.placements.len(),
+                        result.pages.len(),
+                        out.display()
+                    );
+                }
+            }
+        },
         Commands::Ui(args) => {
             let ws = resolve_optional_workspace(cli.workspace.as_ref())?;
             let port = args

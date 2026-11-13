@@ -312,3 +312,192 @@ fn cli_invalid_invocations_fail_closed(#[case] args: &[&str]) {
         .expect("spawn imgforge");
     assert!(!output.status.success());
 }
+
+fn write_studio_sheet_png(path: &std::path::Path) {
+    let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_pixel(1536, 1024, Rgba([0x25, 0x28, 0x30, 255]));
+    for (start_x, rgb) in [(200u32, [200u8, 120, 80]), (880u32, [90u8, 170, 210])] {
+        for y in 140..760 {
+            for x in start_x..(start_x + 220) {
+                img.put_pixel(x, y, Rgba([rgb[0], rgb[1], rgb[2], 255]));
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    DynamicImage::ImageRgba8(img)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)
+        .expect("encode studio sheet PNG");
+    fs::write(path, bytes).expect("write studio sheet PNG");
+}
+
+#[test]
+fn cli_phase2_library_and_pack_pipeline_end_to_end() {
+    let root = TempDir::new().expect("tempdir");
+    let ws_dir = root.path().join("workspace");
+    let xdg_data = root.path().join("xdg-data");
+    let xdg_cfg = root.path().join("xdg-cfg");
+    fs::create_dir_all(ws_dir.join("library/subjects/courier-ren")).unwrap();
+    fs::create_dir_all(&xdg_data).unwrap();
+    fs::create_dir_all(&xdg_cfg).unwrap();
+
+    fs::write(
+        ws_dir.join("imgforge.toml"),
+        "schema_version = 1\nname = \"phase2-e2e\"\n",
+    )
+    .unwrap();
+    fs::write(
+        ws_dir.join("library/subjects/courier-ren/card.yaml"),
+        r##"
+schema_version: 1
+kind: character
+slug: courier-ren
+display_name: Courier Ren
+height_m: 1.74
+exclusive_surface_map:
+  bindings:
+    - slot: coat
+      material: waxed canvas
+      color_hex: "#2C3E50"
+palette_lock:
+  swatches:
+    - name: coat_navy
+      color_hex: "#2C3E50"
+      surface_slot: coat
+    - name: scarf_rust
+      color_hex: "#B84A39"
+visibility: public
+"##,
+    )
+    .unwrap();
+
+    let studio_fixture = root.path().join("studio_1536x1024.png");
+    write_studio_sheet_png(&studio_fixture);
+    let stub = create_stub_codex(root.path(), &studio_fixture);
+
+    // 1. Provision tool-local auth
+    let login = Command::new(bin_path())
+        .args(["--codex-bin", stub.to_str().unwrap(), "auth", "login"])
+        .env("XDG_DATA_HOME", &xdg_data)
+        .output()
+        .unwrap();
+    assert!(login.status.success());
+
+    // 2. List library entities across project > user > builtin
+    let list = Command::new(bin_path())
+        .args([
+            "--workspace",
+            ws_dir.to_str().unwrap(),
+            "library",
+            "list",
+            "--json",
+        ])
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_cfg)
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "library list stderr: {}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&list.stdout).unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r["kind"] == "subject" && r["slug"] == "courier-ren")
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["kind"] == "style" && r["slug"] == "franco-belgian-line")
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r["kind"] == "atmosphere" && r["slug"] == "golden-dawn")
+    );
+
+    // 3. Show built-in style
+    let show = Command::new(bin_path())
+        .args([
+            "--workspace",
+            ws_dir.to_str().unwrap(),
+            "library",
+            "show",
+            "style",
+            "franco-belgian-line",
+            "--json",
+        ])
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_cfg)
+        .output()
+        .unwrap();
+    assert!(show.status.success());
+
+    // 4. Generate style-scoped ReferencePack (2-step character chain)
+    let pack_gen = Command::new(bin_path())
+        .args([
+            "--workspace",
+            ws_dir.to_str().unwrap(),
+            "--codex-bin",
+            stub.to_str().unwrap(),
+            "pack",
+            "generate",
+            "--subject",
+            "courier-ren",
+            "--style",
+            "franco-belgian-line",
+            "--json",
+        ])
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_cfg)
+        .output()
+        .unwrap();
+    assert!(
+        pack_gen.status.success(),
+        "pack generate stderr: {}",
+        String::from_utf8_lossy(&pack_gen.stderr)
+    );
+    let pack_json: serde_json::Value = serde_json::from_slice(&pack_gen.stdout).unwrap();
+    assert_eq!(pack_json["sheets"].as_array().unwrap().len(), 3);
+    assert_eq!(pack_json["slices"].as_array().unwrap().len(), 6);
+
+    // 5. Dynamically pack an Atlas from two selected slices
+    let atlas_out = root.path().join("atlas.png");
+    let atlas_cmd = Command::new(bin_path())
+        .args([
+            "--workspace",
+            ws_dir.to_str().unwrap(),
+            "pack",
+            "atlas",
+            "--out",
+            atlas_out.to_str().unwrap(),
+            "--slice",
+            "courier-ren:franco-belgian-line:turnaround_001,poses_001",
+            "--json",
+        ])
+        .env("XDG_DATA_HOME", &xdg_data)
+        .env("XDG_CONFIG_HOME", &xdg_cfg)
+        .output()
+        .unwrap();
+    assert!(
+        atlas_cmd.status.success(),
+        "pack atlas stderr: {}",
+        String::from_utf8_lossy(&atlas_cmd.stderr)
+    );
+    let placements: Vec<serde_json::Value> = serde_json::from_slice(&atlas_cmd.stdout).unwrap();
+    assert_eq!(placements.len(), 2);
+    assert!(atlas_out.is_file());
+    let atlas_img = image::open(&atlas_out).unwrap();
+    assert_eq!((atlas_img.width(), atlas_img.height()), (1536, 1024));
+
+    // 6. Verify manifest.lock.json check succeeds cleanly on initialized workspace
+    let verify_lock = Command::new(bin_path())
+        .args([
+            "--workspace",
+            ws_dir.to_str().unwrap(),
+            "library",
+            "verify-lock",
+        ])
+        .env("XDG_DATA_HOME", &xdg_data)
+        .output()
+        .unwrap();
+    assert!(verify_lock.status.success());
+}
