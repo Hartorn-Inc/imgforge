@@ -36,6 +36,7 @@ use crate::error::CoreError;
 use crate::lifecycle::{
     Lifecycle, SeedInput, now_utc_iso, read_regular_file_nofollow, sha256_hex, validate_slug,
 };
+use crate::reference_pack::ReferencePackManifest;
 use crate::scene_spec::Visibility;
 
 /// Supported `RunMetadata` and `ManifestLock` schema version.
@@ -406,10 +407,8 @@ fn parse_version_from_filename(name: &str) -> Option<u32> {
     let rest = name.strip_prefix('v')?;
     let digits = if let Some(stem) = rest.strip_suffix(".meta.json") {
         stem
-    } else if let Some(stem) = rest.strip_suffix(".png") {
-        stem
     } else {
-        return None;
+        rest.strip_suffix(".png")?
     };
     if digits.len() >= 3 && digits.bytes().all(|b| b.is_ascii_digit()) {
         digits.parse::<u32>().ok()
@@ -632,6 +631,53 @@ impl ManifestLockStore {
         Ok((promoted_meta, updated_lock))
     }
 
+    /// Promote a `Validated` style-scoped `ReferencePack` (`pack.json`) to `Canonical`
+    /// and record SHA-256 checksums for all sheets, slices, and manifests in `manifest.lock.json`.
+    pub fn promote_reference_pack_canonical(
+        &self,
+        pack_dir: &Path,
+        workspace_root: &Path,
+    ) -> Result<(ReferencePackManifest, ManifestLock), CoreError> {
+        let pack_path = pack_dir.join("pack.json");
+        let raw = read_regular_file_nofollow(&pack_path, "pack.json")?;
+        let mut manifest: ReferencePackManifest = serde_json::from_slice(&raw)
+            .map_err(|err| CoreError::ManifestLockInvalid(err.to_string()))?;
+
+        manifest.lifecycle = manifest.lifecycle.transition_to(Lifecycle::Canonical)?;
+        let updated_pack_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|err| CoreError::ManifestLockInvalid(err.to_string()))?;
+        write_atomic(&pack_path, &updated_pack_bytes, "pack.json")?;
+
+        let mut artifact_hashes = BTreeMap::new();
+        artifact_hashes.insert(
+            relative_workspace_key(workspace_root, &pack_path)?,
+            sha256_hex(&updated_pack_bytes),
+        );
+        for rel_name in manifest.artifact_hashes.keys() {
+            let full = pack_dir.join(rel_name);
+            let bytes = read_regular_file_nofollow(&full, rel_name)?;
+            artifact_hashes.insert(
+                relative_workspace_key(workspace_root, &full)?,
+                sha256_hex(&bytes),
+            );
+        }
+
+        let lock_key = format!("pack:{}/{}", manifest.subject_slug, manifest.style_slug);
+        let version_label = RunStore::format_version_label(manifest.version);
+        let updated_lock = self.promote_canonical(ManifestEntry {
+            entity_kind: ManifestEntityKind::ReferencePack,
+            key: lock_key,
+            version: manifest.version,
+            version_label,
+            lifecycle: Lifecycle::Canonical,
+            visibility: manifest.visibility,
+            artifact_hashes,
+            promoted_at_iso: now_utc_iso(),
+        })?;
+
+        Ok((manifest, updated_lock))
+    }
+
     /// Verify that every artifact in `manifest.lock.json`'s `canonical` table exists on disk
     /// as a regular non-symlink file inside `workspace_root` with matching SHA-256 checksum.
     pub fn verify_canonical_checksums(&self, workspace_root: &Path) -> Result<(), CoreError> {
@@ -733,13 +779,10 @@ pub(crate) fn write_atomic(dest: &Path, bytes: &[u8], label: &str) -> Result<(),
         context: format!("syncing temp {label} at {}", tmp.path().display()),
         source: err,
     })?;
-    let _file: File = tmp
-        .persist(dest)
-        .map_err(|err| CoreError::Io {
-            context: format!("persisting {label} to {}", dest.display()),
-            source: err.error,
-        })?
-        .into();
+    let _file: File = tmp.persist(dest).map_err(|err| CoreError::Io {
+        context: format!("persisting {label} to {}", dest.display()),
+        source: err.error,
+    })?;
     Ok(())
 }
 
