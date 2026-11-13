@@ -144,6 +144,80 @@ pub enum CoreError {
         reason: String,
     },
 
+    /// A `Subject` card failed YAML/JSON parsing or domain schema validation.
+    #[error("invalid Subject: {0}")]
+    SubjectInvalid(String),
+
+    /// A `Style` card or exemplar reference failed parsing or validation.
+    #[error("invalid Style: {0}")]
+    StyleInvalid(String),
+
+    /// An `Atmosphere` card failed parsing or validation.
+    #[error("invalid Atmosphere: {0}")]
+    AtmosphereInvalid(String),
+
+    /// A `Visibility` boundary check prevented an `internal` or `restricted` asset from leaking.
+    #[error(
+        "Visibility violation in {context}: asset '{asset_id}' ({asset_visibility}) exceeds permitted visibility ({context_visibility})"
+    )]
+    VisibilityViolation {
+        /// Surrounding `SceneSpec`, `Atlas`, or `Export` context description.
+        context: String,
+        /// Identifier of the asset whose `Visibility` exceeded the context limit.
+        asset_id: String,
+        /// Actual `Visibility` classification of the asset.
+        asset_visibility: String,
+        /// Maximum `Visibility` permitted by the target context.
+        context_visibility: String,
+    },
+
+    /// Attempted an invalid `Lifecycle` state transition (`draft -> candidate -> validated -> canonical -> superseded`).
+    #[error("invalid Lifecycle transition from '{from}' to '{to}': {reason}")]
+    LifecycleTransitionInvalid {
+        /// Current lifecycle state.
+        from: String,
+        /// Requested next lifecycle state.
+        to: String,
+        /// Reason the transition is prohibited.
+        reason: String,
+    },
+
+    /// Attempted to mutate or overwrite an immutable `canonical` artifact.
+    #[error("canonical artifact '{artifact}' is immutable: {reason}")]
+    CanonicalImmutable {
+        /// Identifier or path of the canonical artifact.
+        artifact: String,
+        /// Reason mutation was rejected.
+        reason: String,
+    },
+
+    /// Library entity could not be resolved across `project > user > builtin` tiers.
+    #[error("{kind} '{slug}' could not be resolved: {reason}")]
+    RegistryResolutionFailed {
+        /// Entity kind (`Subject`, `Style`, or `Atmosphere`).
+        kind: &'static str,
+        /// Requested slug identifier.
+        slug: String,
+        /// Specific lookup failure detail.
+        reason: String,
+    },
+
+    /// `ReferencePack` generation or structural validation failed.
+    #[error("ReferencePack pipeline failed: {0}")]
+    ReferencePackFailed(String),
+
+    /// Foreground component bounding-box slicing failed.
+    #[error("ReferencePack slicer failed: {0}")]
+    SlicerFailed(String),
+
+    /// Dynamic `Atlas` packing failed validation or placement.
+    #[error("Atlas packing failed: {0}")]
+    AtlasPackFailed(String),
+
+    /// `manifest.lock.json` failed parsing, verification, or atomic update.
+    #[error("manifest.lock.json invalid: {0}")]
+    ManifestLockInvalid(String),
+
     /// Underlying filesystem or process I/O error.
     #[error("I/O error during {context}: {source}")]
     Io {

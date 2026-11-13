@@ -59,6 +59,75 @@ impl Visibility {
     pub fn allows_asset(self, asset_visibility: Self) -> bool {
         asset_visibility <= self
     }
+
+    /// Fail-closed guard verifying that `asset_visibility` does not exceed `self` (`SceneSpec` or `Export` context).
+    pub fn ensure_allows(
+        self,
+        asset_visibility: Self,
+        asset_id: &str,
+        context: &str,
+    ) -> Result<(), CoreError> {
+        if self.allows_asset(asset_visibility) {
+            Ok(())
+        } else {
+            Err(CoreError::VisibilityViolation {
+                context: context.to_string(),
+                asset_id: asset_id.to_string(),
+                asset_visibility: asset_visibility.as_str().to_string(),
+                context_visibility: self.as_str().to_string(),
+            })
+        }
+    }
+}
+
+/// Validate that every `(asset_id, Visibility)` referenced by a `SceneSpec`, `Atlas`, or `Export`
+/// is permitted under `target_visibility`, failing closed on the first leak.
+pub fn check_visibility_compatibility<'a, I>(
+    target_visibility: Visibility,
+    context: &str,
+    assets: I,
+) -> Result<(), CoreError>
+where
+    I: IntoIterator<Item = (&'a str, Visibility)>,
+{
+    for (asset_id, asset_vis) in assets {
+        target_visibility.ensure_allows(asset_vis, asset_id, context)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::public_allows_public(Visibility::Public, Visibility::Public, true)]
+    #[case::public_blocks_restricted(Visibility::Public, Visibility::Restricted, false)]
+    #[case::public_blocks_internal(Visibility::Public, Visibility::Internal, false)]
+    #[case::restricted_allows_public(Visibility::Restricted, Visibility::Public, true)]
+    #[case::restricted_allows_restricted(Visibility::Restricted, Visibility::Restricted, true)]
+    #[case::restricted_blocks_internal(Visibility::Restricted, Visibility::Internal, false)]
+    #[case::internal_allows_all(Visibility::Internal, Visibility::Internal, true)]
+    fn visibility_compatibility_matrix(
+        #[case] context_vis: Visibility,
+        #[case] asset_vis: Visibility,
+        #[case] expect_ok: bool,
+    ) {
+        let res = check_visibility_compatibility(
+            context_vis,
+            "ExportProfile",
+            [("subject-alpha", asset_vis)],
+        );
+        assert_eq!(res.is_ok(), expect_ok);
+        if !expect_ok {
+            assert!(matches!(
+                res.unwrap_err(),
+                CoreError::VisibilityViolation { .. }
+            ));
+        }
+    }
 }
 
 /// Depth plane assignment for quantitative composition bands.
