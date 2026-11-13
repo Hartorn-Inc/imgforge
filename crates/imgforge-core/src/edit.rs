@@ -141,13 +141,23 @@ pub async fn execute_whole_image_edit(
     run_store: &RunStore,
     request: &WholeImageEditRequest,
 ) -> Result<WholeImageEditResult, CoreError> {
+    let mut vis_checks: Vec<(String, Visibility)> = request
+        .subject_rois
+        .iter()
+        .map(|s| (s.subject_slug.clone(), s.visibility))
+        .collect();
+    if let Some(run_vis) = run_store.inspect_run_image_visibility(&request.target_image_path)? {
+        vis_checks.push((request.target_image_path.display().to_string(), run_vis));
+    }
+    for ref_path in &request.reference_images {
+        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
+            vis_checks.push((ref_path.display().to_string(), run_vis));
+        }
+    }
     check_visibility_compatibility(
         request.visibility,
         "WholeImageEdit",
-        request
-            .subject_rois
-            .iter()
-            .map(|s| (s.subject_slug.as_str(), s.visibility)),
+        vis_checks.iter().map(|(id, vis)| (id.as_str(), *vis)),
     )?;
 
     if request.compiled_prompt.trim().is_empty() {
@@ -411,6 +421,20 @@ pub async fn execute_patch_edit(
     request: &PatchEditRequest,
 ) -> Result<PatchEditResult, CoreError> {
     request.config.validate()?;
+    let mut vis_checks: Vec<(String, Visibility)> = Vec::new();
+    if let Some(run_vis) = run_store.inspect_run_image_visibility(&request.target_image_path)? {
+        vis_checks.push((request.target_image_path.display().to_string(), run_vis));
+    }
+    for ref_path in &request.reference_images {
+        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
+            vis_checks.push((ref_path.display().to_string(), run_vis));
+        }
+    }
+    check_visibility_compatibility(
+        request.visibility,
+        "PatchEdit",
+        vis_checks.iter().map(|(id, vis)| (id.as_str(), *vis)),
+    )?;
     if request.compiled_prompt.trim().is_empty() {
         return Err(CoreError::EditFailed(
             "PatchEdit compiled_prompt must not be empty".to_string(),
@@ -1899,5 +1923,108 @@ mod tests {
                 "backend must not be invoked when Visibility fails"
             );
         }
+    }
+
+    #[rstest]
+    #[case::whole_blocks_internal_run_target(true, true, false)]
+    #[case::whole_blocks_internal_run_ref(true, false, false)]
+    #[case::patch_blocks_internal_run_target(false, true, false)]
+    #[case::patch_blocks_internal_run_ref(false, false, false)]
+    #[tokio::test]
+    async fn edits_enforce_run_store_image_visibility_for_target_and_references(
+        #[case] is_whole: bool,
+        #[case] as_target: bool,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().expect("tempdir");
+        let run_store = RunStore::new(root.path().join("runs"));
+        let mut buf = Vec::new();
+        DynamicImage::ImageRgba8(ImageBuffer::from_pixel(64, 64, Rgba([120, 140, 160, 255])))
+            .write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        let secret_run = run_store
+            .record_run(RecordRunParams {
+                slug: "secret-run".to_string(),
+                visibility: Visibility::Internal,
+                png_bytes: buf,
+                input_hashes: BTreeMap::new(),
+                compiled_prompt: "secret".to_string(),
+                backend: RunBackendMetadata {
+                    name: "stub".to_string(),
+                    width: 64,
+                    height: 64,
+                    raw_width: 64,
+                    raw_height: 64,
+                    thread_id: None,
+                },
+                seed: None,
+                qa_reports: RunQaReports::default(),
+            })
+            .unwrap();
+
+        let public_png = root.path().join("public.png");
+        write_test_png(
+            &public_png,
+            &ImageBuffer::from_pixel(64, 64, Rgba([120, 140, 160, 255])),
+        );
+
+        let (target_image_path, reference_images) = if as_target {
+            (secret_run.image_path, Vec::new())
+        } else {
+            (public_png, vec![secret_run.image_path])
+        };
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = StubEditBackend {
+            response_fill: [120, 140, 160],
+            seen_requests: Arc::clone(&seen),
+        };
+
+        let is_ok = if is_whole {
+            execute_whole_image_edit(
+                &backend,
+                &run_store,
+                &WholeImageEditRequest {
+                    slug: "pub-whole".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path,
+                    compiled_prompt: "clean lighting".to_string(),
+                    reference_images,
+                    exposure_floor: None,
+                    subject_rois: Vec::new(),
+                    palette_config: PaletteQaConfig::default(),
+                    edit_mask: None,
+                    untouched_drift_config: UntouchedDriftConfig::default(),
+                    allowed_sparkle_mask: None,
+                    sparkle_config: SparkleConfig::default(),
+                    fail_closed_on_qa: true,
+                },
+            )
+            .await
+            .is_ok()
+        } else {
+            execute_patch_edit(
+                &backend,
+                &run_store,
+                &PatchEditRequest {
+                    slug: "pub-patch".to_string(),
+                    visibility: Visibility::Public,
+                    target_image_path,
+                    target_mask: PatchTargetMask::SquareRoi {
+                        x: 20,
+                        y: 20,
+                        size: 16,
+                    },
+                    compiled_prompt: "clean patch".to_string(),
+                    reference_images,
+                    config: PatchEditConfig::default(),
+                },
+            )
+            .await
+            .is_ok()
+        };
+
+        assert_eq!(is_ok, expect_ok);
+        assert!(seen.lock().unwrap().is_empty());
     }
 }

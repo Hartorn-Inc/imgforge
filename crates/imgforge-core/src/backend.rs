@@ -26,10 +26,8 @@
 //!    and Lanczos-resample to exact `WxH`.
 //! 6. Drop `TempCodexHome` automatically on return, error, or cancellation.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Cursor, Read};
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::SystemTime;
@@ -41,6 +39,7 @@ use tokio::process::Command;
 
 use crate::auth::{DEFAULT_CODEX_BIN, TempCodexHome};
 use crate::error::CoreError;
+use crate::store::{decode_png_checked, read_regular_file_nofollow};
 
 /// Exact 8-byte PNG file magic header.
 pub const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -362,61 +361,22 @@ fn pick_newest_png(dir: &Path, label: &str) -> Result<Option<PathBuf>, CoreError
 }
 
 fn read_regular_png_nofollow(png_path: &Path) -> Result<Vec<u8>, CoreError> {
-    let lstat_meta = fs::symlink_metadata(png_path).map_err(|err| CoreError::Io {
-        context: format!("inspecting generated PNG at {}", png_path.display()),
-        source: err,
-    })?;
-    if lstat_meta.file_type().is_symlink() || !lstat_meta.is_file() {
-        return Err(CoreError::InvalidPng {
-            path: png_path.to_path_buf(),
-            reason: "refusing symlink or non-regular generated PNG".to_string(),
-        });
-    }
-
-    #[cfg(unix)]
-    {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(png_path)
-            .map_err(|err| {
-                if err.raw_os_error() == Some(libc::ELOOP) {
-                    CoreError::InvalidPng {
-                        path: png_path.to_path_buf(),
-                        reason: "refusing symlink generated PNG (O_NOFOLLOW)".to_string(),
-                    }
-                } else {
-                    CoreError::Io {
-                        context: format!("opening generated PNG at {}", png_path.display()),
-                        source: err,
-                    }
-                }
-            })?;
-        let meta = file.metadata().map_err(|err| CoreError::Io {
-            context: format!("inspecting opened generated PNG at {}", png_path.display()),
-            source: err,
-        })?;
-        if !meta.is_file() {
-            return Err(CoreError::InvalidPng {
+    read_regular_file_nofollow(png_path, "generated PNG").map_err(|err| match err {
+        CoreError::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput => {
+            CoreError::InvalidPng {
                 path: png_path.to_path_buf(),
-                reason: "generated PNG is not a regular file".to_string(),
-            });
+                reason: format!("refusing symlink or non-regular generated PNG: {source}"),
+            }
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|err| CoreError::Io {
-            context: format!("reading generated PNG at {}", png_path.display()),
-            source: err,
-        })?;
-        Ok(bytes)
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::read(png_path).map_err(|err| CoreError::Io {
-            context: format!("reading generated PNG at {}", png_path.display()),
-            source: err,
-        })
-    }
+        #[cfg(unix)]
+        CoreError::Io { source, .. } if source.raw_os_error() == Some(libc::ELOOP) => {
+            CoreError::InvalidPng {
+                path: png_path.to_path_buf(),
+                reason: "refusing symlink generated PNG (O_NOFOLLOW)".to_string(),
+            }
+        }
+        other => other,
+    })
 }
 
 /// Locate the generated PNG under `$CODEX_HOME/generated_images/<thread_id>/`,
@@ -466,13 +426,7 @@ pub fn validate_and_resample_png(
         });
     }
 
-    let decoded =
-        image::load_from_memory_with_format(raw_bytes, ImageFormat::Png).map_err(|err| {
-            CoreError::InvalidPng {
-                path: png_path.to_path_buf(),
-                reason: format!("PNG decode failed: {err}"),
-            }
-        })?;
+    let decoded = decode_png_checked(png_path, raw_bytes)?;
 
     let actual_width = decoded.width();
     let actual_height = decoded.height();

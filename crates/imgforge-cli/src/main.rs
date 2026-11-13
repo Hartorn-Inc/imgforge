@@ -777,6 +777,20 @@ async fn main() -> anyhow::Result<()> {
                         None => None,
                     };
                     let target_visibility: Visibility = visibility.into();
+                    let mut run_vis_checks: Vec<(String, Visibility)> = Vec::new();
+                    if let Some(run_vis) = run_store.inspect_run_image_visibility(&target)? {
+                        run_vis_checks.push((target.display().to_string(), run_vis));
+                    }
+                    for ref_path in &references {
+                        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
+                            run_vis_checks.push((ref_path.display().to_string(), run_vis));
+                        }
+                    }
+                    check_visibility_compatibility(
+                        target_visibility,
+                        "WholeImageEdit",
+                        run_vis_checks.iter().map(|(id, vis)| (id.as_str(), *vis)),
+                    )?;
                     let mut subject_rois = Vec::with_capacity(subjects.len());
                     for subj_slug in &subjects {
                         let resolved = registry.resolve_subject(subj_slug)?;
@@ -844,6 +858,21 @@ async fn main() -> anyhow::Result<()> {
                     references,
                     json,
                 } => {
+                    let target_visibility: Visibility = visibility.into();
+                    let mut run_vis_checks: Vec<(String, Visibility)> = Vec::new();
+                    if let Some(run_vis) = run_store.inspect_run_image_visibility(&target)? {
+                        run_vis_checks.push((target.display().to_string(), run_vis));
+                    }
+                    for ref_path in &references {
+                        if let Some(run_vis) = run_store.inspect_run_image_visibility(ref_path)? {
+                            run_vis_checks.push((ref_path.display().to_string(), run_vis));
+                        }
+                    }
+                    check_visibility_compatibility(
+                        target_visibility,
+                        "PatchEdit",
+                        run_vis_checks.iter().map(|(id, vis)| (id.as_str(), *vis)),
+                    )?;
                     let target_mask = match (roi, mask) {
                         (Some(raw_roi), None) => PatchTargetMask::Roi(parse_roi_arg(&raw_roi)?),
                         (None, Some(mask_path)) => PatchTargetMask::MaskImagePath(mask_path),
@@ -855,7 +884,7 @@ async fn main() -> anyhow::Result<()> {
                         &run_store,
                         &PatchEditRequest {
                             slug,
-                            visibility: visibility.into(),
+                            visibility: target_visibility,
                             target_image_path: target,
                             target_mask,
                             compiled_prompt: prompt,

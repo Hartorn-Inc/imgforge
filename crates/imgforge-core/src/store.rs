@@ -489,7 +489,9 @@ fn parse_version_from_filename(name: &str) -> Option<u32> {
     let digits = if let Some(stem) = rest.strip_suffix(".meta.json") {
         stem
     } else {
-        rest.strip_suffix(".png")?
+        let lower = rest.to_ascii_lowercase();
+        let stem_len = lower.strip_suffix(".png")?.len();
+        &rest[..stem_len]
     };
     if digits.len() >= 3 && digits.bytes().all(|b| b.is_ascii_digit()) {
         digits.parse::<u32>().ok()
@@ -1941,5 +1943,19 @@ mod tests {
             store.inspect_run_image_visibility(&target).unwrap(),
             expected
         );
+    }
+
+    #[rstest]
+    #[case::lowercase_png("v001.png", Some(1))]
+    #[case::uppercase_png("v001.PNG", Some(1))]
+    #[case::mixed_case_png("v012.Png", Some(12))]
+    #[case::meta_json("v003.meta.json", Some(3))]
+    #[case::too_short_digits("v01.png", None)]
+    #[case::unrelated_file("other.png", None)]
+    fn parse_version_from_filename_handles_png_case_insensitively(
+        #[case] name: &str,
+        #[case] expected: Option<u32>,
+    ) {
+        assert_eq!(parse_version_from_filename(name), expected);
     }
 }

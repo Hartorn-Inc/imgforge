@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::PNG_SIGNATURE;
 use crate::error::CoreError;
 use crate::slicer::PixelRect;
+use crate::store::decode_png_checked;
 use crate::subject::PaletteLock;
 
 /// Canonical neutral studio backdrop color (`#252830`) used across `ReferencePack` and `Atlas` sheets.
@@ -173,13 +174,7 @@ pub fn validate_reference_sheet_structure(
         ));
     }
 
-    let decoded =
-        image::load_from_memory_with_format(png_bytes, ImageFormat::Png).map_err(|err| {
-            CoreError::InvalidPng {
-                path: Path::new("reference_sheet.png").to_path_buf(),
-                reason: format!("PNG decode failed: {err}"),
-            }
-        })?;
+    let decoded = decode_png_checked(Path::new("reference_sheet.png"), png_bytes)?;
 
     let width = decoded.width();
     let height = decoded.height();
@@ -387,13 +382,7 @@ pub fn composite_calibration_strip_png(
     png_bytes: &[u8],
     palette_lock: &PaletteLock,
 ) -> Result<(Vec<u8>, CalibrationStripLayout), CoreError> {
-    let decoded =
-        image::load_from_memory_with_format(png_bytes, ImageFormat::Png).map_err(|err| {
-            CoreError::InvalidPng {
-                path: Path::new("reference_sheet.png").to_path_buf(),
-                reason: format!("PNG decode failed before calibration compositing: {err}"),
-            }
-        })?;
+    let decoded = decode_png_checked(Path::new("reference_sheet.png"), png_bytes)?;
     let mut rgba = decoded.to_rgba8();
     let layout = composite_calibration_strip(&mut rgba, palette_lock)?;
 

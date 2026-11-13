@@ -36,7 +36,9 @@ use crate::presets::{
     builtin_atmosphere, builtin_atmospheres, builtin_style, builtin_style_exemplar_png,
     builtin_styles,
 };
-use crate::store::{read_regular_file_nofollow, verify_optional_contained_dir_no_symlinks};
+use crate::store::{
+    decode_png_checked, read_regular_file_nofollow, verify_optional_contained_dir_no_symlinks,
+};
 use crate::style::Style;
 use crate::subject::Subject;
 
@@ -535,12 +537,7 @@ fn load_and_verify_style_exemplars(
                 reason: "Style exemplar is missing valid 8-byte PNG signature".to_string(),
             });
         }
-        image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).map_err(|err| {
-            CoreError::InvalidPng {
-                path: cursor,
-                reason: format!("Style exemplar PNG decode failed: {err}"),
-            }
-        })?;
+        decode_png_checked(&cursor, &bytes)?;
 
         loaded.push((rel.clone(), bytes));
     }

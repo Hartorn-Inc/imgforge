@@ -44,7 +44,7 @@ use crate::registry::{LibraryRegistry, ResolvedStyle, ResolvedSubject};
 use crate::scene_spec::Visibility;
 use crate::slicer::{RectOverride, SliceRecord, SlicerConfig, SlicesManifest, slice_sheet_image};
 use crate::store::{
-    read_regular_file_nofollow, verify_contained_path_no_symlinks,
+    decode_png_checked, read_regular_file_nofollow, verify_contained_path_no_symlinks,
     verify_existing_dir_prefix_no_symlinks, write_atomic,
 };
 use crate::style::Style;
@@ -482,12 +482,7 @@ impl<'a> ReferencePackPipeline<'a> {
         let sheet_sha256 = sha256_hex(&calibrated_png);
         artifact_hashes.insert(filename.clone(), sheet_sha256.clone());
 
-        let decoded = image::load_from_memory_with_format(&calibrated_png, image::ImageFormat::Png)
-            .map_err(|err| CoreError::InvalidPng {
-                path: sheet_path.clone(),
-                reason: format!("re-decoding calibrated sheet failed: {err}"),
-            })?
-            .to_rgba8();
+        let decoded = decode_png_checked(&sheet_path, &calibrated_png)?.to_rgba8();
 
         let mut slice_cfg = request.slicer_config.clone();
         slice_cfg.exclude_bottom_rows = calibration_strip.strip_height;

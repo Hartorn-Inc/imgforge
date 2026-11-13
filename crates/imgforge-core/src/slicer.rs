@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::calibration::{STUDIO_BG_RGB, studio_bg_distance};
 use crate::error::CoreError;
 use crate::lifecycle::sha256_hex;
-use crate::store::write_atomic;
+use crate::store::{decode_png_checked, read_regular_file_nofollow, write_atomic};
 
 /// Supported `SlicesManifest` schema version.
 pub const SUPPORTED_SLICES_SCHEMA_VERSION: u32 = 1;
@@ -324,16 +324,8 @@ pub fn slice_sheet_to_dir(
     out_dir: &Path,
     config: &SlicerConfig,
 ) -> Result<SlicesManifest, CoreError> {
-    let raw = fs::read(sheet_path).map_err(|err| CoreError::Io {
-        context: format!("reading sheet {}", sheet_path.display()),
-        source: err,
-    })?;
-    let decoded = image::load_from_memory_with_format(&raw, ImageFormat::Png).map_err(|err| {
-        CoreError::InvalidPng {
-            path: sheet_path.to_path_buf(),
-            reason: format!("PNG decode failed in slicer: {err}"),
-        }
-    })?;
+    let raw = read_regular_file_nofollow(sheet_path, "sheet PNG")?;
+    let decoded = decode_png_checked(sheet_path, &raw)?;
     let rgba = decoded.to_rgba8();
     let extracted = slice_sheet_image(&rgba, config)?;
 

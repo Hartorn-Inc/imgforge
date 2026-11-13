@@ -259,7 +259,15 @@ pub fn execute_export(
             path,
             asset_id,
             visibility,
-        } => (asset_id.clone(), *visibility, path.clone()),
+        } => {
+            let mut effective_vis = *visibility;
+            if let Some(store) = run_store
+                && let Some(run_vis) = store.inspect_run_image_visibility(path)?
+            {
+                effective_vis = std::cmp::max(effective_vis, run_vis);
+            }
+            (asset_id.clone(), effective_vis, path.clone())
+        }
     };
 
     check_visibility_compatibility(
@@ -1455,5 +1463,64 @@ mod tests {
         )
         .expect_err("oversized or overflowing Export profile must fail closed");
         assert!(matches!(err, CoreError::ExportFailed(_)));
+    }
+
+    #[rstest]
+    #[case::internal_run_png_blocked_for_public_export(
+        Visibility::Internal,
+        Visibility::Public,
+        false
+    )]
+    #[case::restricted_run_png_blocked_for_public_export(
+        Visibility::Restricted,
+        Visibility::Public,
+        false
+    )]
+    #[case::internal_run_png_allowed_for_internal_export(
+        Visibility::Internal,
+        Visibility::Internal,
+        true
+    )]
+    fn export_png_path_raises_effective_visibility_from_run_store(
+        #[case] run_vis: Visibility,
+        #[case] export_vis: Visibility,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        let store = seed_run(
+            root.path(),
+            "secret-run",
+            run_vis,
+            64,
+            64,
+            [90, 110, 130, 255],
+        );
+        let run_png = store.run_image_path("secret-run", 1);
+
+        // Programmatic caller specifies Visibility::Public on PngPath, but RunStore must raise it.
+        let res = execute_export(
+            Some(&store),
+            &ExportRequest {
+                source: ExportSource::PngPath {
+                    path: run_png,
+                    asset_id: "secret-run".to_string(),
+                    visibility: Visibility::Public,
+                },
+                output_slug: "secret-run".to_string(),
+                profile_visibility: export_vis,
+                out_dir: root.path().join("exports"),
+                profile: ExportProfile::WebWebp,
+                match_grade: None,
+            },
+        );
+        assert_eq!(res.is_ok(), expect_ok);
+        if let Ok(ok) = res {
+            assert_eq!(ok.source_visibility, run_vis);
+        } else {
+            assert!(matches!(
+                res.unwrap_err(),
+                CoreError::VisibilityViolation { .. }
+            ));
+        }
     }
 }

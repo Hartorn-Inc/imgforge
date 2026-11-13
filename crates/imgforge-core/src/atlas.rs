@@ -34,7 +34,8 @@ use crate::registry::LibraryRegistry;
 use crate::scene_spec::{MAX_FOREGROUND_SLOTS, Visibility, check_visibility_compatibility};
 use crate::slicer::{PixelRect, SlicesManifest};
 use crate::store::{
-    read_regular_file_nofollow, validate_strict_relative_path, verify_contained_path_no_symlinks,
+    decode_png_checked, read_regular_file_nofollow, validate_strict_relative_path,
+    verify_contained_path_no_symlinks,
 };
 
 /// Maximum number of distinct focal `Subject`s allowed in a single `Atlas`.
@@ -254,11 +255,7 @@ pub fn pack_dynamic_atlas(
                     })?;
 
             let png_bytes = read_regular_file_nofollow(&slice_path, "slice PNG")?;
-            let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)
-                .map_err(|err| CoreError::InvalidPng {
-                    path: slice_path,
-                    reason: format!("slice PNG decode failed: {err}"),
-                })?;
+            let decoded = decode_png_checked(&slice_path, &png_bytes)?;
             let rgba = decoded.to_rgba8();
             let required_w = rgba.width().saturating_add(request.padding_px * 2);
             let required_h = rgba.height().saturating_add(request.padding_px * 2);
