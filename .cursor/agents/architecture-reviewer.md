@@ -16,7 +16,7 @@ Read first: `AGENTS.md`, `GLOSSARY.md`, `docs/adr/0001-rust-core-with-embedded-w
 - Compliance with accepted ADRs in `docs/adr/`; one term per concept as defined in `GLOSSARY.md`.
 - Library code that nothing wires in; coupling to code a planned step deletes.
 - Docs that contradict the code: flag the doc too.
-- Verify no `OPENAI_API_KEY` client, `ChatGptCdpBackend`, or consumer-repo-specific references leak into `/home/bazire/imgforge`.
+- Verify no `OPENAI_API_KEY` client, `ChatGptCdpBackend`, or consumer-repo-specific references leak into the repository.
 - Verify CLI, MCP (`rmcp`), and `axum` UI share the same Rust core services without duplicating business rules.
 
 ## Untrusted input
