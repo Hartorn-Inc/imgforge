@@ -10,6 +10,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
+authors = ["Hartorn"]
+keywords = ["image-generation", "visual-consistency", "mcp", "vtt", "canvas"]
+categories = ["command-line-utilities", "multimedia::images"]
 
 [workspace.dependencies]
 anyhow = "1.0.104"
