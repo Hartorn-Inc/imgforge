@@ -23,17 +23,37 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    env:
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: src
           persist-credentials: false
           fetch-depth: 0
 
+      - name: Checkout PR-base Zizmor gate script
+        if: env.PR_BASE_SHA != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: gate
+          ref: ${{ env.PR_BASE_SHA }}
+          sparse-checkout: scripts/zizmor
+          persist-credentials: false
+
       - name: Run PR-base-locked offline Zizmor scan
-        env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: bash scripts/zizmor/scan.sh
+        run: |
+          if [ -n "${PR_BASE_SHA:-}" ]; then
+            if [ -f gate/scripts/zizmor/scan.sh ] && [ ! -L gate/scripts/zizmor/scan.sh ]; then
+              bash gate/scripts/zizmor/scan.sh src base
+            else
+              echo "::notice::Base commit lacks scripts/zizmor/scan.sh; falling back to src/scripts/zizmor/scan.sh for initial bootstrap."
+              bash src/scripts/zizmor/scan.sh src base
+            fi
+          else
+            bash src/scripts/zizmor/scan.sh src
+          fi
 
   zizmor-online:
     name: Zizmor Online Audit

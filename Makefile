@@ -28,9 +28,9 @@ DOCKER_RUN = \
 ENSURE_FRONTEND_DEPS = \
 	if [ ! -d frontend/node_modules ] || { [ -f frontend/package-lock.json ] && { [ ! -f frontend/node_modules/.package-lock.json ] || [ frontend/package-lock.json -nt frontend/node_modules/.package-lock.json ]; }; }; then \
 		if [ -f frontend/package-lock.json ]; then \
-			npm --prefix frontend ci --prefer-offline; \
+			npm --prefix frontend ci --ignore-scripts --prefer-offline; \
 		else \
-			npm --prefix frontend install; \
+			npm --prefix frontend install --ignore-scripts; \
 		fi; \
 	fi
 

@@ -1426,6 +1426,15 @@ pub fn read_regular_file_nofollow_bounded(
             context: format!("inspecting opened {context_label} at {}", path.display()),
             source: err,
         })?;
+        if !meta.is_file() {
+            return Err(CoreError::Io {
+                context: format!("reading {context_label} at {}", path.display()),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{context_label} is not a regular file"),
+                ),
+            });
+        }
         if meta.len() > max_bytes {
             return Err(CoreError::Io {
                 context: format!("reading {context_label} at {}", path.display()),

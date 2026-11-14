@@ -3,9 +3,34 @@
 set -euo pipefail
 
 ZIZMOR_IMAGE="${ZIZMOR_IMAGE:-ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d}"
-REPO_ROOT="${GITHUB_WORKSPACE:-$(git rev-parse --show-toplevel)}"
+TARGET_INPUT="${1:-${GITHUB_WORKSPACE:-$(git rev-parse --show-toplevel)}}"
+BASE_MODE="${2:-}"
 
+if [ -L "$TARGET_INPUT" ] || [ ! -d "$TARGET_INPUT" ]; then
+  echo "::error::Target repository path is not a regular non-symlink directory: $TARGET_INPUT" >&2
+  exit 1
+fi
+
+REPO_ROOT="$(cd "$TARGET_INPUT" && pwd -P)"
 cd "$REPO_ROOT"
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "::error::Target directory is not a git work tree: $REPO_ROOT" >&2
+  exit 1
+fi
+
+BASE_SHA=""
+if [ "$BASE_MODE" = "base" ]; then
+  if [ -z "${PR_BASE_SHA:-}" ]; then
+    echo "::error::PR_BASE_SHA must be set when running scan.sh in base-locked mode." >&2
+    exit 1
+  fi
+  BASE_SHA="$PR_BASE_SHA"
+elif [ -n "$BASE_MODE" ]; then
+  BASE_SHA="$BASE_MODE"
+elif [ -n "${PR_BASE_SHA:-}" ]; then
+  BASE_SHA="$PR_BASE_SHA"
+fi
 
 # Reject symlinks anywhere under .github/ (both working tree and git index).
 if [ -d .github ]; then
@@ -58,14 +83,14 @@ trap 'rm -rf "$tmpdir"' EXIT
 docker_config_args=()
 zizmor_config_args=()
 
-if [ -n "${PR_BASE_SHA:-}" ]; then
-  if ! git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null; then
-    git fetch --no-tags --depth=1 origin "$PR_BASE_SHA"
+if [ -n "$BASE_SHA" ]; then
+  if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+    git fetch --no-tags --depth=1 origin "$BASE_SHA"
   fi
 
   # Flag newly introduced zizmor ignore comments in the PR diff.
   added_ignores="$(
-    git diff --no-ext-diff --unified=0 "$PR_BASE_SHA" HEAD -- .github/ .pre-commit-config.yaml .pre-commit-hooks.yaml 2>/dev/null \
+    git diff --no-ext-diff --unified=0 "$BASE_SHA" HEAD -- .github/ .pre-commit-config.yaml .pre-commit-hooks.yaml 2>/dev/null \
       | awk '
           /^\+\+\+ b\// { file = substr($0, 7); next }
           /^\+[^+]/ {
@@ -94,8 +119,8 @@ if [ -n "${PR_BASE_SHA:-}" ]; then
   # Lock Zizmor configuration strictly to the PR base commit so PRs cannot weaken rules.
   base_config=""
   for candidate in .github/zizmor.yml .github/zizmor.yaml zizmor.yml zizmor.yaml; do
-    if git cat-file -e "${PR_BASE_SHA}:${candidate}" 2>/dev/null; then
-      git show "${PR_BASE_SHA}:${candidate}" > "${tmpdir}/base-zizmor.yml"
+    if git cat-file -e "${BASE_SHA}:${candidate}" 2>/dev/null; then
+      git show "${BASE_SHA}:${candidate}" > "${tmpdir}/base-zizmor.yml"
       base_config="${tmpdir}/base-zizmor.yml"
       break
     fi
