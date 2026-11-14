@@ -765,6 +765,7 @@ mod tests {
         fs::write(&generated_png_fixture, make_solid_png(1254, 1254)).unwrap();
 
         let recorded_codex_home = root.path().join("codex_home.txt");
+        let recorded_codex_home_phys = root.path().join("codex_home_phys.txt");
         let recorded_cwd = root.path().join("codex_cwd.txt");
         let recorded_args = root.path().join("codex_args.txt");
         let stub_bin = root.path().join("codex-stub");
@@ -773,7 +774,8 @@ mod tests {
             r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s' "$CODEX_HOME" > "{home_log}"
-pwd > "{cwd_log}"
+(cd "$CODEX_HOME" && pwd -P) > "{home_phys_log}"
+pwd -P > "{cwd_log}"
 printf '%s\n' "$@" > "{args_log}"
 if [ -n "${{OPENAI_API_KEY:-}}" ]; then
   echo "OPENAI_API_KEY must be unset" >&2
@@ -784,6 +786,7 @@ cp "{fixture}" "$CODEX_HOME/generated_images/thr_001/out.png"
 printf '{{"type":"thread.started","thread_id":"thr_001"}}\n'
 "#,
             home_log = recorded_codex_home.display(),
+            home_phys_log = recorded_codex_home_phys.display(),
             cwd_log = recorded_cwd.display(),
             args_log = recorded_args.display(),
             fixture = generated_png_fixture.display()
@@ -814,14 +817,28 @@ printf '{{"type":"thread.started","thread_id":"thr_001"}}\n'
             .expect("valid PNG");
         assert_eq!((decoded.width(), decoded.height()), (1024, 1024));
 
-        // Verify RAII cleanup of isolated CODEX_HOME and CWD isolation
+        // Verify RAII cleanup of isolated CODEX_HOME and CWD isolation (compare physical paths
+        // so macOS `/var` -> `/private/var` symlinks match `pwd -P`).
         let used_home = PathBuf::from(fs::read_to_string(&recorded_codex_home).unwrap());
+        let used_home_phys = PathBuf::from(
+            fs::read_to_string(&recorded_codex_home_phys)
+                .unwrap()
+                .trim(),
+        );
         let used_cwd = PathBuf::from(fs::read_to_string(&recorded_cwd).unwrap().trim());
-        assert_eq!(used_cwd, used_home);
+        assert_eq!(used_cwd, used_home_phys);
         assert_ne!(used_home, auth_dir);
+        assert_ne!(
+            used_home_phys,
+            fs::canonicalize(&auth_dir).unwrap_or_else(|_| auth_dir.clone())
+        );
         assert!(
             !used_home.exists(),
             "TempCodexHome must be removed after generation finishes"
+        );
+        assert!(
+            !used_home_phys.exists(),
+            "TempCodexHome physical path must be removed after generation finishes"
         );
 
         let args = fs::read_to_string(&recorded_args).unwrap();
@@ -916,7 +933,7 @@ printf '%s\n' '{event_line}'
 set -euo pipefail
 mkdir -p "$CODEX_HOME/generated_images/misc"
 cp "{older}" "$CODEX_HOME/generated_images/misc/a.png"
-touch -d "2025-01-01 00:00:00 UTC" "$CODEX_HOME/generated_images/misc/a.png"
+touch -t 202501010000 "$CODEX_HOME/generated_images/misc/a.png"
 cp "{newer}" "$CODEX_HOME/generated_images/misc/b.png"
 printf '{{"type":"turn.completed"}}\n'
 "#,

@@ -3328,6 +3328,11 @@ fn resolve_safe_fixture_path(
     verify_contained_path_no_symlinks(cases_dir, &rel, false, raw_rel)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn is_macos_system_root_symlink(path: &Path) -> bool {
+    path == Path::new("/var") || path == Path::new("/tmp")
+}
+
 fn ensure_safe_output_dir(dir: &Path) -> Result<(), CoreError> {
     if dir.as_os_str().is_empty() {
         return Err(CoreError::EvalFailed(
@@ -3360,7 +3365,34 @@ fn ensure_safe_output_dir(dir: &Path) -> Result<(), CoreError> {
 
         match fs::symlink_metadata(&cursor) {
             Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.is_dir() {
+                if meta.file_type().is_symlink() {
+                    // On macOS, `/var` -> `/private/var` and `/tmp` -> `/private/tmp` are OS
+                    // root-level symlinks (including `TempDir` paths under `/var/folders/...`).
+                    // Canonicalize only those two OS root symlinks and continue inspecting every
+                    // remaining path component so any user/test symlink still fails closed.
+                    #[cfg(target_os = "macos")]
+                    if is_macos_system_root_symlink(&cursor) {
+                        cursor = fs::canonicalize(&cursor).map_err(|err| CoreError::Io {
+                            context: format!(
+                                "canonicalizing macOS system root symlink {}",
+                                cursor.display()
+                            ),
+                            source: err,
+                        })?;
+                        if !cursor.is_dir() {
+                            return Err(CoreError::EvalFailed(format!(
+                                "refusing non-directory target for macOS system root symlink: {}",
+                                cursor.display()
+                            )));
+                        }
+                        continue;
+                    }
+                    return Err(CoreError::EvalFailed(format!(
+                        "refusing symlink or non-directory ancestor in eval output directory path: {}",
+                        cursor.display()
+                    )));
+                }
+                if !meta.is_dir() {
                     return Err(CoreError::EvalFailed(format!(
                         "refusing symlink or non-directory ancestor in eval output directory path: {}",
                         cursor.display()
@@ -4523,6 +4555,21 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
             0,
             "must not create directories through symlinked ancestor"
         );
+    }
+
+    #[rstest]
+    #[case::var_root("/var", true)]
+    #[case::tmp_root("/tmp", true)]
+    #[case::var_subdir("/var/folders", false)]
+    #[case::tmp_subdir("/tmp/out", false)]
+    #[case::private_var("/private/var", false)]
+    #[case::etc_root("/etc", false)]
+    #[case::relative_var("var", false)]
+    fn macos_system_root_symlink_matches_only_var_and_tmp(
+        #[case] raw_path: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_macos_system_root_symlink(Path::new(raw_path)), expected);
     }
 
     #[rstest]
