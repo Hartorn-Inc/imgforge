@@ -23,7 +23,9 @@
 //!    and atomically writes `library/manifest.lock.json`.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Cursor, Read, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
