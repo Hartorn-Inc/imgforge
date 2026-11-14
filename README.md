@@ -41,12 +41,6 @@ Install prebuilt release binaries verified with `SHA256SUMS.txt`, or build from 
   irm https://github.com/Hartorn-Inc/imgforge/releases/latest/download/install.ps1 | iex
   ```
 
-- **Cargo Binstall:**
-
-  ```bash
-  cargo binstall imgforge
-  ```
-
 - **Build from Source (Docker + Make):**
 
   ```bash

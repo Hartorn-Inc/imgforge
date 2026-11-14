@@ -1335,7 +1335,7 @@ impl ServerHandler for ImgforgeMcpServer {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(Implementation::new("imgforge", env!("CARGO_PKG_VERSION")))
+        .with_server_info(Implementation::new("imgforge", env!("IMGFORGE_VERSION")))
         .with_instructions(
             "imgforge visual consistency engine MCP server: compose, generate, pack, edit, guide, export, validate, promote tools and imgforge://* workspace resources.",
         )
@@ -2311,5 +2311,19 @@ JSON
         } else {
             assert_ne!(resp.status(), StatusCode::FORBIDDEN);
         }
+    }
+
+    #[test]
+    fn server_info_version_matches_injected_imgforge_version() {
+        let (_root, ws, auth_dir, codex_stub) = setup_mcp_test_workspace();
+        let server = ImgforgeMcpServer::with_backend(
+            Some(ws),
+            auth_dir,
+            codex_stub.to_string_lossy().into_owned(),
+            Arc::new(StubMcpBackend),
+        );
+        let info = server.get_info();
+        assert_eq!(info.server_info.name, "imgforge");
+        assert_eq!(info.server_info.version, env!("IMGFORGE_VERSION"));
     }
 }

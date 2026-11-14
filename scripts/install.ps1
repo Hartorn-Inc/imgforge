@@ -34,13 +34,22 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     }
 }
 $InstallDir = $InstallDir.TrimEnd('\')
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    throw "InstallDir must not be empty."
+}
+if (-not [System.IO.Path]::IsPathRooted($InstallDir)) {
+    throw "InstallDir '$InstallDir' must be a rooted path."
+}
+if ($InstallDir.Contains(";")) {
+    throw "InstallDir '$InstallDir' must not contain ';' before adding to User PATH."
+}
 
 $ExplicitTag = ""
 if ($Version -eq "latest") {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
 } else {
     $NormalizedVersion = $Version -replace '^[vV]', ''
-    if ($NormalizedVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+    if ($NormalizedVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?\z') {
         throw "Version '$Version' must be 'latest' or valid SemVer (for example '0.1.0' or 'v0.1.0')."
     }
     $ExplicitTag = "v$NormalizedVersion"

@@ -66,7 +66,8 @@ else
     v*) raw_ver="${raw_ver#v}" ;;
     V*) raw_ver="${raw_ver#V}" ;;
   esac
-  if ! printf '%s' "$raw_ver" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+  semver_regex='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+  if [[ ! "$raw_ver" =~ $semver_regex ]] || [[ "$raw_ver" == *$'\n'* ]]; then
     echo "error: IMGFORGE_VERSION '${IMGFORGE_VERSION}' must be 'latest' or valid SemVer (for example '0.1.0' or 'v0.1.0')" >&2
     exit 1
   fi
@@ -86,7 +87,7 @@ trap cleanup EXIT INT TERM
 
 SUMS_FILE="${TMP_DIR}/SHA256SUMS.txt"
 echo "Fetching release checksums from ${BASE_URL}/SHA256SUMS.txt..."
-curl -fsSL "${BASE_URL}/SHA256SUMS.txt" -o "$SUMS_FILE"
+curl --proto '=https' --tlsv1.2 -fsSL "${BASE_URL}/SHA256SUMS.txt" -o "$SUMS_FILE"
 
 if [ -n "$EXPLICIT_TAG" ]; then
   EXPECTED_ARCHIVE="imgforge-${EXPLICIT_TAG}-${TARGET}.tar.gz"
@@ -142,7 +143,7 @@ ARCHIVE_NAME="${match_line#* }"
 ARCHIVE_PATH="${TMP_DIR}/${ARCHIVE_NAME}"
 
 echo "Downloading ${BASE_URL}/${ARCHIVE_NAME}..."
-curl -fsSL "${BASE_URL}/${ARCHIVE_NAME}" -o "$ARCHIVE_PATH"
+curl --proto '=https' --tlsv1.2 -fsSL "${BASE_URL}/${ARCHIVE_NAME}" -o "$ARCHIVE_PATH"
 
 if [ "$SHA256_CMD" = "sha256sum" ]; then
   ACTUAL_SHA256="$(sha256sum "$ARCHIVE_PATH" | awk '{print tolower($1)}')"
