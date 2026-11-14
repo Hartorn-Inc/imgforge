@@ -1,0 +1,121 @@
+name: Zizmor Security Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+permissions: {}
+
+concurrency:
+  group: zizmor-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  ZIZMOR_IMAGE: ghcr.io/zizmorcore/zizmor:1.32.0@sha256:3014cc8f68f663935f69b3c3e0e41f5ce102b268d97db13db0f62208747f860d
+
+jobs:
+  zizmor:
+    name: Zizmor Offline Audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run PR-base-locked offline Zizmor scan
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/zizmor/scan.sh
+
+  zizmor-online:
+    name: Zizmor Online Audit
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run online Zizmor auditor scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          docker run --rm \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -w /workspace \
+            -e GH_TOKEN \
+            "$ZIZMOR_IMAGE" \
+            --persona=auditor \
+            --format=github \
+            --collect=all \
+            --strict-collection \
+            --no-config \
+            .
+
+  skip-ci-markers:
+    name: Guard Against Skip-CI Markers
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Reject skip-CI markers in PR metadata or merge queue commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          MERGE_GROUP_COMMIT_MESSAGE: ${{ github.event.merge_group.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          patterns = [
+              ("skip ci directive", re.compile(r"\[skip ci\]", re.IGNORECASE)),
+              ("ci skip directive", re.compile(r"\[ci skip\]", re.IGNORECASE)),
+              ("no ci directive", re.compile(r"\[no ci\]", re.IGNORECASE)),
+              ("skip actions directive", re.compile(r"\[skip actions\]", re.IGNORECASE)),
+              ("actions skip directive", re.compile(r"\[actions skip\]", re.IGNORECASE)),
+              ("skip-checks directive", re.compile(r"skip-checks\s*:\s*true", re.IGNORECASE)),
+          ]
+
+          fields = {
+              "PR title": os.environ.get("PR_TITLE", ""),
+              "PR body": os.environ.get("PR_BODY", ""),
+              "merge_group commit message": os.environ.get("MERGE_GROUP_COMMIT_MESSAGE", ""),
+          }
+
+          violations = []
+          for field_name, content in fields.items():
+              if not content:
+                  continue
+              for label, pattern in patterns:
+                  if pattern.search(content):
+                      violations.append(f"{field_name} contains forbidden {label}")
+
+          if violations:
+              for v in violations:
+                  print(f"::error::{v}", file=sys.stderr)
+              print(
+                  "Squash-merges and merge queue commits must not include skip-CI markers.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(f"No skip-CI markers detected (event={os.environ.get('EVENT_NAME', '')}).")
+          PY
