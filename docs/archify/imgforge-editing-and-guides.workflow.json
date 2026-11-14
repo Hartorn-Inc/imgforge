@@ -1,0 +1,208 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "SpatialGuide, PatchEdit, WholeImageEdit, and Export",
+    "locale": "en",
+    "output": "docs/public/diagrams/imgforge-editing-and-guides.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Hartorn-Inc/imgforge.git",
+      "provider": "github",
+      "revision": "1cabb6736ae59c7d47c877061a47886732c73916"
+    }
+  },
+  "lanes": [
+    { "id": "guides", "label": "SpatialGuide Rendering" },
+    { "id": "whole", "label": "WholeImageEdit & Persistence" },
+    { "id": "patch", "label": "PatchEdit Compositing" },
+    { "id": "export", "label": "Visibility & Export", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "guide_phase", "label": "Spatial Guidance", "fromCol": 0, "toCol": 1 },
+    { "id": "edit_phase", "label": "Edit & Calibration", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "qa_export_phase", "label": "QA & Export", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "groups": [
+    { "id": "guide_group", "label": "Deterministic Raster Guide", "lane": "guides", "fromCol": 0, "toCol": 1 },
+    { "id": "patch_group", "label": "Local Harmonization & Blending", "lane": "patch", "fromCol": 2, "toCol": 4, "variant": "emphasis" },
+    { "id": "export_group", "label": "Visibility-Gated Deliverables", "lane": "export", "fromCol": 4, "toCol": 5, "variant": "security" }
+  ],
+  "mainPath": [
+    "guide_spec",
+    "guide_renderer",
+    "patch_crop",
+    "reinhard_laplacian",
+    "out_of_roi_qa",
+    "run_store",
+    "visibility_gate",
+    "export_profiles"
+  ],
+  "nodes": [
+    {
+      "id": "guide_spec",
+      "lane": "guides",
+      "col": 0,
+      "type": "frontend",
+      "label": "GuideSpec",
+      "sublabel": "JSON schemaVersion 1.0",
+      "sources": [
+        { "path": "crates/imgforge-core/src/guide_renderer.rs", "line": 435, "end_line": 465, "label": "build_recommended_blockout" }
+      ]
+    },
+    {
+      "id": "guide_renderer",
+      "lane": "guides",
+      "col": 1,
+      "type": "backend",
+      "label": "GuideRenderer",
+      "sublabel": "Blockout & OverlayGuide",
+      "tag": "tiny-skia / resvg",
+      "sources": [
+        { "path": "crates/imgforge-core/src/guide_renderer.rs", "line": 534, "end_line": 580, "label": "GuideRenderer::render" }
+      ]
+    },
+    {
+      "id": "whole_edit",
+      "lane": "whole",
+      "col": 2,
+      "type": "backend",
+      "label": "WholeImageEdit",
+      "sublabel": "target + refs -> backend",
+      "tag": "no re-grade",
+      "sources": [
+        { "path": "crates/imgforge-core/src/edit.rs", "line": 140, "end_line": 178, "label": "execute_whole_image_edit" }
+      ]
+    },
+    {
+      "id": "color_qa",
+      "lane": "whole",
+      "col": 3,
+      "type": "security",
+      "label": "ColorQaEngine",
+      "sublabel": "exposure + DeltaE_2000",
+      "tag": "fail-closed",
+      "sources": [
+        { "path": "crates/imgforge-core/src/color_qa.rs", "line": 497, "end_line": 540, "label": "ColorQaEngine" }
+      ]
+    },
+    {
+      "id": "run_store",
+      "lane": "whole",
+      "col": 4,
+      "type": "database",
+      "label": "RunStore",
+      "sublabel": "vNNN.png + meta.json",
+      "sources": [
+        { "path": "crates/imgforge-core/src/store.rs", "line": 173, "end_line": 208, "label": "RunStore" }
+      ]
+    },
+    {
+      "id": "patch_crop",
+      "lane": "patch",
+      "col": 2,
+      "type": "backend",
+      "label": "PatchEdit Crop",
+      "sublabel": "1:1 crop + PatchPrepMode",
+      "tag": "16..32px collar",
+      "sources": [
+        { "path": "crates/imgforge-core/src/edit.rs", "line": 462, "end_line": 502, "label": "execute_patch_edit" }
+      ]
+    },
+    {
+      "id": "reinhard_laplacian",
+      "lane": "patch",
+      "col": 3,
+      "type": "backend",
+      "label": "Reinhard + Laplacian",
+      "sublabel": "OKLab [0.75, 1.35] + 5-lvl",
+      "tag": "cosine DT feather",
+      "sources": [
+        { "path": "crates/imgforge-core/src/edit.rs", "line": 638, "end_line": 680, "label": "composite_calibrated_patch" }
+      ]
+    },
+    {
+      "id": "out_of_roi_qa",
+      "lane": "patch",
+      "col": 4,
+      "type": "security",
+      "label": "outOfRoi DeltaE_2000",
+      "sublabel": "0.0 outside drift",
+      "tag": "fail-closed",
+      "sources": [
+        { "path": "crates/imgforge-core/src/color_qa.rs", "line": 830, "end_line": 865, "label": "evaluate_untouched_drift" }
+      ]
+    },
+    {
+      "id": "visibility_gate",
+      "lane": "export",
+      "col": 4,
+      "type": "security",
+      "label": "Visibility Gate",
+      "sublabel": "public / restricted / internal",
+      "tag": "fail-closed",
+      "sources": [
+        { "path": "crates/imgforge-core/src/export.rs", "line": 238, "end_line": 278, "label": "execute_export" }
+      ]
+    },
+    {
+      "id": "match_grade",
+      "lane": "export",
+      "col": 3,
+      "type": "backend",
+      "label": "Match Grade",
+      "sublabel": "damped L* CDF / .cube",
+      "tag": "opt --match-grade",
+      "sources": [
+        { "path": "crates/imgforge-core/src/export.rs", "line": 640, "end_line": 678, "label": "apply_damped_l_star_cdf_match" },
+        { "path": "crates/imgforge-core/src/export.rs", "line": 737, "end_line": 775, "label": "CubeLut::parse" }
+      ]
+    },
+    {
+      "id": "export_profiles",
+      "lane": "export",
+      "col": 5,
+      "type": "cloud",
+      "label": "Export Profiles",
+      "sublabel": "web-webp, vtt-token, vtt-map",
+      "tag": "deterministic",
+      "sources": [
+        { "path": "crates/imgforge-core/src/export.rs", "line": 238, "end_line": 278, "label": "execute_export" }
+      ]
+    }
+  ],
+  "edges": [
+    { "id": "spec-to-renderer", "from": "guide_spec", "to": "guide_renderer", "label": "render PNG", "variant": "emphasis" },
+    { "id": "guide-to-whole", "from": "guide_renderer", "to": "whole_edit", "label": "SpatialGuide", "variant": "default", "role": "branch" },
+    { "id": "guide-to-patch", "from": "guide_renderer", "to": "patch_crop", "label": "ROI + mask", "variant": "emphasis", "role": "main" },
+    { "id": "whole-to-qa", "from": "whole_edit", "to": "color_qa", "label": "whole PNG", "variant": "default" },
+    { "id": "qa-to-store", "from": "color_qa", "to": "run_store", "label": "QA passed", "variant": "emphasis" },
+    { "id": "patch-to-blend", "from": "patch_crop", "to": "reinhard_laplacian", "label": "WxW patch", "variant": "emphasis", "role": "main" },
+    { "id": "blend-to-roi-qa", "from": "reinhard_laplacian", "to": "out_of_roi_qa", "label": "composited", "variant": "emphasis", "role": "main" },
+    { "id": "roi-qa-to-store", "from": "out_of_roi_qa", "to": "run_store", "label": "0.0 drift", "variant": "emphasis", "role": "main" },
+    { "id": "store-to-vis", "from": "run_store", "to": "visibility_gate", "label": "Run / PNG", "variant": "security", "role": "main" },
+    { "id": "vis-to-grade", "from": "visibility_gate", "to": "match_grade", "label": "--match-grade", "variant": "dashed", "role": "branch" },
+    { "id": "grade-to-export", "from": "match_grade", "to": "export_profiles", "label": "graded PNG", "variant": "dashed", "role": "branch" },
+    { "id": "vis-to-export", "from": "visibility_gate", "to": "export_profiles", "label": "allowed", "variant": "security", "role": "main" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "SpatialGuide & Edits",
+      "items": [
+        "GuideRenderer produces byte-deterministic Blockout and OverlayGuide PNGs via tiny-skia and resvg",
+        "WholeImageEdit forwards target + references without silent post-generation re-grading",
+        "PatchEdit uses a 1:1 crop, PatchPrepMode, collar OKLab Reinhard transfer, and 5-level Laplacian blend"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Drift QA & Deterministic Export",
+      "items": [
+        "outOfRoi DeltaE_2000 guarantees zero mutation outside the PatchEdit composite footprint",
+        "Export enforces source <= profile Visibility before emitting web-webp, vtt-token, or vtt-map",
+        "Damped L* CDF (0.25..=0.45) and .cube 3D LUT grading run only under explicit --match-grade"
+      ]
+    }
+  ]
+}

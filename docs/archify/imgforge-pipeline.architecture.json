@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "imgforge Architecture & Generation Pipeline",
+    "locale": "en",
+    "output": "docs/public/diagrams/imgforge-pipeline.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Hartorn-Inc/imgforge.git",
+      "provider": "github",
+      "revision": "1cabb6736ae59c7d47c877061a47886732c73916"
+    }
+  },
+  "components": [
+    {
+      "id": "cli_mcp",
+      "type": "frontend",
+      "label": "CLI & MCP",
+      "sublabel": "imgforge / rmcp",
+      "tag": "stdio + loopback",
+      "pos": [40, 50],
+      "size": [175, 72],
+      "sources": [
+        { "path": "crates/imgforge-cli/src/main.rs", "line": 870, "end_line": 900, "label": "clap CLI entrypoint" },
+        { "path": "crates/imgforge-cli/src/mcp.rs", "line": 429, "end_line": 468, "label": "ImgforgeMcpServer" }
+      ]
+    },
+    {
+      "id": "web_ui",
+      "type": "frontend",
+      "label": "Web Canvas UI",
+      "sublabel": "axum + Preact / Konva",
+      "tag": "127.0.0.1",
+      "pos": [40, 215],
+      "size": [175, 72],
+      "sources": [
+        { "path": "crates/imgforge-cli/src/server.rs", "line": 916, "end_line": 930, "label": "serve_ui loopback bind" }
+      ]
+    },
+    {
+      "id": "scene_composer",
+      "type": "backend",
+      "label": "SceneComposer",
+      "sublabel": "codex exec -s read-only",
+      "tag": "optional prose",
+      "pos": [330, 50],
+      "size": [185, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/composer.rs", "line": 180, "end_line": 235, "label": "SceneComposer" }
+      ]
+    },
+    {
+      "id": "library_registry",
+      "type": "database",
+      "label": "LibraryRegistry",
+      "sublabel": "Subject, Style, Atmosphere",
+      "tag": "project > user > builtin",
+      "pos": [330, 215],
+      "size": [185, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/registry.rs", "line": 245, "end_line": 284, "label": "LibraryRegistry precedence" }
+      ]
+    },
+    {
+      "id": "prompt_compiler",
+      "type": "backend",
+      "label": "PromptCompiler",
+      "sublabel": "positive-only + SceneSpec",
+      "tag": "fail-closed",
+      "pos": [635, 50],
+      "size": [195, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/prompt_compiler.rs", "line": 109, "end_line": 154, "label": "PromptCompiler::compile" }
+      ]
+    },
+    {
+      "id": "ref_pack_atlas",
+      "type": "backend",
+      "label": "ReferencePack & Atlas",
+      "sublabel": "#252830 strip + packing",
+      "tag": "1536x1024",
+      "pos": [635, 215],
+      "size": [195, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/reference_pack.rs", "line": 209, "end_line": 248, "label": "ReferencePackPipeline" },
+        { "path": "crates/imgforge-core/src/calibration.rs", "line": 381, "end_line": 395, "label": "composite_calibration_strip_png" },
+        { "path": "crates/imgforge-core/src/atlas.rs", "line": 145, "end_line": 184, "label": "pack_dynamic_atlas" }
+      ]
+    },
+    {
+      "id": "run_store",
+      "type": "database",
+      "label": "RunStore & manifest.lock.json",
+      "sublabel": "vNNN.png + SHA-256 locks",
+      "tag": "atomic persistence",
+      "pos": [635, 385],
+      "size": [210, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/store.rs", "line": 173, "end_line": 208, "label": "RunStore" },
+        { "path": "crates/imgforge-core/src/store.rs", "line": 667, "end_line": 720, "label": "ManifestLockStore::promote_run_canonical" }
+      ]
+    },
+    {
+      "id": "codex_backend",
+      "type": "security",
+      "label": "CodexNativeBackend",
+      "sublabel": "TempCodexHome 0700/0600",
+      "tag": "<=5% AR + Lanczos3",
+      "pos": [965, 50],
+      "size": [200, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/backend.rs", "line": 144, "end_line": 195, "label": "CodexNativeBackend" },
+        { "path": "crates/imgforge-core/src/auth.rs", "line": 519, "end_line": 560, "label": "TempCodexHome" }
+      ]
+    },
+    {
+      "id": "color_qa",
+      "type": "security",
+      "label": "ColorQaEngine",
+      "sublabel": "OKLab / DeltaE_2000 / DoG",
+      "tag": "read-only QA",
+      "pos": [965, 215],
+      "size": [200, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/color_qa.rs", "line": 497, "end_line": 540, "label": "ColorQaEngine" }
+      ]
+    },
+    {
+      "id": "vision_critic",
+      "type": "security",
+      "label": "VisionCritic",
+      "sublabel": "codex exec -s read-only",
+      "tag": "--output-schema",
+      "pos": [965, 385],
+      "size": [200, 72],
+      "sources": [
+        { "path": "crates/imgforge-core/src/critic.rs", "line": 177, "end_line": 220, "label": "VisionCritic::evaluate" }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Control & Prompt Pipeline",
+      "wraps": ["scene_composer", "library_registry", "prompt_compiler", "ref_pack_atlas"]
+    },
+    {
+      "kind": "security-group",
+      "label": "Isolated Backend & QA",
+      "wraps": ["codex_backend", "color_qa", "vision_critic"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "cli-to-composer",
+      "from": "cli_mcp",
+      "to": "scene_composer",
+      "label": "prose / CLI",
+      "variant": "emphasis"
+    },
+    {
+      "id": "webui-to-registry",
+      "from": "web_ui",
+      "to": "library_registry",
+      "label": "REST / WS",
+      "variant": "emphasis"
+    },
+    {
+      "id": "composer-to-compiler",
+      "from": "scene_composer",
+      "to": "prompt_compiler",
+      "label": "SceneSpec",
+      "variant": "default"
+    },
+    {
+      "id": "registry-to-compiler",
+      "from": "library_registry",
+      "to": "prompt_compiler",
+      "label": "Visibility",
+      "variant": "security"
+    },
+    {
+      "id": "registry-to-atlas",
+      "from": "library_registry",
+      "to": "ref_pack_atlas",
+      "label": "Subject / Style",
+      "variant": "default"
+    },
+    {
+      "id": "compiler-to-backend",
+      "from": "prompt_compiler",
+      "to": "codex_backend",
+      "label": "CompiledPrompt",
+      "variant": "emphasis"
+    },
+    {
+      "id": "atlas-to-backend",
+      "from": "ref_pack_atlas",
+      "to": "codex_backend",
+      "label": "-i Atlas PNGs",
+      "variant": "default"
+    },
+    {
+      "id": "backend-to-colorqa",
+      "from": "codex_backend",
+      "to": "color_qa",
+      "label": "Lanczos3 PNG",
+      "variant": "emphasis"
+    },
+    {
+      "id": "colorqa-to-critic",
+      "from": "color_qa",
+      "to": "vision_critic",
+      "label": "QA checked",
+      "variant": "security"
+    },
+    {
+      "id": "colorqa-to-store",
+      "from": "color_qa",
+      "to": "run_store",
+      "label": "Run + QA",
+      "variant": "dashed"
+    },
+    {
+      "id": "critic-to-store",
+      "from": "vision_critic",
+      "to": "run_store",
+      "label": "CriticReport",
+      "variant": "emphasis"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Interfaces & Control",
+      "items": [
+        "CLI (imgforge) and rmcp expose 8 workspace-contained tools and 4 resources",
+        "Embedded Web Canvas UI binds strictly to 127.0.0.1 with CSP headers",
+        "PromptCompiler enforces positive-only SceneSpec invariants before generation"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Reference & Calibration",
+      "items": [
+        "LibraryRegistry resolves cards strictly along project > user > builtin",
+        "ReferencePack sheets composite a #252830 gray wedge and PaletteLock strip",
+        "Dynamic Atlas packs 1..=3 focal Subjects into 1536x1024 pages"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Isolation & Persistence",
+      "items": [
+        "CodexNativeBackend runs in 0700/0600 TempCodexHome with OPENAI_API_KEY cleared",
+        "ColorQaEngine and VisionCritic gate outputs fail-closed without silent re-grading",
+        "RunStore writes vNNN.png atomically; manifest.lock.json locks canonical SHA-256"
+      ]
+    }
+  ]
+}

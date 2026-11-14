@@ -1,0 +1,162 @@
+{
+  "schema_version": 3,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Run & ReferencePack Lifecycle and Visibility Gate",
+    "locale": "en",
+    "output": "docs/public/diagrams/imgforge-lifecycle.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/Hartorn-Inc/imgforge.git",
+      "provider": "github",
+      "revision": "1cabb6736ae59c7d47c877061a47886732c73916"
+    }
+  },
+  "mainPath": ["draft", "candidate", "validated", "canonical", "superseded"],
+  "states": [
+    {
+      "id": "draft",
+      "type": "start",
+      "label": "Draft",
+      "sublabel": "vNNN.png / pack.json",
+      "tag": "mutable",
+      "step": "01",
+      "sources": [
+        { "path": "crates/imgforge-core/src/lifecycle.rs", "line": 39, "end_line": 51, "label": "Lifecycle enum" },
+        { "path": "crates/imgforge-core/src/store.rs", "line": 173, "end_line": 208, "label": "RunStore" }
+      ]
+    },
+    {
+      "id": "candidate",
+      "type": "active",
+      "label": "Candidate",
+      "sublabel": "queued for QA",
+      "tag": "inspecting",
+      "step": "02",
+      "sources": [
+        { "path": "crates/imgforge-core/src/validation.rs", "line": 183, "end_line": 230, "label": "validate_run" },
+        { "path": "crates/imgforge-core/src/validation.rs", "line": 369, "end_line": 415, "label": "validate_reference_pack" }
+      ]
+    },
+    {
+      "id": "validated",
+      "type": "decision",
+      "label": "Validated",
+      "sublabel": "SHA-256 + QA passed",
+      "tag": "ready to lock",
+      "step": "03",
+      "sources": [
+        { "path": "crates/imgforge-core/src/validation.rs", "line": 183, "end_line": 230, "label": "validate_run" },
+        { "path": "crates/imgforge-core/src/validation.rs", "line": 369, "end_line": 415, "label": "validate_reference_pack" }
+      ]
+    },
+    {
+      "id": "canonical",
+      "type": "success",
+      "label": "Canonical",
+      "sublabel": "manifest.lock.json",
+      "tag": "immutable",
+      "step": "04",
+      "sources": [
+        { "path": "crates/imgforge-core/src/store.rs", "line": 667, "end_line": 720, "label": "promote_run_canonical" },
+        { "path": "crates/imgforge-core/src/validation.rs", "line": 742, "end_line": 770, "label": "promote_run / promote_reference_pack" }
+      ]
+    },
+    {
+      "id": "superseded",
+      "type": "neutral",
+      "label": "Superseded",
+      "sublabel": "replaced canonical",
+      "tag": "terminal",
+      "step": "05",
+      "sources": [
+        { "path": "crates/imgforge-core/src/lifecycle.rs", "line": 67, "end_line": 98, "label": "Lifecycle::transition_to" }
+      ]
+    },
+    {
+      "id": "qa_rejected",
+      "type": "failure",
+      "label": "QA Rejected",
+      "sublabel": "ColorQa / VisionCritic",
+      "tag": "fail-closed",
+      "sources": [
+        { "path": "crates/imgforge-core/src/color_qa.rs", "line": 497, "end_line": 540, "label": "ColorQaEngine" },
+        { "path": "crates/imgforge-core/src/critic.rs", "line": 177, "end_line": 220, "label": "VisionCritic" }
+      ]
+    },
+    {
+      "id": "visibility_gate",
+      "type": "decision",
+      "label": "Visibility Gate",
+      "sublabel": "public / restricted / internal",
+      "tag": "policy guard",
+      "sources": [
+        { "path": "crates/imgforge-core/src/scene_spec.rs", "line": 85, "end_line": 98, "label": "check_visibility_compatibility" },
+        { "path": "crates/imgforge-core/src/registry.rs", "line": 591, "end_line": 608, "label": "inspect_asset_image_visibility" }
+      ]
+    },
+    {
+      "id": "visibility_blocked",
+      "type": "failure",
+      "label": "VisibilityViolation",
+      "sublabel": "leak prevented",
+      "tag": "fail-closed",
+      "sources": [
+        { "path": "crates/imgforge-core/src/scene_spec.rs", "line": 85, "end_line": 98, "label": "VisibilityViolation" }
+      ]
+    },
+    {
+      "id": "atlas_output",
+      "type": "external",
+      "label": "Atlas",
+      "sublabel": "1536x1024 packed slices",
+      "tag": "1..=3 Subjects",
+      "sources": [
+        { "path": "crates/imgforge-core/src/atlas.rs", "line": 145, "end_line": 184, "label": "pack_dynamic_atlas" }
+      ]
+    },
+    {
+      "id": "export_output",
+      "type": "success",
+      "label": "Export",
+      "sublabel": "web-webp / vtt-token / vtt-map",
+      "tag": "non-versioned",
+      "sources": [
+        { "path": "crates/imgforge-core/src/export.rs", "line": 238, "end_line": 278, "label": "execute_export" }
+      ]
+    }
+  ],
+  "transitions": [
+    { "id": "draft-candidate", "from": "draft", "to": "candidate", "label": "submit QA" },
+    { "id": "candidate-validated", "from": "candidate", "to": "validated", "label": "QA + Critic pass" },
+    { "id": "validated-canonical", "from": "validated", "to": "canonical", "label": "promote lock" },
+    { "id": "canonical-superseded", "from": "canonical", "to": "superseded", "label": "newer canonical" },
+    { "id": "candidate-rejected", "from": "candidate", "to": "qa_rejected", "label": "fail-closed", "variant": "security" },
+    { "id": "rejected-draft", "from": "qa_rejected", "to": "draft", "label": "rework as draft", "variant": "dashed" },
+    { "id": "validated-visibility", "from": "validated", "to": "visibility_gate", "label": "request use" },
+    { "id": "canonical-visibility", "from": "canonical", "to": "visibility_gate", "label": "request use" },
+    { "id": "visibility-blocked", "from": "visibility_gate", "to": "visibility_blocked", "label": "exceeds context", "variant": "security" },
+    { "id": "visibility-atlas", "from": "visibility_gate", "to": "atlas_output", "label": "pack Atlas", "variant": "emphasis" },
+    { "id": "visibility-export", "from": "visibility_gate", "to": "export_output", "label": "run Export", "variant": "emphasis" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Strict Forward Lifecycle",
+      "items": [
+        "Run and ReferencePack progress strictly: draft -> candidate -> validated -> canonical -> superseded",
+        "Seed (SeedInput) is strictly a bootstrap input role and never enters Lifecycle",
+        "Canonical assets are immutable and frozen by SHA-256 in library/manifest.lock.json"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Fail-Closed Gates",
+      "items": [
+        "ColorQaEngine and VisionCritic reject failing candidates back to draft for revision",
+        "Visibility (public < restricted < internal) guards both Atlas packing and Export",
+        "Export produces reproducible deliverables without creating independent Lifecycle versions"
+      ]
+    }
+  ]
+}
