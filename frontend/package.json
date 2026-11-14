@@ -2,6 +2,7 @@
   "name": "imgforge-web-canvas",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Embedded TypeScript + Vite + Preact + Konva Web Canvas SPA for imgforge",
   "scripts": {
