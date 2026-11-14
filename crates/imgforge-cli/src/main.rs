@@ -17,6 +17,8 @@
 
 mod mcp;
 mod server;
+#[cfg(test)]
+mod version;
 
 use std::path::PathBuf;
 
@@ -51,7 +53,7 @@ use crate::server::{AppState, serve_ui};
 #[derive(Debug, Parser)]
 #[command(
     name = "imgforge",
-    version,
+    version = env!("IMGFORGE_VERSION"),
     about = "Standalone visual consistency engine"
 )]
 struct Cli {
@@ -2104,5 +2106,17 @@ mod tests {
             }
             other => panic!("expected Commands::Eval, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn injected_imgforge_version_is_non_empty_valid_semver_and_wired_to_cli() {
+        use clap::CommandFactory;
+
+        let build_version = env!("IMGFORGE_VERSION");
+        assert!(!build_version.is_empty());
+        let validated =
+            version::parse_and_validate_semver(build_version).expect("IMGFORGE_VERSION is SemVer");
+        assert_eq!(validated, build_version);
+        assert_eq!(Cli::command().get_version(), Some(build_version));
     }
 }

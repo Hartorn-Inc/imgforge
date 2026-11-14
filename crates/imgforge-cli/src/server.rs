@@ -201,7 +201,7 @@ impl AppState {
             codex_bin,
             backend,
             events_tx,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: env!("IMGFORGE_VERSION").to_string(),
             backend_name,
         }
     }
@@ -3246,6 +3246,10 @@ JSON
         assert_eq!(parsed["authProvisioned"], serde_json::json!(provision_auth));
         assert_eq!(parsed["backend"], serde_json::json!("codex-native"));
         assert!(parsed["version"].as_str().is_some_and(|v| !v.is_empty()));
+        assert_eq!(
+            parsed["version"],
+            serde_json::json!(env!("IMGFORGE_VERSION"))
+        );
 
         let decoded: HealthResponse = serde_json::from_value(parsed).unwrap();
         assert_eq!(decoded.status, expected_status);
