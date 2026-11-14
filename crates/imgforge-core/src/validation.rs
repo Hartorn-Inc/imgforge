@@ -894,9 +894,11 @@ mod tests {
     fn write_stub_critic_codex(dir: &Path, passed: bool) -> (PathBuf, PathBuf) {
         let auth_dir = dir.join("auth");
         fs::create_dir_all(&auth_dir).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&auth_dir, fs::Permissions::from_mode(0o700)).unwrap();
         let auth_file = auth_dir.join("auth.json");
         fs::write(&auth_file, r#"{"token":"ok"}"#).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600)).unwrap();
 
         let stub = dir.join("codex-critic");
@@ -918,10 +920,12 @@ JSON
 "##
         );
         fs::write(&stub, script).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
         (auth_dir, stub)
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::draft_run_passes_critic_to_validated(false, true, true)]
     #[case::candidate_run_passes_critic_to_validated(true, true, true)]
@@ -1371,13 +1375,31 @@ fi
 
     #[rstest]
     #[case::matching_colors_without_critic_passes(None, false, true)]
-    #[case::matching_colors_with_critic_invokes_step2_turnaround_anchor(None, true, true)]
     #[case::warmer_darker_poses_shift_fails_closed_before_critic(Some([75, 42, 24]), true, false)]
     #[tokio::test]
     async fn validate_reference_pack_gates_cross_sheet_color_and_runs_step2_critic(
         #[case] override_poses_fg: Option<[u8; 3]>,
         #[case] run_critic: bool,
         #[case] expect_ok: bool,
+    ) {
+        assert_validate_reference_pack_cross_sheet_and_critic(
+            override_poses_fg,
+            run_critic,
+            expect_ok,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn validate_reference_pack_invokes_step2_turnaround_anchor_with_critic() {
+        assert_validate_reference_pack_cross_sheet_and_critic(None, true, true).await;
+    }
+
+    async fn assert_validate_reference_pack_cross_sheet_and_critic(
+        override_poses_fg: Option<[u8; 3]>,
+        run_critic: bool,
+        expect_ok: bool,
     ) {
         let root = TempDir::new().unwrap();
         let ws = root.path();

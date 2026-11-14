@@ -3404,6 +3404,7 @@ fn rec709_luma_255(px: [u8; 4]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3431,6 +3432,7 @@ mod tests {
         fs::write(path, buf).unwrap();
     }
 
+    #[cfg(unix)]
     fn create_secure_auth_dir(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3654,6 +3656,7 @@ mod tests {
         assert!(align.max_height_ratio_error < 1e-6);
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::agree_winner_a("left", "right", true, DebiasedPairwiseOutcome::WinnerA)]
     #[case::agree_winner_b("right", "left", true, DebiasedPairwiseOutcome::WinnerB)]
@@ -3833,11 +3836,13 @@ trials: 2
             .unwrap();
         }
 
-        // External JSONL scorer script echoing validated score lines
-        let scorer_script = root.path().join("scorer.sh");
-        fs::write(
-            &scorer_script,
-            r#"#!/usr/bin/env bash
+        // External JSONL scorer script echoing validated score lines (POSIX bash stub).
+        #[cfg(unix)]
+        let external_scorer = {
+            let scorer_script = root.path().join("scorer.sh");
+            fs::write(
+                &scorer_script,
+                r#"#!/usr/bin/env bash
 set -euo pipefail
 IFS= read -r line
 if [ -z "$line" ]; then
@@ -3845,9 +3850,13 @@ if [ -z "$line" ]; then
 fi
 printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&scorer_script, fs::Permissions::from_mode(0o755)).unwrap();
+            )
+            .unwrap();
+            fs::set_permissions(&scorer_script, fs::Permissions::from_mode(0o755)).unwrap();
+            Some(scorer_script.to_string_lossy().into_owned())
+        };
+        #[cfg(not(unix))]
+        let external_scorer: Option<String> = None;
 
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_observed = Arc::new(AtomicUsize::new(0));
@@ -3868,7 +3877,7 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
             force: false,
             filter_cases: Vec::new(),
             filter_strategies: Vec::new(),
-            external_scorer: Some(scorer_script.to_string_lossy().into_owned()),
+            external_scorer,
             external_scorer_timeout: Duration::from_secs(10),
             contact_sheet_panel_px: 64,
         };
@@ -3888,6 +3897,7 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
         assert!(out_dir.join("eval_state.json").is_file());
         assert!(out_dir.join("eval_summary.json").is_file());
         assert!(out_dir.join("eval_summary.md").is_file());
+        #[cfg(unix)]
         assert!(summary1.trials.iter().all(|t| t.external_score.is_some()));
 
         // Simulate interrupted/resumed run: remove 1 trial checkpoint PNG and re-run without --force.
@@ -3914,6 +3924,7 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
         assert_eq!(call_count.load(Ordering::SeqCst), 8);
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::eof_without_output("printf ''", false)]
     #[case::non_zero_exit("printf '{\"passed\":true,\"score\":1.0}\n'; exit 2", false)]
@@ -4269,6 +4280,7 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
     enum CheckpointTamperMode {
         OutputPngOutsideOutDir,
         TrialJsonOutsideOutDir,
+        #[cfg(unix)]
         OutputPngSymlinkParent,
         MismatchedSha256,
     }
@@ -4276,12 +4288,21 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
     #[rstest]
     #[case::output_png_outside_out_dir(CheckpointTamperMode::OutputPngOutsideOutDir)]
     #[case::trial_json_outside_out_dir(CheckpointTamperMode::TrialJsonOutsideOutDir)]
-    #[case::output_png_symlink_parent(CheckpointTamperMode::OutputPngSymlinkParent)]
     #[case::mismatched_sha256(CheckpointTamperMode::MismatchedSha256)]
     #[tokio::test]
     async fn tampered_checkpoint_state_is_rejected_and_not_skipped(
         #[case] mode: CheckpointTamperMode,
     ) {
+        assert_tampered_checkpoint_rejected(mode).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tampered_checkpoint_symlink_parent_is_rejected_and_not_skipped() {
+        assert_tampered_checkpoint_rejected(CheckpointTamperMode::OutputPngSymlinkParent).await;
+    }
+
+    async fn assert_tampered_checkpoint_rejected(mode: CheckpointTamperMode) {
         let root = TempDir::new().unwrap();
         let cases_dir = root.path().join("eval/cases");
         let fixtures_dir = root.path().join("eval/fixtures");
@@ -4344,6 +4365,7 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
                 fs::copy(&rec.trial_json, &outside_json).unwrap();
                 rec.trial_json = outside_json;
             }
+            #[cfg(unix)]
             CheckpointTamperMode::OutputPngSymlinkParent => {
                 let outside_png = outside_dir.join("trial_001.png");
                 fs::copy(&rec.output_png, &outside_png).unwrap();
@@ -4462,11 +4484,29 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
     }
 
     #[rstest]
+    #[case::regular_file_ancestor("regular_file/nested/out", false)]
+    #[case::valid_multi_level_new_dir("real_dir/level1/level2/out", true)]
+    fn ensure_safe_output_dir_rejects_regular_file_ancestors_and_creates_nested_dirs(
+        #[case] rel_target: &str,
+        #[case] expect_ok: bool,
+    ) {
+        let root = TempDir::new().unwrap();
+        fs::write(root.path().join("regular_file"), b"not-a-dir").unwrap();
+        fs::create_dir_all(root.path().join("real_dir")).unwrap();
+
+        let target = root.path().join(rel_target);
+        let res = ensure_safe_output_dir(&target);
+        assert_eq!(res.is_ok(), expect_ok, "result: {res:?}");
+        if expect_ok {
+            assert!(target.is_dir());
+        }
+    }
+
+    #[cfg(unix)]
+    #[rstest]
     #[case::direct_symlink("sym_dir", false)]
     #[case::single_missing_child_under_symlink("sym_dir/child", false)]
     #[case::multi_level_missing_under_symlink("sym_dir/level1/level2/out", false)]
-    #[case::regular_file_ancestor("regular_file/nested/out", false)]
-    #[case::valid_multi_level_new_dir("real_dir/level1/level2/out", true)]
     fn ensure_safe_output_dir_rejects_symlinked_ancestors_at_any_depth(
         #[case] rel_target: &str,
         #[case] expect_ok: bool,
@@ -4474,21 +4514,15 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
         let root = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("sym_dir")).unwrap();
-        fs::write(root.path().join("regular_file"), b"not-a-dir").unwrap();
-        fs::create_dir_all(root.path().join("real_dir")).unwrap();
 
         let target = root.path().join(rel_target);
         let res = ensure_safe_output_dir(&target);
         assert_eq!(res.is_ok(), expect_ok, "result: {res:?}");
-        if !expect_ok {
-            assert_eq!(
-                fs::read_dir(outside.path()).unwrap().count(),
-                0,
-                "must not create directories through symlinked ancestor"
-            );
-        } else {
-            assert!(target.is_dir());
-        }
+        assert_eq!(
+            fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "must not create directories through symlinked ancestor"
+        );
     }
 
     #[rstest]
@@ -4530,6 +4564,7 @@ printf '{"passed":true,"score":0.92,"notes":["ok"],"metrics":{"custom":0.92}}\n'
         assert_eq!(summary.max_concurrency, expected_effective);
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::timeout_enforced_across_io("sleep 5", Duration::from_millis(100), false)]
     #[case::large_stderr_drained_without_deadlock(

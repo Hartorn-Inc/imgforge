@@ -7,12 +7,17 @@
 //! using isolated workspaces and a deterministic stub `codex` binary.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Cursor, Write};
+#[cfg(unix)]
+use std::io::Cursor;
+use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use tempfile::TempDir;
 
@@ -20,6 +25,7 @@ fn imgforge_bin() -> &'static str {
     env!("CARGO_BIN_EXE_imgforge")
 }
 
+#[cfg(unix)]
 fn write_png(path: &Path, w: u32, h: u32, fill: [u8; 4]) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -32,6 +38,7 @@ fn write_png(path: &Path, w: u32, h: u32, fill: [u8; 4]) {
     fs::write(path, buf).unwrap();
 }
 
+#[cfg(unix)]
 fn write_studio_sheet_png(path: &Path) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -96,6 +103,7 @@ visibility: public
     (root, ws, data_home)
 }
 
+#[cfg(unix)]
 fn write_smart_codex_stub(
     dir: &Path,
     scene_fixture: &Path,
@@ -170,6 +178,7 @@ exit 2
     stub
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_phase4_generate_explore_compose_validate_and_promote_e2e() {
     let (root, ws, data_home) = setup_workspace();

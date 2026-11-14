@@ -1793,7 +1793,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode, header};
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
+    #[cfg(unix)]
     use rmcp::ServiceExt;
+    #[cfg(unix)]
     use rmcp::model::{CallToolRequestParams, ReadResourceRequestParams};
     use rstest::rstest;
     use tempfile::TempDir;
@@ -1886,9 +1888,11 @@ visibility: public
 
         let auth_dir = root.path().join("auth");
         fs::create_dir_all(&auth_dir).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&auth_dir, fs::Permissions::from_mode(0o700)).unwrap();
         let auth_file = auth_dir.join("auth.json");
         fs::write(&auth_file, r#"{"token":"mcp-stub"}"#).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600)).unwrap();
 
         let codex_stub = root.path().join("codex-mcp-stub");
@@ -1915,16 +1919,19 @@ JSON
 "##,
         )
         .unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&codex_stub, fs::Permissions::from_mode(0o755)).unwrap();
 
         (root, ws, auth_dir, codex_stub)
     }
 
+    #[cfg(unix)]
     fn call_params(name: &'static str, args: serde_json::Value) -> CallToolRequestParams {
         let map = args.as_object().unwrap().clone();
         CallToolRequestParams::new(name).with_arguments(map)
     }
 
+    #[cfg(unix)]
     fn extract_tool_json(result: &CallToolResult) -> serde_json::Value {
         let text = result
             .content
@@ -1934,6 +1941,7 @@ JSON
         serde_json::from_str(&text.text).expect("valid JSON tool output")
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mcp_server_exposes_exact_8_tools_and_4_resources_and_executes_all_end_to_end() {
         let (_root, ws, auth_dir, codex_stub) = setup_mcp_test_workspace();

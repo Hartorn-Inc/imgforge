@@ -341,13 +341,16 @@ pub(crate) fn read_structured_json_output(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::path::Path;
 
     use rstest::rstest;
 
     use super::*;
 
+    #[cfg(unix)]
     fn create_secure_auth_dir(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -356,6 +359,7 @@ mod tests {
         fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    #[cfg(unix)]
     fn valid_scene_json() -> &'static str {
         r##"{
   "schema_version": 1,
@@ -405,6 +409,7 @@ mod tests {
         assert!(prompt.contains("far_meters > near_meters"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn scene_composer_invokes_readonly_codex_and_validates_output() {
         let root = TempDir::new().expect("tempdir");
@@ -452,6 +457,7 @@ JSON
         assert!(args.contains(UNTRUSTED_PROSE_END));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn scene_composer_rejects_negations_returned_by_model_fail_closed() {
         let root = TempDir::new().expect("tempdir");

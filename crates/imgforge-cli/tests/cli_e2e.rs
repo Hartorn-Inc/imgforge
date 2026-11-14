@@ -6,18 +6,23 @@
 //! workspace (`imgforge.toml`), temp `$XDG_DATA_HOME`, and a deterministic
 //! stub `codex` executable.
 
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
+#[cfg(unix)]
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
 use rstest::rstest;
+#[cfg(unix)]
 use tempfile::TempDir;
 
 fn bin_path() -> &'static str {
     env!("CARGO_BIN_EXE_imgforge")
 }
 
+#[cfg(unix)]
 fn write_png_file(path: &std::path::Path, width: u32, height: u32) {
     let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_pixel(width, height, Rgba([80, 140, 200, 255]));
@@ -28,6 +33,7 @@ fn write_png_file(path: &std::path::Path, width: u32, height: u32) {
     fs::write(path, bytes).expect("write PNG file");
 }
 
+#[cfg(unix)]
 fn create_stub_codex(dir: &std::path::Path, fixture_png: &std::path::Path) -> std::path::PathBuf {
     let stub = dir.join("codex-e2e-stub");
     let script = format!(
@@ -90,6 +96,7 @@ exit 3
     stub
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
     let root = TempDir::new().expect("tempdir");
@@ -244,6 +251,7 @@ fn cli_full_phase1_pipeline_auth_compose_validate_generate_critic_and_status() {
     assert!(!xdg_dir.join("imgforge/codex/auth.json").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn untrusted_workspace_codex_bin_is_rejected_and_auth_ignores_workspace_toml() {
     let root = TempDir::new().expect("tempdir");
@@ -313,6 +321,7 @@ fn cli_invalid_invocations_fail_closed(#[case] args: &[&str]) {
     assert!(!output.status.success());
 }
 
+#[cfg(unix)]
 fn write_studio_sheet_png(path: &std::path::Path) {
     let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_pixel(1536, 1024, Rgba([0x25, 0x28, 0x30, 255]));
@@ -330,6 +339,7 @@ fn write_studio_sheet_png(path: &std::path::Path) {
     fs::write(path, bytes).expect("write studio sheet PNG");
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_phase2_library_and_pack_pipeline_end_to_end() {
     let root = TempDir::new().expect("tempdir");

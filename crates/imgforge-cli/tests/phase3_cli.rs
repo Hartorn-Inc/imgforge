@@ -74,6 +74,7 @@ weather_and_particles: clear air
     (root, ws, data_home)
 }
 
+#[cfg(unix)]
 fn write_stub_codex(dir: &Path, name: &str, fixture_png: &Path) -> PathBuf {
     let script_path = dir.join(name);
     let script = format!(
@@ -159,6 +160,7 @@ fn cli_guide_validate_and_render_blockout_and_overlay_e2e() {
     assert_eq!((rendered.width(), rendered.height()), (256, 256));
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_edit_patch_and_export_with_visibility_gate_e2e() {
     let (root, ws, data_home) = setup_workspace();
@@ -256,6 +258,7 @@ fn cli_edit_patch_and_export_with_visibility_gate_e2e() {
     assert!(ws.join("exports/int/harbor-patch_token.png").is_file());
 }
 
+#[cfg(unix)]
 #[rstest]
 #[case::good_exposure_passes([160, 165, 170, 255], true)]
 #[case::crushed_black_fails_closed([3, 3, 4, 255], false)]
@@ -294,6 +297,7 @@ fn cli_edit_whole_enforces_atmosphere_exposure_floor_fail_closed(
     assert_eq!(out.status.success(), expect_ok);
 }
 
+#[cfg(unix)]
 #[rstest]
 #[case::public_blocks_restricted_subject("restricted", "public", false)]
 #[case::public_blocks_internal_subject("internal", "public", false)]
@@ -424,6 +428,7 @@ fn cli_guide_render_replaces_leaf_symlink_atomically_without_clobbering_target()
     );
 }
 
+#[cfg(unix)]
 #[rstest]
 #[case::internal_run_input_blocked_for_public("internal", "public", false)]
 #[case::restricted_run_input_blocked_for_public("restricted", "public", false)]

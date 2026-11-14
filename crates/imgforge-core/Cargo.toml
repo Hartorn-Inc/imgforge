@@ -16,7 +16,6 @@ description = "Core domain schemas, deterministic PromptCompiler, isolated Codex
 [dependencies]
 async-trait.workspace = true
 image.workspace = true
-libc.workspace = true
 palette.workspace = true
 resvg.workspace = true
 serde.workspace = true
@@ -29,6 +28,9 @@ tiny-skia.workspace = true
 tokio.workspace = true
 toml.workspace = true
 yaml_serde.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

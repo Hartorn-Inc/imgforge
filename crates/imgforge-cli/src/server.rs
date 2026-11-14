@@ -3014,9 +3014,11 @@ visibility: public
 
         let auth_dir = root.path().join("auth");
         fs::create_dir_all(&auth_dir).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&auth_dir, fs::Permissions::from_mode(0o700)).unwrap();
         let auth_file = auth_dir.join("auth.json");
         fs::write(&auth_file, r#"{"token":"ok"}"#).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600)).unwrap();
 
         let stub_codex = root.path().join("codex-critic-stub");
@@ -3037,6 +3039,7 @@ JSON
 "##,
         )
         .unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&stub_codex, fs::Permissions::from_mode(0o755)).unwrap();
 
         (root, ws, auth_dir, stub_codex)
@@ -3208,10 +3211,12 @@ JSON
         #[case] expected_status: HealthStatusKind,
     ) {
         let dir = TempDir::new().expect("tempdir");
+        #[cfg(unix)]
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         if provision_auth {
             let auth_file = dir.path().join("auth.json");
             fs::write(&auth_file, r#"{"token":"ok"}"#).unwrap();
+            #[cfg(unix)]
             fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600)).unwrap();
         }
 
@@ -3483,7 +3488,6 @@ JSON
     #[case::non_image_toml_rejected("imgforge.toml", StatusCode::FORBIDDEN)]
     #[case::auth_json_rejected("auth.json", StatusCode::FORBIDDEN)]
     #[case::dotfile_rejected(".git/config.png", StatusCode::FORBIDDEN)]
-    #[case::symlink_rejected("runs/link.png", StatusCode::FORBIDDEN)]
     #[tokio::test]
     async fn api_assets_and_presets_enforce_containment_and_serve_images(
         #[case] asset_path: &str,
@@ -3492,12 +3496,6 @@ JSON
         let (_root, ws, auth_dir, codex_bin) = setup_test_workspace();
         seed_run_v1(&ws, "harbor-dock", Visibility::Public, [120, 140, 160, 255]);
         fs::write(ws.join("auth.json"), r#"{"token":"secret"}"#).unwrap();
-        #[cfg(unix)]
-        {
-            let outside = ws.parent().unwrap().join("outside.png");
-            fs::write(&outside, make_png(16, 16, [255, 0, 0, 255])).unwrap();
-            symlink(&outside, ws.join("runs/link.png")).unwrap();
-        }
 
         let app = build_router(AppState::with_workspace_and_backend(
             Some(ws),
@@ -3542,6 +3540,34 @@ JSON
         assert_eq!(preset_resp.status(), StatusCode::OK);
         let bytes = preset_resp.into_body().collect().await.unwrap().to_bytes();
         assert!(bytes.starts_with(&PNG_SIGNATURE));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_assets_rejects_symlinks_fail_closed() {
+        let (_root, ws, auth_dir, codex_bin) = setup_test_workspace();
+        seed_run_v1(&ws, "harbor-dock", Visibility::Public, [120, 140, 160, 255]);
+        let outside = ws.parent().unwrap().join("outside.png");
+        fs::write(&outside, make_png(16, 16, [255, 0, 0, 255])).unwrap();
+        symlink(&outside, ws.join("runs/link.png")).unwrap();
+
+        let app = build_router(AppState::with_workspace_and_backend(
+            Some(ws),
+            auth_dir,
+            codex_bin.to_string_lossy().into_owned(),
+            None,
+        ));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/assets/runs/link.png")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -3884,7 +3910,7 @@ JSON
             "/api/runs/harbor-dock/2/validate",
             Some(serde_json::json!({
                 "atmosphereSlug": "golden-dawn",
-                "runCritic": true
+                "runCritic": cfg!(unix)
             })),
         )
         .await;

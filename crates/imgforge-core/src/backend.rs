@@ -639,6 +639,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     fn create_secure_auth_dir(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -750,6 +751,7 @@ mod tests {
         assert!(matches!(err, CoreError::InvalidPng { .. }));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn codex_native_backend_uses_isolated_codex_home_thread_id_and_cleans_up() {
         let root = TempDir::new().expect("tempdir");
@@ -832,6 +834,7 @@ printf '{{"type":"thread.started","thread_id":"thr_001"}}\n'
         assert!(args.contains("attached reference"));
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::agent_message_text_only(
         r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Which brush style would you prefer?"}}"#,
@@ -895,6 +898,7 @@ printf '%s\n' '{event_line}'
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn codex_native_backend_uses_newest_png_fallback_when_thread_id_absent() {
         let root = TempDir::new().expect("tempdir");
@@ -956,6 +960,7 @@ printf '{{"type":"turn.completed"}}\n'
         assert!(matches!(err, CoreError::AuthMissing { .. }));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn codex_native_backend_cleans_up_temp_codex_home_when_aspect_ratio_fails() {
         let root = TempDir::new().expect("tempdir");
@@ -1055,6 +1060,7 @@ printf '{{"type":"thread.started","thread_id":"thr_err"}}\n'
         );
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::stderr_multiline_control_chars_and_bounded(
         format!("line1\t\x07line2\n{}", "a".repeat(350)),
@@ -1149,6 +1155,7 @@ exit 7
         }
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::symlink_generated_images_root("root_symlink")]
     #[case::non_directory_generated_images_root("root_file")]
@@ -1192,6 +1199,7 @@ exit 7
         assert!(matches!(err, CoreError::InvalidPng { .. }));
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_regular_png_nofollow_rejects_symlink_png() {
         let root = TempDir::new().expect("tempdir");

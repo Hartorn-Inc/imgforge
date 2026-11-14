@@ -26,8 +26,11 @@
 //!    and clones it into a `0700` temp dir for a single `codex exec` invocation.
 
 use std::ffi::OsStr;
-use std::fs::{self, DirBuilder, OpenOptions, Permissions};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -90,22 +93,82 @@ pub fn resolve_codex_auth_dir(
     Err(CoreError::AuthHomeUnavailable)
 }
 
+/// Resolve the tool-local Codex credential directory on Windows using explicit environment inputs:
+/// - `%XDG_DATA_HOME%\imgforge\codex` when non-empty and absolute;
+/// - else `%LOCALAPPDATA%\imgforge\codex` when non-empty and absolute;
+/// - else `%USERPROFILE%\.local\share\imgforge\codex` (falling back to `%HOME%`) when non-empty and absolute.
+#[cfg(any(windows, test))]
+pub(crate) fn resolve_codex_auth_dir_windows(
+    xdg_data_home: Option<&OsStr>,
+    local_app_data: Option<&OsStr>,
+    user_profile: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, CoreError> {
+    if let Some(raw_xdg) = xdg_data_home
+        && !raw_xdg.is_empty()
+    {
+        let xdg_path = Path::new(raw_xdg);
+        if xdg_path.is_absolute() {
+            return Ok(xdg_path.join("imgforge").join("codex"));
+        }
+    }
+
+    if let Some(raw_local) = local_app_data
+        && !raw_local.is_empty()
+    {
+        let local_path = Path::new(raw_local);
+        if local_path.is_absolute() {
+            return Ok(local_path.join("imgforge").join("codex"));
+        }
+    }
+
+    for candidate in [user_profile, home].into_iter().flatten() {
+        if !candidate.is_empty() {
+            let home_path = Path::new(candidate);
+            if home_path.is_absolute() {
+                return Ok(home_path
+                    .join(".local")
+                    .join("share")
+                    .join("imgforge")
+                    .join("codex"));
+            }
+        }
+    }
+
+    Err(CoreError::AuthHomeUnavailable)
+}
+
 /// Resolve the tool-local Codex credential directory from process environment variables.
 pub fn resolve_codex_auth_dir_from_env() -> Result<PathBuf, CoreError> {
     let xdg = std::env::var_os("XDG_DATA_HOME");
-    let home = std::env::var_os("HOME");
-    resolve_codex_auth_dir(xdg.as_deref(), home.as_deref())
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA");
+        let user_profile = std::env::var_os("USERPROFILE");
+        let home = std::env::var_os("HOME");
+        resolve_codex_auth_dir_windows(
+            xdg.as_deref(),
+            local_app_data.as_deref(),
+            user_profile.as_deref(),
+            home.as_deref(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME");
+        resolve_codex_auth_dir(xdg.as_deref(), home.as_deref())
+    }
 }
 
 fn ensure_secure_dir(dir: &Path) -> Result<(), CoreError> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|err| CoreError::Io {
-            context: format!("creating auth directory {}", dir.display()),
-            source: err,
-        })?;
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir).map_err(|err| CoreError::Io {
+        context: format!("creating auth directory {}", dir.display()),
+        source: err,
+    })?;
 
     let meta = fs::symlink_metadata(dir).map_err(|err| CoreError::Io {
         context: format!("inspecting auth directory {}", dir.display()),
@@ -118,6 +181,7 @@ fn ensure_secure_dir(dir: &Path) -> Result<(), CoreError> {
         });
     }
 
+    #[cfg(unix)]
     fs::set_permissions(dir, Permissions::from_mode(0o700)).map_err(|err| CoreError::Io {
         context: format!("setting 0700 permissions on {}", dir.display()),
         source: err,
@@ -148,15 +212,18 @@ fn validate_auth_dir(auth_dir: &Path) -> Result<(), CoreError> {
         });
     }
 
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(CoreError::AuthInvalid {
-            path: auth_dir.to_path_buf(),
-            reason: format!(
-                "auth directory has overly permissive mode {:04o}; expected 0700 (no group/world permissions)",
-                mode & 0o777
-            ),
-        });
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(CoreError::AuthInvalid {
+                path: auth_dir.to_path_buf(),
+                reason: format!(
+                    "auth directory has overly permissive mode {:04o}; expected 0700 (no group/world permissions)",
+                    mode & 0o777
+                ),
+            });
+        }
     }
 
     Ok(())
@@ -192,25 +259,26 @@ fn validate_regular_auth_file(auth_file: &Path) -> Result<Vec<u8>, CoreError> {
         });
     }
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(auth_file)
-        .map_err(|err| {
-            if err.raw_os_error() == Some(libc::ELOOP) {
-                CoreError::AuthInvalid {
-                    path: auth_file.to_path_buf(),
-                    reason:
-                        "refusing symlinked auth.json; credentials must be tool-local regular files"
-                            .to_string(),
-                }
-            } else {
-                CoreError::Io {
-                    context: format!("opening {}", auth_file.display()),
-                    source: err,
-                }
-            }
-        })?;
+    let mut open_opts = OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    open_opts.custom_flags(libc::O_NOFOLLOW);
+
+    let mut file = open_opts.open(auth_file).map_err(|err| {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return CoreError::AuthInvalid {
+                path: auth_file.to_path_buf(),
+                reason:
+                    "refusing symlinked auth.json; credentials must be tool-local regular files"
+                        .to_string(),
+            };
+        }
+        CoreError::Io {
+            context: format!("opening {}", auth_file.display()),
+            source: err,
+        }
+    })?;
 
     let meta = file.metadata().map_err(|err| CoreError::Io {
         context: format!("inspecting opened {}", auth_file.display()),
@@ -222,15 +290,18 @@ fn validate_regular_auth_file(auth_file: &Path) -> Result<Vec<u8>, CoreError> {
             reason: "auth.json is not a regular file".to_string(),
         });
     }
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
-        return Err(CoreError::AuthInvalid {
-            path: auth_file.to_path_buf(),
-            reason: format!(
-                "auth.json has overly permissive mode {:04o}; expected 0600 (no group/world permissions)",
-                mode & 0o777
-            ),
-        });
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(CoreError::AuthInvalid {
+                path: auth_file.to_path_buf(),
+                reason: format!(
+                    "auth.json has overly permissive mode {:04o}; expected 0600 (no group/world permissions)",
+                    mode & 0o777
+                ),
+            });
+        }
     }
 
     let mut bytes = Vec::new();
@@ -254,15 +325,14 @@ fn validate_regular_auth_file(auth_file: &Path) -> Result<Vec<u8>, CoreError> {
 }
 
 fn write_private_new_file(path: &Path, contents: &[u8], context: &str) -> Result<(), CoreError> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|err| CoreError::Io {
-            context: context.to_string(),
-            source: err,
-        })?;
+    let mut open_opts = OpenOptions::new();
+    open_opts.write(true).create_new(true);
+    #[cfg(unix)]
+    open_opts.mode(0o600);
+    let mut file = open_opts.open(path).map_err(|err| CoreError::Io {
+        context: context.to_string(),
+        source: err,
+    })?;
     file.write_all(contents).map_err(|err| CoreError::Io {
         context: context.to_string(),
         source: err,
@@ -350,6 +420,7 @@ impl AuthManager {
                 reason: "codex login produced a symlink or non-regular auth.json".to_string(),
             });
         }
+        #[cfg(unix)]
         fs::set_permissions(&auth_file, Permissions::from_mode(0o600)).map_err(|err| {
             CoreError::Io {
                 context: format!("setting 0600 permissions on {}", auth_file.display()),
@@ -464,6 +535,7 @@ impl TempCodexHome {
                 source: err,
             })?;
 
+        #[cfg(unix)]
         fs::set_permissions(temp_dir.path(), Permissions::from_mode(0o700)).map_err(|err| {
             CoreError::Io {
                 context: format!(
@@ -504,12 +576,14 @@ impl TempCodexHome {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     use rstest::rstest;
 
     use super::*;
 
+    #[cfg(unix)]
     #[rstest]
     #[case::absolute_xdg(
         Some("/tmp/xdg-data"),
@@ -545,12 +619,125 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[rstest]
+    #[case::absolute_xdg_overrides_localappdata(
+        Some(r"C:\xdg-data"),
+        Some(r"C:\Users\tester\AppData\Local"),
+        Some(r"C:\Users\tester"),
+        None,
+        Some(r"C:\xdg-data\imgforge\codex")
+    )]
+    #[case::localappdata_used_when_xdg_unset(
+        None,
+        Some(r"C:\Users\tester\AppData\Local"),
+        Some(r"C:\Users\tester"),
+        None,
+        Some(r"C:\Users\tester\AppData\Local\imgforge\codex")
+    )]
+    #[case::relative_localappdata_falls_back_to_userprofile(
+        Some(""),
+        Some(r"relative\local"),
+        Some(r"C:\Users\tester"),
+        None,
+        Some(r"C:\Users\tester\.local\share\imgforge\codex")
+    )]
+    #[case::userprofile_unset_falls_back_to_home(
+        None,
+        None,
+        None,
+        Some(r"C:\Users\tester"),
+        Some(r"C:\Users\tester\.local\share\imgforge\codex")
+    )]
+    #[case::all_relative_or_missing_fails_closed(None, Some("rel"), Some("rel"), None, None)]
+    fn resolves_windows_tool_local_auth_dir(
+        #[case] xdg: Option<&str>,
+        #[case] local_app_data: Option<&str>,
+        #[case] user_profile: Option<&str>,
+        #[case] home: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let result = resolve_codex_auth_dir_windows(
+            xdg.map(OsStr::new),
+            local_app_data.map(OsStr::new),
+            user_profile.map(OsStr::new),
+            home.map(OsStr::new),
+        );
+        match expected {
+            Some(exp) => assert_eq!(result.expect("should resolve"), PathBuf::from(exp)),
+            None => assert!(matches!(result, Err(CoreError::AuthHomeUnavailable))),
+        }
+    }
+
+    #[test]
+    fn resolves_auth_dir_with_platform_absolute_temp_paths_and_temp_codex_home_lifecycle() {
+        let root = TempDir::new().expect("tempdir");
+        let xdg = root.path().join("xdg");
+        let local = root.path().join("local");
+        let profile = root.path().join("profile");
+
+        let via_xdg = resolve_codex_auth_dir_windows(
+            Some(xdg.as_os_str()),
+            Some(local.as_os_str()),
+            Some(profile.as_os_str()),
+            None,
+        )
+        .expect("absolute xdg resolves");
+        assert_eq!(via_xdg, xdg.join("imgforge").join("codex"));
+
+        let via_local = resolve_codex_auth_dir_windows(
+            Some(OsStr::new("relative-xdg")),
+            Some(local.as_os_str()),
+            Some(profile.as_os_str()),
+            None,
+        )
+        .expect("absolute localappdata resolves");
+        assert_eq!(via_local, local.join("imgforge").join("codex"));
+
+        let via_profile = resolve_codex_auth_dir_windows(
+            None,
+            Some(OsStr::new("")),
+            Some(profile.as_os_str()),
+            None,
+        )
+        .expect("absolute userprofile resolves");
+        assert_eq!(
+            via_profile,
+            profile
+                .join(".local")
+                .join("share")
+                .join("imgforge")
+                .join("codex")
+        );
+
+        // Verify ensure_secure_dir + TempCodexHome lifecycle on the resolved directory.
+        ensure_secure_dir(&via_local).expect("ensure_secure_dir succeeds");
+        let auth_file = via_local.join(AUTH_JSON_FILENAME);
+        write_private_new_file(
+            &auth_file,
+            br#"{"access_token":"cross-platform-token"}"#,
+            "writing test auth.json",
+        )
+        .expect("write_private_new_file succeeds");
+
+        let isolated_path: PathBuf;
+        {
+            let guard = TempCodexHome::create(&via_local).expect("TempCodexHome create");
+            isolated_path = guard.path().to_path_buf();
+            assert!(isolated_path.join(AUTH_JSON_FILENAME).is_file());
+            assert!(isolated_path.join(CODEX_CONFIG_FILENAME).is_file());
+        }
+        assert!(!isolated_path.exists());
+    }
+
     #[test]
     fn temp_codex_home_copies_auth_with_strict_permissions_and_cleans_up_on_drop() {
         let auth_dir = TempDir::new().expect("auth tempdir");
+        #[cfg(unix)]
         fs::set_permissions(auth_dir.path(), Permissions::from_mode(0o700)).unwrap();
         let auth_file = auth_dir.path().join("auth.json");
         fs::write(&auth_file, r#"{"access_token":"test-token"}"#).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&auth_file, Permissions::from_mode(0o600)).unwrap();
 
         let isolated_path: PathBuf;
@@ -558,21 +745,24 @@ mod tests {
             let guard = TempCodexHome::create(auth_dir.path()).expect("TempCodexHome create");
             isolated_path = guard.path().to_path_buf();
 
-            let dir_mode = fs::metadata(&isolated_path).unwrap().permissions().mode() & 0o777;
-            let auth_mode = fs::metadata(isolated_path.join("auth.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            let cfg_mode = fs::metadata(isolated_path.join("config.toml"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
+            #[cfg(unix)]
+            {
+                let dir_mode = fs::metadata(&isolated_path).unwrap().permissions().mode() & 0o777;
+                let auth_mode = fs::metadata(isolated_path.join("auth.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                let cfg_mode = fs::metadata(isolated_path.join("config.toml"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
 
-            assert_eq!(dir_mode, 0o700);
-            assert_eq!(auth_mode, 0o600);
-            assert_eq!(cfg_mode, 0o600);
+                assert_eq!(dir_mode, 0o700);
+                assert_eq!(auth_mode, 0o600);
+                assert_eq!(cfg_mode, 0o600);
+            }
             assert!(isolated_path.join("auth.json").is_file());
             assert!(isolated_path.join("config.toml").is_file());
         }
@@ -586,18 +776,23 @@ mod tests {
     #[test]
     fn temp_codex_home_rejects_missing_and_symlinked_auth_json() {
         let auth_dir = TempDir::new().expect("auth tempdir");
+        #[cfg(unix)]
         fs::set_permissions(auth_dir.path(), Permissions::from_mode(0o700)).unwrap();
         let missing_err = TempCodexHome::create(auth_dir.path()).expect_err("missing auth");
         assert!(matches!(missing_err, CoreError::AuthMissing { .. }));
 
-        let target = auth_dir.path().join("real.json");
-        fs::write(&target, r#"{"token":"secret"}"#).unwrap();
-        symlink(&target, auth_dir.path().join("auth.json")).unwrap();
+        #[cfg(unix)]
+        {
+            let target = auth_dir.path().join("real.json");
+            fs::write(&target, r#"{"token":"secret"}"#).unwrap();
+            symlink(&target, auth_dir.path().join("auth.json")).unwrap();
 
-        let symlink_err = TempCodexHome::create(auth_dir.path()).expect_err("symlink auth");
-        assert!(matches!(symlink_err, CoreError::AuthInvalid { .. }));
+            let symlink_err = TempCodexHome::create(auth_dir.path()).expect_err("symlink auth");
+            assert!(matches!(symlink_err, CoreError::AuthInvalid { .. }));
+        }
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::group_readable_dir(0o740, 0o600)]
     #[case::world_readable_dir(0o755, 0o600)]
@@ -622,6 +817,7 @@ mod tests {
         assert!(matches!(err, CoreError::AuthInvalid { .. }));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn auth_login_status_logout_with_stub_codex_binary() {
         let root = TempDir::new().expect("tempdir");

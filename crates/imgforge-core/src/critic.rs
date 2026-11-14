@@ -459,7 +459,9 @@ pub fn validate_critic_report_for_traits(
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::path::Path;
 
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
@@ -477,6 +479,7 @@ mod tests {
         buf
     }
 
+    #[cfg(unix)]
     fn create_secure_auth_dir(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
@@ -520,6 +523,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn vision_critic_passes_target_and_reference_images_and_parses_report() {
         let root = TempDir::new().expect("tempdir");

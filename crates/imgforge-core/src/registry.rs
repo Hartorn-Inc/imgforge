@@ -177,12 +177,67 @@ pub fn resolve_user_config_dir(
     None
 }
 
+/// Resolve the user-level `imgforge` config directory on Windows from explicit env inputs:
+/// - `%XDG_CONFIG_HOME%\imgforge` when non-empty and absolute;
+/// - else `%APPDATA%\imgforge` when non-empty and absolute;
+/// - else `%LOCALAPPDATA%\imgforge` when non-empty and absolute;
+/// - else `%USERPROFILE%\.config\imgforge` (or `%HOME%\.config\imgforge`) when non-empty and absolute;
+/// - else `None`.
+#[cfg(any(windows, test))]
+pub(crate) fn resolve_user_config_dir_windows(
+    xdg_config_home: Option<&OsStr>,
+    app_data: Option<&OsStr>,
+    local_app_data: Option<&OsStr>,
+    user_profile: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    for candidate in [xdg_config_home, app_data, local_app_data]
+        .into_iter()
+        .flatten()
+    {
+        if !candidate.is_empty() {
+            let path = Path::new(candidate);
+            if path.is_absolute() {
+                return Some(path.join("imgforge"));
+            }
+        }
+    }
+
+    for candidate in [user_profile, home].into_iter().flatten() {
+        if !candidate.is_empty() {
+            let path = Path::new(candidate);
+            if path.is_absolute() {
+                return Some(path.join(".config").join("imgforge"));
+            }
+        }
+    }
+
+    None
+}
+
 /// Resolve the user-level `imgforge` config directory from process environment variables.
 #[must_use]
 pub fn resolve_user_config_dir_from_env() -> Option<PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
-    let home = std::env::var_os("HOME");
-    resolve_user_config_dir(xdg.as_deref(), home.as_deref())
+    #[cfg(windows)]
+    {
+        let app_data = std::env::var_os("APPDATA");
+        let local_app_data = std::env::var_os("LOCALAPPDATA");
+        let user_profile = std::env::var_os("USERPROFILE");
+        let home = std::env::var_os("HOME");
+        resolve_user_config_dir_windows(
+            xdg.as_deref(),
+            app_data.as_deref(),
+            local_app_data.as_deref(),
+            user_profile.as_deref(),
+            home.as_deref(),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var_os("HOME");
+        resolve_user_config_dir(xdg.as_deref(), home.as_deref())
+    }
 }
 
 /// Precedence-aware library resolver (`project > user > builtin`).
@@ -745,6 +800,7 @@ weather_and_particles: clear air
         fs::write(dir.join("card.yaml"), yaml).unwrap();
     }
 
+    #[cfg(unix)]
     #[rstest]
     #[case::absolute_xdg(Some("/tmp/xdg-cfg"), Some("/home/u"), Some("/tmp/xdg-cfg/imgforge"))]
     #[case::empty_xdg_falls_back(Some(""), Some("/home/u"), Some("/home/u/.config/imgforge"))]
@@ -763,6 +819,120 @@ weather_and_particles: clear air
     ) {
         let actual = resolve_user_config_dir(xdg.map(OsStr::new), home.map(OsStr::new));
         assert_eq!(actual, expected.map(PathBuf::from));
+    }
+
+    #[cfg(windows)]
+    #[rstest]
+    #[case::absolute_xdg_wins(
+        Some(r"C:\xdg-cfg"),
+        Some(r"C:\Users\u\AppData\Roaming"),
+        Some(r"C:\Users\u\AppData\Local"),
+        Some(r"C:\Users\u"),
+        None,
+        Some(r"C:\xdg-cfg\imgforge")
+    )]
+    #[case::appdata_used_when_xdg_unset(
+        None,
+        Some(r"C:\Users\u\AppData\Roaming"),
+        Some(r"C:\Users\u\AppData\Local"),
+        Some(r"C:\Users\u"),
+        None,
+        Some(r"C:\Users\u\AppData\Roaming\imgforge")
+    )]
+    #[case::localappdata_fallback(
+        Some(""),
+        Some(r"relative\appdata"),
+        Some(r"C:\Users\u\AppData\Local"),
+        Some(r"C:\Users\u"),
+        None,
+        Some(r"C:\Users\u\AppData\Local\imgforge")
+    )]
+    #[case::userprofile_fallback(
+        None,
+        None,
+        None,
+        Some(r"C:\Users\u"),
+        None,
+        Some(r"C:\Users\u\.config\imgforge")
+    )]
+    #[case::all_relative_or_unset_returns_none(
+        None,
+        Some("rel"),
+        Some("rel"),
+        Some("rel"),
+        None,
+        None
+    )]
+    fn resolves_windows_user_config_dir_safely(
+        #[case] xdg: Option<&str>,
+        #[case] app_data: Option<&str>,
+        #[case] local_app_data: Option<&str>,
+        #[case] user_profile: Option<&str>,
+        #[case] home: Option<&str>,
+        #[case] expected: Option<&str>,
+    ) {
+        let actual = resolve_user_config_dir_windows(
+            xdg.map(OsStr::new),
+            app_data.map(OsStr::new),
+            local_app_data.map(OsStr::new),
+            user_profile.map(OsStr::new),
+            home.map(OsStr::new),
+        );
+        assert_eq!(actual, expected.map(PathBuf::from));
+    }
+
+    #[test]
+    fn resolves_user_config_dir_with_platform_absolute_paths() {
+        let root = TempDir::new().expect("tempdir");
+        let xdg = root.path().join("xdg");
+        let app_data = root.path().join("roaming");
+        let local_app_data = root.path().join("local");
+        let profile = root.path().join("profile");
+
+        assert_eq!(
+            resolve_user_config_dir_windows(
+                Some(xdg.as_os_str()),
+                Some(app_data.as_os_str()),
+                Some(local_app_data.as_os_str()),
+                Some(profile.as_os_str()),
+                None,
+            ),
+            Some(xdg.join("imgforge"))
+        );
+        assert_eq!(
+            resolve_user_config_dir_windows(
+                Some(OsStr::new("relative-xdg")),
+                Some(app_data.as_os_str()),
+                Some(local_app_data.as_os_str()),
+                Some(profile.as_os_str()),
+                None,
+            ),
+            Some(app_data.join("imgforge"))
+        );
+        assert_eq!(
+            resolve_user_config_dir_windows(
+                None,
+                Some(OsStr::new("")),
+                Some(local_app_data.as_os_str()),
+                Some(profile.as_os_str()),
+                None,
+            ),
+            Some(local_app_data.join("imgforge"))
+        );
+        assert_eq!(
+            resolve_user_config_dir_windows(None, None, None, Some(profile.as_os_str()), None),
+            Some(profile.join(".config").join("imgforge"))
+        );
+        assert_eq!(
+            resolve_user_config_dir_windows(
+                Some(OsStr::new("rel")),
+                Some(OsStr::new("rel")),
+                Some(OsStr::new("rel")),
+                Some(OsStr::new("rel")),
+                None,
+            ),
+            None
+        );
     }
 
     #[test]

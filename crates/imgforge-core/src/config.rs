@@ -181,13 +181,17 @@ fn validate_relative_workspace_path(
             reason: format!("{field_name} must be a relative path inside the workspace"),
         });
     }
-    if rel
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
+    if rel.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
         return Err(CoreError::ConfigInvalid {
             path: config_path.to_path_buf(),
-            reason: format!("{field_name} must not contain '..' parent directory components"),
+            reason: format!(
+                "{field_name} must be a relative path without '..' or root/prefix components"
+            ),
         });
     }
     Ok(())

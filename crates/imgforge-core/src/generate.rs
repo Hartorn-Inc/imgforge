@@ -1181,6 +1181,7 @@ visibility: {visibility}
         assert_eq!(runs[0].lifecycle, Lifecycle::Draft);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn generate_supports_compose_prose_via_scene_composer() {
         let root = TempDir::new().unwrap();
