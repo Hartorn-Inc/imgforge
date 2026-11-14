@@ -1,3 +1,8 @@
+---
+title: "Reference"
+description: "Canonical schemas, Visibility ranks, Lifecycle transitions, Export profiles, and GLOSSARY.md index for Subject, Style, Atmosphere, ReferencePack, SpatialGuide, and PatchEdit."
+---
+
 # Reference
 
 Canonical schema, state-machine, and vocabulary reference for `imgforge`. Every term here matches [`GLOSSARY.md`](https://github.com/Hartorn-Inc/imgforge/blob/main/GLOSSARY.md) 1:1.

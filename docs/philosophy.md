@@ -1,3 +1,8 @@
+---
+title: "Philosophy"
+description: "Why prompt-only generation drifts and how imgforge decouples Subject, Style, and Atmosphere with deterministic PromptCompiler, fail-closed Color QA, and isolated OAuth."
+---
+
 # Philosophy
 
 `imgforge` is built around a straightforward engineering premise: **generative models should paint pixels, while deterministic host code should own structure, color invariants, spatial geometry, and asset locking.**

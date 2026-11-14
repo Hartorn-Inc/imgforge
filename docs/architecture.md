@@ -1,3 +1,8 @@
+---
+title: "How It Works"
+description: "End-to-end imgforge architecture covering CLI, MCP, and Web Canvas UI, PromptCompiler, ReferencePack and Atlas pipelines, Lifecycle state transitions, PatchEdit, and Export."
+---
+
 # How It Works
 
 `imgforge` compiles into a single Rust binary (`imgforge-cli` + `imgforge-core`) with an embedded `TypeScript + Vite + Preact + Konva` Web Canvas SPA (`rust-embed`). All generation, validation, slicing, editing, and export logic lives in `imgforge-core`, while `imgforge-cli` exposes CLI commands, an `rmcp` MCP server, and a strictly loopback `axum` Web UI server.

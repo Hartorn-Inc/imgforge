@@ -1,0 +1,948 @@
+================================================================================
+FILE: docs/index.md
+URL: https://hartorn-inc.github.io/imgforge/
+================================================================================
+
+## Quick Install
+
+Install a checksum-verified release binary or build inside the pinned Rust + Node builder container:
+
+::: code-group
+
+```bash [macOS / Linux]
+curl -fsSL https://github.com/Hartorn-Inc/imgforge/releases/latest/download/install.sh | bash
+```
+
+```powershell [Windows (PowerShell)]
+irm https://github.com/Hartorn-Inc/imgforge/releases/latest/download/install.ps1 | iex
+```
+
+```bash [Docker + Make]
+make build
+```
+
+:::
+
+Then provision tool-local credentials and inspect your workspace:
+
+```bash
+imgforge auth login
+imgforge auth status
+imgforge status
+```
+
+## Why `imgforge` Exists
+
+Prompt-only image generation drifts across shots: armor trims change hue, secondary props swap hands, ink outlines bleed into painterly scenes, and silent post-processing ruins intentional dark atmospheres. `imgforge` replaces ad-hoc prompting with an inspectable engineering pipeline where structure, color math, `Lifecycle` locking, and `Visibility` isolation are enforced deterministically.
+
+Read [Philosophy](/philosophy) for the design rationale or explore [How It Works](/architecture) with interactive architectural diagrams.
+
+================================================================================
+FILE: docs/philosophy.md
+URL: https://hartorn-inc.github.io/imgforge/philosophy
+================================================================================
+
+# Philosophy
+
+`imgforge` is built around a straightforward engineering premise: **generative models should paint pixels, while deterministic host code should own structure, color invariants, spatial geometry, and asset locking.**
+
+When multi-asset visual production relies on prose prompts and manual retries alone, every generation introduces silent drift. `imgforge` separates creative intent from structural enforcement across five core architectural decisions.
+
+---
+
+## 1. Why Prompt-Only Generation Drifts
+
+Unstructured prose forces a single text prompt to carry four incompatible responsibilities at once:
+
+1. **Identity** — what a `Subject` looks like, how tall it stands, which hand holds which weapon, and which exact hex colors belong on each garment slot.
+2. **Rendering Technique** — line weight, brushwork, shading curves, and framing rules (`Style`).
+3. **Scene Lighting** — key light direction, Kelvin temperature, shadow exposure floor, and weather (`Atmosphere`).
+4. **Spatial Layout** — camera shot, depth planes, left-to-right ordering, and motion trajectories (`SceneSpec` and `SpatialGuide`).
+
+When those four axes live inside one paragraph of prose, editing a character's cloak color accidentally alters the lighting temperature, adding a second character shifts relative heights, and changing the camera angle mutates weapon geometry.
+
+## 2. Decoupling `Subject`, `Style`, and `Atmosphere`
+
+`imgforge` separates those axes into first-class YAML specifications validated on load:
+
+- **`Subject` (`library/subjects/<slug>/card.yaml`):** Style-neutral physical identity—proportions, `height_m`, `PaletteLock` base albedo swatches, `ExclusiveSurfaceMap` slot-to-material bindings, `asymmetric_markers`, `positive_weapon_geometry`, and `Visibility`.
+- **`Style` (`library/styles/<slug>/card.yaml` + `exemplars/*.png`):** Rendering medium, linework, shading, palette profile, positive `style_guardrails`, and `1..=3` visual exemplars.
+- **`Atmosphere` (`library/atmospheres/<slug>/card.yaml`):** Key and secondary light directions, `color_temperature_k`, `max_ambient_tint_blend`, `ExposureFloor`, and atmospheric particles.
+
+As documented in [ADR 0003](/adr/0003-style-scoped-reference-packs), storing a single global turnaround sheet per `Subject` fails in cross-style workflows: passing a Franco-Belgian inked sheet into a painterly dark-fantasy generation causes ink outlines to bleed into the output. Scoping each `ReferencePack` under `library/subjects/<subject_slug>/packs/<style_slug>/` keeps `Subject` identity shared while giving every `(Subject, Style)` pair clean visual anchors.
+
+## 3. Deterministic `PromptCompiler` Over Double-LLM Rewriting
+
+In many AI imaging pipelines, an agent constructs structured intent, hands it to an LLM "prompt writer" to expand into prose, and passes that prose to an image model. That middle LLM hop adds 5–15 seconds of latency per call and quietly rewrites hand bindings, left-to-right slot ordering, and weapon descriptions.
+
+Per [ADR 0004](/adr/0004-deterministic-prompt-compiler-over-double-llm), `imgforge` makes `SceneSpec` the canonical boundary:
+
+- **`PromptCompiler` (Rust, sub-millisecond):** Deterministically validates `SceneSpec` invariants—finite depth planes (`far_meters > near_meters`), `<= 3` strictly left-to-right `foreground_slots`, explicit `left_hand` / `right_hand` bindings, unique `ExclusiveSurfaceMap` slots, `Visibility` compatibility, and zero active negation tokens—and compiles fixed `[SCENE]`, `[CAMERA]`, `[DEPTH_BANDS]`, `[FOREGROUND_SLOTS_LEFT_TO_RIGHT]`, `[STYLE]`, `[ATMOSPHERE]`, and `[OUTPUT]` sections.
+- **`SceneComposer` (`codex exec -s read-only`, optional):** Invoked *only* when a human supplies unstructured prose via `imgforge compose` or `imgforge generate --compose`. Untrusted prose is bounded (`32 KiB`), fenced inside `<<<UNTRUSTED_SCENE_PROSE>>>` delimiters, parsed with `#[serde(deny_unknown_fields)]`, and immediately validated through `PromptCompiler`.
+
+## 4. Calibration Strips & Fail-Closed Color QA Over Silent Re-Grading
+
+Asking an image model to paint its own reference color swatches yields distorted RGB values that poison downstream checks. Conversely, silently applying global color grading to every generated scene washes out intentional twilight or torchlit `Atmosphere`s.
+
+Per [ADR 0005](/adr/0005-host-composited-calibration-and-fail-closed-color-qa), `imgforge` draws a crisp boundary between **inspection**, **local blending**, and **explicit export grading**:
+
+- **Host-Composited Calibration Strip:** `imgforge` deterministically paints the <span class="forge-swatch-chip"></span>`#252830` neutral studio calibration strip—a 6-step CIE `L*` gray wedge (`15, 30, 45, 60, 75, 90`) plus pixel-exact `48x48` `PaletteLock` swatches—onto `ReferencePack` sheets on the host.
+- **Fail-Closed `ColorQaEngine`:** Evaluates CIE `L*` exposure floors and shadow crush, OKLab k-means (`K = 6`) cluster adherence against `PaletteLock` (`DeltaE_2000`), forbidden hue sectors, untouched-region `1 - M` drift, and Difference-of-Gaussians (`DoG`) yellow-dot sparkle artifacts. Whole-image runs fail closed (`CoreError::ColorQaFailed`) and emit diagnostic RGBA heatmaps rather than silently mutating pixels.
+- **Automatic Local Harmonization Only in `PatchEdit`:** When replacing a localized ROI or painted mask, `PatchEdit` crops a `1:1` square with a `16..=32 px` context collar, runs `ImageBackend`, applies 10%-trimmed OKLab Reinhard transfer (`[0.75, 1.35]` clamped gains) from the collar ring, and blends via a cosine distance-transform feather and 5-level Laplacian pyramid—guaranteeing `0.0` `DeltaE_2000` drift outside the composite footprint.
+- **Opt-In Grading Only in `Export`:** Global damped `L*` CDF matching (`0.25..=0.45`) and Adobe `.cube` 3D LUTs run exclusively when requested via `imgforge export --match-grade`.
+
+## 5. Isolated ChatGPT Plus OAuth Over Browser Scraping or API Keys
+
+Per [ADR 0002](/adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec), `imgforge` ships `CodexNativeBackend` as its sole built-in `ImageBackend`. Instead of charging per-image `OPENAI_API_KEY` API calls or automating fragile browser DOM / Turnstile flows, `imgforge` wraps `codex exec` with built-in `image_gen` backed by ChatGPT Plus OAuth:
+
+- **Tool-Local Credentials:** `imgforge auth login` stores OAuth credentials strictly under `$XDG_DATA_HOME/imgforge/codex/auth.json` (`0700` directory, `0600` regular non-symlink file) without symlinking or mutating a user's global `~/.codex/auth.json`.
+- **Per-Invocation `TempCodexHome`:** Every `CodexNativeBackend`, `SceneComposer`, and `VisionCritic` call allocates a private `0700` temporary `CODEX_HOME`, strips `OPENAI_API_KEY`, writes `0600` copies of `auth.json` and minimal `config.toml`, and deletes the directory on `Drop`.
+- **Host Aspect-Ratio Guard & Resampling:** Output PNGs are checked for the 8-byte PNG signature, rejected fail-closed if aspect-ratio error exceeds `5%`, and resampled with `FilterType::Lanczos3` to exact target dimensions.
+
+================================================================================
+FILE: docs/architecture.md
+URL: https://hartorn-inc.github.io/imgforge/architecture
+================================================================================
+
+# How It Works
+
+`imgforge` compiles into a single Rust binary (`imgforge-cli` + `imgforge-core`) with an embedded `TypeScript + Vite + Preact + Konva` Web Canvas SPA (`rust-embed`). All generation, validation, slicing, editing, and export logic lives in `imgforge-core`, while `imgforge-cli` exposes CLI commands, an `rmcp` MCP server, and a strictly loopback `axum` Web UI server.
+
+See the [Implementation Docs](/implementation/architecture-and-backend) and [ADRs](/adr/0001-rust-core-with-embedded-web-canvas) for module-level invariants.
+
+---
+
+## 1. Architecture & Generation Pipeline
+
+Every request—whether initiated from the CLI, an MCP coding agent, or the local Web Canvas UI—converges on the same deterministic core pipeline:
+
+<ArchifyDiagram
+  slug="imgforge-pipeline"
+  title="imgforge Architecture & Generation Pipeline"
+  caption="End-to-end flow across CLI / MCP / Web Canvas UI, SceneComposer, PromptCompiler, LibraryRegistry, ReferencePack & Atlas, CodexNativeBackend, ColorQaEngine, VisionCritic, and RunStore."
+  height="600px"
+/>
+
+### Subsystem Mapping
+
+| Subsystem | Role | Crate / Source | Spec |
+|---|---|---|---|
+| **CLI & MCP Server** | `clap` subcommands + `rmcp` (`8` tools, `4` resources, workspace-contained paths) | `crates/imgforge-cli/src/main.rs`, `mcp.rs` | [Architecture & Backend](/implementation/architecture-and-backend) |
+| **Web Canvas UI** | Loopback `127.0.0.1:<port>` `axum` server + embedded `Preact`/`Konva` SPA with CSP | `crates/imgforge-cli/src/server.rs`, `frontend/` | [ADR 0001](/adr/0001-rust-core-with-embedded-web-canvas) |
+| **Workspace & Auth** | `imgforge.toml` (`deny_unknown_fields`) discovery + `0700`/`0600` `TempCodexHome` | `crates/imgforge-core/src/config.rs`, `auth.rs` | [ADR 0002](/adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec) |
+| **SceneComposer** | Optional `codex exec -s read-only --output-schema` prose-to-`SceneSpec` stage | `crates/imgforge-core/src/composer.rs` | [ADR 0004](/adr/0004-deterministic-prompt-compiler-over-double-llm) |
+| **PromptCompiler** | Sub-ms Rust `SceneSpec` validation (negations, geometry, `Visibility`) | `crates/imgforge-core/src/prompt_compiler.rs` | [ADR 0004](/adr/0004-deterministic-prompt-compiler-over-double-llm) |
+| **LibraryRegistry** | `project > user > builtin` resolution with symlink-free `O_NOFOLLOW` checks | `crates/imgforge-core/src/registry.rs` | [Domain & ReferencePacks](/implementation/domain-and-reference-packs) |
+| **ReferencePack & Atlas** | Style-scoped `1536x1024` sheet chains, `#252830` calibration, bbox slicing, dynamic `Atlas` | `reference_pack.rs`, `calibration.rs`, `slicer.rs`, `atlas.rs` | [ADR 0003](/adr/0003-style-scoped-reference-packs) |
+| **CodexNativeBackend** | `ImageBackend` trait via `codex exec --json` (`<= 5%` AR guard + `Lanczos3`) | `crates/imgforge-core/src/backend.rs` | [ADR 0002](/adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec) |
+| **ColorQaEngine** | Read-only CIE `L*`, OKLab k-means (`K=6`), `DeltaE_2000`, `1 - M` drift, DoG sparkle | `crates/imgforge-core/src/color_qa.rs` | [ADR 0005](/adr/0005-host-composited-calibration-and-fail-closed-color-qa) |
+| **VisionCritic** | Read-only VLM binary checklist (`identity`, `hand_props`, `weapon_geometry`, `style_adherence`, `zero_leaked_text`) | `crates/imgforge-core/src/critic.rs` | [Architecture & Backend](/implementation/architecture-and-backend) |
+
+---
+
+## 2. `Run` & `ReferencePack` `Lifecycle` and `Visibility` Gate
+
+Assets follow a strict forward state machine (`draft` -> `candidate` -> `validated` -> `canonical` -> `superseded`) paired with ordered `Visibility` isolation (`public < restricted < internal`):
+
+<ArchifyDiagram
+  slug="imgforge-lifecycle"
+  title="Run & ReferencePack Lifecycle and Visibility Gate"
+  caption="Strict forward Lifecycle transitions, fail-closed ColorQaEngine / VisionCritic rejection, manifest.lock.json SHA-256 freezing, and Visibility gating for Atlas and Export."
+  height="560px"
+/>
+
+### Key Invariants
+
+- **`Seed` Is Input-Only (`crates/imgforge-core/src/lifecycle.rs`):** A `Seed` (`SeedInput` path + SHA-256 + optional label) bootstraps a `ReferencePack` and never enters `Lifecycle`.
+- **Atomic `RunStore` & `ManifestLockStore` (`crates/imgforge-core/src/store.rs`):** Every `Run` writes `runs/<slug>/vNNN.png` and `vNNN.meta.json` atomically (`NamedTempFile` + `sync_all` + `persist`) with full `input_hashes`. Promoting a `validated` `Run` or `ReferencePack` to `canonical` freezes its SHA-256 in `library/manifest.lock.json` and marks any prior `canonical` entry `superseded`.
+- **Fail-Closed Validation (`crates/imgforge-core/src/validation.rs`):** `validate_run` and `validate_reference_pack` verify symlink-free containment, SHA-256 digests, calibration swatch `DeltaE_2000 <= 0.5`, sparkle/exposure gates, and `VisionCritic` checklists before allowing `validated` status.
+- **`Visibility` Containment (`crates/imgforge-core/src/scene_spec.rs`, `registry.rs`):** `check_visibility_compatibility` blocks `restricted` or `internal` assets from entering lower-classification `SceneSpec`, `Atlas`, `Edit`, `Validate`, or `Export` contexts.
+
+---
+
+## 3. `SpatialGuide`, `PatchEdit`, `WholeImageEdit`, and `Export`
+
+When a generated `Run` needs layout control, localized repair, or final delivery packaging, `imgforge` provides deterministic vector guidance, calibrated compositing, and reproducible export profiles:
+
+<ArchifyDiagram
+  slug="imgforge-editing-and-guides"
+  title="SpatialGuide, PatchEdit, WholeImageEdit, and Export"
+  caption="GuideRenderer (OverlayGuide & Blockout), WholeImageEdit vs. 1:1 PatchEdit Laplacian compositing with zero out-of-ROI drift, and Visibility-gated Export profiles."
+  height="580px"
+/>
+
+### Imaging & Export Mapping
+
+| Stage | Mechanism | Source | Spec |
+|---|---|---|---|
+| **`GuideRenderer`** | Renders `GuideSpec` (`schemaVersion: "1.0"`) into deterministic `Blockout` (`#252830` depth bands + `resvg` mannequins) or `OverlayGuide` (`tiny-skia` haloed vectors) PNGs | `crates/imgforge-core/src/guide_renderer.rs` | [Imaging, Color QA & Export](/implementation/imaging-color-qa-and-export) |
+| **`WholeImageEdit`** | Forwards `[target, refs...]` to `ImageBackend` without mutating output colors; fails closed via `ColorQaEngine` unless `--allow-qa-fail` is set | `crates/imgforge-core/src/edit.rs` | [Imaging, Color QA & Export](/implementation/imaging-color-qa-and-export) |
+| **`PatchEdit`** | Centers `1:1` crop with `16..=32 px` collar, applies `PatchPrepMode`, transfers 10%-trimmed OKLab Reinhard (`[0.75, 1.35]`), blends via cosine DT + 5-level Laplacian pyramid, verifies `0.0` outside `DeltaE_2000` | `crates/imgforge-core/src/edit.rs`, `color_qa.rs` | [ADR 0005](/adr/0005-host-composited-calibration-and-fail-closed-color-qa) |
+| **`Export`** | Enforces `Visibility` and outputs `vtt-token` (`4x` SS AA), `vtt-map`, `web-webp`, or `grid-2x2`; runs `L*` CDF (`0.25..=0.45`) or `.cube` 3D LUT only with explicit `--match-grade` | `crates/imgforge-core/src/export.rs` | [Imaging, Color QA & Export](/implementation/imaging-color-qa-and-export) |
+
+================================================================================
+FILE: docs/getting-started.md
+URL: https://hartorn-inc.github.io/imgforge/getting-started
+================================================================================
+
+# Getting Started
+
+Get `imgforge` installed, authenticate with tool-local ChatGPT Plus OAuth, configure an `imgforge.toml` workspace, and run your first end-to-end generation, `PatchEdit`, and `Export` workflow.
+
+---
+
+## 1. Install `imgforge`
+
+Prebuilt release archives are verified against `SHA256SUMS.txt` on every install, or you can compile natively from source inside the repository's pinned Docker builder.
+
+::: code-group
+
+```bash [macOS / Linux]
+curl -fsSL https://github.com/Hartorn-Inc/imgforge/releases/latest/download/install.sh | bash
+```
+
+```powershell [Windows (PowerShell)]
+irm https://github.com/Hartorn-Inc/imgforge/releases/latest/download/install.ps1 | iex
+```
+
+```bash [Docker + Make (Source)]
+git clone https://github.com/Hartorn-Inc/imgforge.git
+cd imgforge
+make build
+# Compiled binary: ./target/release/imgforge
+```
+
+:::
+
+- **macOS / Linux overrides:** `IMGFORGE_VERSION` (for example `0.1.0` or `v0.1.0`, default `latest`) and `IMGFORGE_INSTALL_DIR` (default `~/.local/bin`).
+- **Windows overrides:** `-Version` / `$env:IMGFORGE_VERSION` and `-InstallDir` / `$env:IMGFORGE_INSTALL_DIR` (default `%LOCALAPPDATA%\imgforge\bin`, added to User `PATH`).
+- **WSL2 note:** `Dockerfile` targets Debian Bookworm (`glibc 2.36`) so `target/release/imgforge` runs directly on Ubuntu 24.04 (`glibc 2.39`) WSL2 hosts with native access to `codex exec` and `127.0.0.1` ports.
+
+---
+
+## 2. Provision ChatGPT Plus OAuth (`imgforge auth`)
+
+`imgforge` never requires `OPENAI_API_KEY` and never modifies `~/.codex/auth.json`. Credentials are stored strictly at `$XDG_DATA_HOME/imgforge/codex/auth.json` (default `~/.local/share/imgforge/codex/auth.json`) with `0700` directory and `0600` file permissions:
+
+```bash
+# Interactive browser OAuth (add --device-auth for headless/remote terminals)
+imgforge auth login
+
+# Verify local auth.json integrity and Codex login readiness
+imgforge auth status
+
+# Remove tool-local credentials when needed
+imgforge auth logout
+```
+
+---
+
+## 3. Workspace Discovery & `imgforge.toml`
+
+`imgforge` discovers your project workspace in strict non-fallback precedence:
+
+1. `--workspace <PATH>` CLI flag
+2. Non-empty `IMGFORGE_WORKSPACE` environment variable
+3. Nearest `imgforge.toml` walking upward from the current working directory
+
+If an explicit `--workspace` or `IMGFORGE_WORKSPACE` path lacks a valid `imgforge.toml`, `imgforge` fails closed rather than falling back to CWD.
+
+Create a minimal `imgforge.toml` (`schema_version = 1`, `deny_unknown_fields`) at your project root:
+
+```toml
+schema_version = 1
+
+[backend]
+kind = "codex-native"
+
+[paths]
+library_dir = "library"
+runs_dir = "runs"
+exports_dir = "exports"
+
+[server]
+port = 8080
+```
+
+Verify workspace and auth readiness:
+
+```bash
+imgforge status
+```
+
+---
+
+## 4. CLI Quickstart
+
+### Inspect Built-in `Style` and `Atmosphere` Presets
+
+```bash
+imgforge library list
+imgforge library show style dark-fantasy-realistic
+imgforge library show atmosphere torchlit-crypt
+```
+
+### Generate, Validate, and Promote a `ReferencePack`
+
+Given a `Subject` card at `library/subjects/warden-kael/card.yaml`:
+
+```bash
+# 1. Generate a style-scoped ReferencePack (turnaround + poses_expressions + inventory_flatlay)
+imgforge pack generate \
+  --subject warden-kael \
+  --style dark-fantasy-realistic \
+  --seed assets/seeds/warden-portrait.png
+
+# 2. Validate SHA-256 digests, calibration swatch DeltaE_2000 <= 0.5, and VisionCritic checks
+imgforge validate --pack warden-kael:dark-fantasy-realistic --critic
+
+# 3. Lock the validated ReferencePack in library/manifest.lock.json
+imgforge promote --pack warden-kael:dark-fantasy-realistic
+```
+
+### Generate a Scene `Run`
+
+Author a `SceneSpec` YAML/JSON file (or use `--compose` once for prose-to-`SceneSpec` translation via read-only `SceneComposer`):
+
+```bash
+# Deterministic SceneSpec -> PromptCompiler -> CodexNativeBackend -> ColorQaEngine -> RunStore
+imgforge generate \
+  --scene scenes/harbor-ambush.yaml \
+  --slice warden-kael:dark-fantasy-realistic:turnaround_front,inventory_blade \
+  --subject-roi warden-kael
+
+# Validate the recorded Run (v001) and promote it to canonical
+imgforge validate --run harbor-ambush:1 --atmosphere torchlit-crypt --subject warden-kael --critic
+imgforge promote --run harbor-ambush:1
+```
+
+### Apply a Localized `PatchEdit`
+
+Fix a localized region without drifting the rest of the frame:
+
+```bash
+imgforge edit patch \
+  --target runs/harbor-ambush/v001.png \
+  --slug harbor-ambush \
+  --roi 640,310,220,220 \
+  --prep cue-outline \
+  --collar-width 24 \
+  --feather 12 \
+  --prompt "Replace the damaged lantern glass with intact brass framing and warm amber glow."
+```
+
+`PatchEdit` extracts a `1:1` square crop with the context collar, applies 10%-trimmed OKLab Reinhard transfer (`[0.75, 1.35]`), composites with a 5-level Laplacian pyramid, and verifies `0.0` `DeltaE_2000` drift outside the composite footprint.
+
+### Export Deliverables
+
+Derive deterministic deliverables without creating new `Lifecycle` versions:
+
+```bash
+# Circular anti-aliased VTT token (512x512 PNG)
+imgforge export \
+  --run harbor-ambush:v001 \
+  --profile vtt-token \
+  --visibility public \
+  --out-dir exports/tokens
+
+# WebP delivery with explicit opt-in color grading
+imgforge export \
+  --run harbor-ambush:v001 \
+  --profile web-webp \
+  --visibility public \
+  --match-grade \
+  --grade-strength 0.35 \
+  --out-dir exports/web
+```
+
+---
+
+## 5. MCP Server (`imgforge mcp`)
+
+Run `imgforge` as a Model Context Protocol server over stdio (default) or loopback Streamable HTTP:
+
+```bash
+# Stdio transport (default for coding agents)
+imgforge mcp
+
+# Loopback Streamable HTTP with Host/Origin checks
+imgforge mcp --http 127.0.0.1:3001
+```
+
+`ImgforgeMcpServer` exposes **8 workspace-contained tools** (`compose`, `generate`, `pack`, `edit`, `guide`, `export`, `validate`, `promote`) and **4 read-only resources** (`imgforge://manifest`, `imgforge://subjects`, `imgforge://styles-atmospheres`, `imgforge://runs`). Every path argument rejects `..` traversal, NUL bytes, and symlinks outside the resolved workspace root.
+
+---
+
+## 6. Embedded Web Canvas UI (`imgforge ui`)
+
+Launch the embedded `TypeScript + Vite + Preact + Konva` Web Canvas SPA strictly on `127.0.0.1`:
+
+```bash
+imgforge ui
+# Override port from imgforge.toml:
+imgforge ui --port 8090
+```
+
+Open `http://127.0.0.1:8080` to author `GuideSpec` (`Blockout` and `OverlayGuide`) layouts, inspect `ReferencePack` slices, paint `PatchEdit` masks, review `ColorQaEngine` heatmaps, and promote `Run` `Lifecycle` states.
+
+================================================================================
+FILE: docs/reference.md
+URL: https://hartorn-inc.github.io/imgforge/reference
+================================================================================
+
+# Reference
+
+Canonical schema, state-machine, and vocabulary reference for `imgforge`. Every term here matches [`GLOSSARY.md`](https://github.com/Hartorn-Inc/imgforge/blob/main/GLOSSARY.md) 1:1.
+
+---
+
+## 1. Domain Entities (`Subject`, `Style`, `Atmosphere`)
+
+### `Subject` (`library/subjects/<slug>/card.yaml`)
+
+A style-neutral identity specification resolved strictly along `project > user` (no built-in subjects):
+
+| Field | Type / Invariant | Purpose |
+|---|---|---|
+| `kind` | `character` \| `creature` \| `prop` \| `location` | Selects `ReferencePack` chain (`2-step` vs `1-sheet`) and `height_m` rules |
+| `slug` | kebab-case string matching directory name | Canonical identifier used in `SceneSpec`, `pack`, and `--slice` |
+| `display_name` | non-empty string | Human-readable label |
+| `height_m` | positive float (`> 0.0`, required for `character`/`creature`) | Drives proportional scaling in `PromptCompiler` and `Blockout` mannequins |
+| `hand_bindings` | optional default `left_hand` / `right_hand` items | Prevents left/right prop swaps across scenes |
+| `asymmetric_markers` | list of left/right distinguishing features | Guides `VisionCritic` and `PromptCompiler` |
+| `exclusive_surface_map` | unique `slot -> { material, hex }` (`#RRGGBB`) | Prevents color bleed between adjacent garments or surfaces |
+| `positive_weapon_geometry` | positive-only silhouette/grip descriptions | Avoids negative-token drift |
+| `palette_lock` | named `#RRGGBB` base albedo swatches (normalized uppercase) | Anchor swatches for `#252830` strip and OKLab/`DeltaE_2000` QA |
+| `visibility` | `public` \| `restricted` \| `internal` | Prevents restricted assets from leaking into lower-visibility outputs |
+| `lifecycle` | `draft` \| `candidate` \| `validated` \| `canonical` \| `superseded` | Tracks card maturity |
+
+### `Style` (`library/styles/<slug>/card.yaml`)
+
+Resolved along `project > user > builtin`:
+
+- **Fields:** `slug`, `display_name`, `medium`, `linework`, `shading_and_texture`, `palette_profile`, `framing_and_border`, positive `style_guardrails`, and `exemplars` (`1..=3` workspace-contained `.png` paths verified symlink-free with 8-byte PNG signatures).
+- **Built-in Presets (5):** `franco-belgian-line`, `dark-fantasy-realistic`, `manga-ink`, `parchment-handout`, `topdown-battlemap`.
+
+### `Atmosphere` (`library/atmospheres/<slug>/card.yaml`)
+
+Resolved along `project > user > builtin`:
+
+- **Fields:** `slug`, `display_name`, `key_light_direction`, `secondary_light_direction`, `color_temperature_k` (`1000..=20000`), `max_ambient_tint_blend` (`0.0..=1.0`), `exposure_floor` (`min_p10_l_star <= min_mean_l_star` in `0.0..=100.0`), and `weather_and_particles`.
+- **Built-in Presets (4):** `neutral-studio`, `golden-dawn`, `overcast-dusk`, `torchlit-crypt`.
+
+---
+
+## 2. `Visibility` Classification
+
+`Visibility` is a strictly ordered enum protecting spoiler-sensitive or internal assets:
+
+| Level | Rank | Allowed Sources | Typical Use |
+|---|---|---|---|
+| `public` | `0` (strictest output) | `public` assets only | Published web images, public VTT packs |
+| `restricted` | `1` | `public` + `restricted` assets | Campaign-gated or pre-release scenes |
+| `internal` | `2` (most permissive) | `public` + `restricted` + `internal` | Authoring drafts, unreleased story elements |
+
+`check_visibility_compatibility` fails closed (`CoreError::VisibilityViolation`) whenever any referenced `Subject`, `Seed`, `ReferencePack`, `Run`, `Atlas` slice, or PNG input exceeds the target `SceneSpec`, `Atlas`, `Edit`, `Validate`, or `Export` `Visibility`.
+
+---
+
+## 3. `Lifecycle` & `manifest.lock.json`
+
+`Run` (`runs/<slug>/vNNN.png` + `vNNN.meta.json`) and `ReferencePack` (`pack.json`) progress strictly forward:
+
+```text
+draft ──▶ candidate ──▶ validated ──▶ canonical ──▶ superseded
+```
+
+| State | Meaning | Allowed Transitions |
+|---|---|---|
+| `draft` | Newly generated or QA-rejected artifact | `-> candidate` |
+| `candidate` | Structural and initial QA checks passed; awaiting full validation | `-> validated` (or reworked as new `draft`) |
+| `validated` | Verified SHA-256, `ColorQaEngine` gates, and `VisionCritic` report | `-> canonical` |
+| `canonical` | Immutable and frozen by SHA-256 in `library/manifest.lock.json` | `-> superseded` (automatically when a newer entry promotes) |
+| `superseded` | Terminal historical canonical record | None (fail-closed) |
+
+> **Note:** `Seed` (`SeedInput`) is strictly a bootstrap visual input for `pack generate` and never enters `Lifecycle`.
+
+---
+
+## 4. `Export` Profiles & `--match-grade`
+
+`imgforge export` produces deterministic deliverables from a `Run` (`--run slug:ver`) or PNG (`--input path`) without creating `Lifecycle` versions:
+
+| Profile | Outputs | Key Options |
+|---|---|---|
+| `vtt-token` | `<slug>_token.png` (optional `<slug>_token.jpg`) | `1:1` center crop, `Lanczos3` to `--token-size` (`16..=4096`, default `512`), `4x4` SS AA circular mask, `--ring-color` (`#D4A843`), optional `--jpeg-backdrop` |
+| `vtt-map` | `<slug>_<cols>x<rows>.jpg` | `Lanczos3` to `(cols * grid_px) x (rows * grid_px)` (default `24x18` @ `140 px`) or `--scale-factor`, flattened over `#252830` |
+| `web-webp` | `<slug>.webp` | Deterministic WebP encoding |
+| `grid-2x2` | `<slug>_tl.png`, `_tr.png`, `_bl.png`, `_br.png` | Exact quadrant split of a 2x2 contact sheet |
+
+- **Opt-in `--match-grade`:** Runs *only* when `--match-grade` is passed, supporting damped CIE `L*` CDF matching (`--grade-ref`, `--grade-strength` in `0.25..=0.45`, default `0.35`, preserving `a*`/`b*`) and Adobe `.cube` 3D LUTs (`--lut`, `LUT_3D_SIZE` `2..=65`).
+
+---
+
+## 5. Canonical Glossary Index
+
+Source of truth: [`GLOSSARY.md`](https://github.com/Hartorn-Inc/imgforge/blob/main/GLOSSARY.md) on `main`. Use exact glossary terms across all code, schemas, prompts, and docs.
+
+| Term | Canonical Definition |
+|---|---|
+| **`Subject`** | Recurring visual entity (`character`, `creature`, `prop`, or `location`) defined by a style-neutral `card.yaml` with proportions, `height_m`, material bindings, and `PaletteLock` swatches. |
+| **`Style`** | First-class rendering definition (`card.yaml` + `1..=3` `exemplars`) specifying medium, linework, shading, texture, framing rules, and positive guardrails independently of `Subject` or `Atmosphere`. |
+| **`Atmosphere`** | Lighting and environmental specification (`card.yaml`) defining light direction, Kelvin temperature, `exposure_floor`, maximum ambient tint blend, and atmospheric particles. |
+| **`ReferencePack`** | Style-scoped canonical reference sheets (`turnaround`, `poses_expressions`, `inventory_flatlay` for `character`/`creature`, or single `sheet` for `prop`/`location`) and component-detected slices per `(Subject, Style)` pair. |
+| **`Seed`** | Bootstrap visual input image (such as an existing portrait or `explore` `Run`) supplied to generate a `ReferencePack`. |
+| **`Atlas`** | Composite `1536x1024` image dynamically shelf-packed on `#252830` from selected `ReferencePack` slices (`1..=3` focal `Subject`s) to prevent attention dilution. |
+| **`PaletteLock`** | Exact unshaded base albedo hex swatches bound to a `Subject` for deterministic OKLab/`DeltaE_2000` color-drift verification. |
+| **`ExclusiveSurfaceMap`** | Exhaustive assignment of material and base hex color to every visible surface or garment slot of a `Subject` so neighboring colors cannot bleed across boundaries. |
+| **`SceneSpec`** | Structured, machine-validated composition specification (camera shot, depth planes, left-to-right slots, metric heights, hand bindings, `Subject` refs, `Style`, `Atmosphere`) consumed by `PromptCompiler`. |
+| **`SceneComposer`** | Optional read-only LLM stage (`codex exec -s read-only --output-schema`) translating unstructured prose into a structured `SceneSpec`. |
+| **`PromptCompiler`** | Deterministic Rust stage validating `SceneSpec` invariants and compiling the positive-only prompt payload sent to an `ImageBackend`. |
+| **`SpatialGuide`** | Programmatic visual reference image rendered deterministically from a `GuideSpec` JSON by `GuideRenderer` to constrain layout, scale, or trajectories. |
+| **`OverlayGuide`** | `SpatialGuide` variant drawing haloed vector regions and action cues directly onto a copy of a workspace-contained target image. |
+| **`Blockout`** | `SpatialGuide` variant rendered from scratch on `#252830` with depth-band zones, proportionally scaled `Subject` mannequins, and action vectors. |
+| **`GuideSpec`** | Shared JSON schema (`schemaVersion: "1.0"`) authored in the Web Canvas UI and consumed by `GuideRenderer`. |
+| **`GuideRenderer`** | Deterministic Rust vector-to-raster engine (`tiny-skia`/`resvg`) rendering a `GuideSpec` into a `SpatialGuide` PNG. |
+| **`WholeImageEdit`** | Edit strategy passing the entire target image and reference anchors to `ImageBackend` with fail-closed `ColorQaEngine` gating and zero silent re-grading. |
+| **`PatchEdit`** | Localized edit strategy extracting a `1:1` crop with a `16..=32 px` collar, running `ImageBackend`, and blending via collar OKLab Reinhard transfer and 5-level Laplacian pyramids. |
+| **`Run`** | Versioned execution record (`vNNN.png` + `vNNN.meta.json`) capturing input hashes, compiled prompt, backend metadata, and QA reports. |
+| **`Lifecycle`** | Strict five-state asset progression (`draft -> candidate -> validated -> canonical -> superseded`) where `canonical` entries are frozen in `manifest.lock.json`. |
+| **`VisionCritic`** | Structured read-only VLM inspection stage (`codex exec -s read-only --output-schema`) checking binary per-trait criteria (`identity`, `hand_props`, `weapon_geometry`, `style_adherence`, `zero_leaked_text`). |
+| **`Export`** | Deterministic post-processed deliverable (`vtt-token`, `vtt-map`, `web-webp`, `grid-2x2`) derived from a `Run` or PNG without creating a `Lifecycle` version. |
+| **`Visibility`** | Ordered access classification (`public`, `restricted`, `internal`) preventing sensitive assets from leaking into lower-visibility outputs. |
+
+================================================================================
+FILE: docs/implementation/architecture-and-backend.md
+URL: https://hartorn-inc.github.io/imgforge/implementation/architecture-and-backend
+================================================================================
+
+# Architecture, Workspace, Auth, and Backend Boundaries
+
+Companion implementation reference for workspace configuration, tool-local ChatGPT Plus OAuth isolation, `CodexNativeBackend`, `PromptCompiler`, `SceneComposer`, `VisionCritic`, and the CLI/MCP/Web Canvas surfaces ([ADR 0001](../adr/0001-rust-core-with-embedded-web-canvas.md), [ADR 0002](../adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec.md), [ADR 0004](../adr/0004-deterministic-prompt-compiler-over-double-llm.md)).
+
+## Mode & Boundary Comparison
+
+| Surface / Stage | Invocation / Transport | Credentials & Sandbox | Output / Failure Mode | Source |
+|---|---|---|---|---|
+| Workspace Discovery | `--workspace` > `IMGFORGE_WORKSPACE` > CWD ancestors | Read-only TOML (`deny_unknown_fields`) | Fails closed on invalid explicit override; no CWD fallback | `crates/imgforge-core/src/config.rs` |
+| `AuthManager` / `TempCodexHome` | `imgforge auth login\|status\|logout` | `$XDG_DATA_HOME/imgforge/codex/auth.json` (`0700`/`0600`), clears `OPENAI_API_KEY` | Per-invocation RAII `0700` temp `CODEX_HOME` deleted on `Drop` | `crates/imgforge-core/src/auth.rs` |
+| `PromptCompiler` | Deterministic Rust (`SceneSpec` -> `CompiledPrompt`) | Zero subprocesses, zero network | Sub-ms validation; fails closed on negations or `Visibility` leaks | `crates/imgforge-core/src/prompt_compiler.rs` |
+| `SceneComposer` | Optional (`compose` / `--compose`) | `codex exec -s read-only --ephemeral --output-schema` | Untrusted prose delimiters; validates output via `PromptCompiler` | `crates/imgforge-core/src/composer.rs` |
+| `CodexNativeBackend` | `ImageBackend` async trait (`generate`, `pack`, `edit`) | `codex exec --ephemeral --json` in `TempCodexHome` | Enforces `<= 5%` aspect-ratio tolerance + `Lanczos3` resampling | `crates/imgforge-core/src/backend.rs` |
+| `VisionCritic` | Read-only VLM inspection (`validate`, `critic`) | `codex exec -s read-only --ephemeral --output-schema` | Strict `CriticReport` 1:1 trait completeness; fail-closed | `crates/imgforge-core/src/critic.rs` |
+| CLI (`imgforge`) | `clap` binary entrypoint | Optional workspace for `auth`/`ui`/`validate`/`status` | Delegates to `imgforge-core` and `mcp`/`server` | `crates/imgforge-cli/src/main.rs` |
+| MCP (`ImgforgeMcpServer`) | `rmcp` stdio (default) or `--http 127.0.0.1:<port>` | Strict workspace containment, zero symlinks, Host/Origin checks | Exactly 8 tools and 4 `imgforge://*` resources | `crates/imgforge-cli/src/mcp.rs` |
+| Embedded Web Canvas UI | `axum` on `127.0.0.1:<port>` (`rust-embed`) | Strict loopback Host allowlist + CSP (`default-src 'self'`) | Serves SPA + `GET /api/health`; JSON 404 on unknown `/api/*` | `crates/imgforge-cli/src/server.rs` |
+
+---
+
+## 1. Workspace Discovery (`crates/imgforge-core/src/config.rs`)
+
+`resolve_workspace` locates `imgforge.toml` (`schema_version = 1`, `#[serde(deny_unknown_fields)]`) in strict order:
+
+1. `--workspace <PATH>` (`WorkspaceResolutionSource::CliFlag`)
+2. Non-empty `IMGFORGE_WORKSPACE` (`WorkspaceResolutionSource::EnvVar`)
+3. Nearest `imgforge.toml` walking `cwd.ancestors()` (`WorkspaceResolutionSource::AncestorsFromCwd`)
+
+If an explicit tier (`--workspace` or `IMGFORGE_WORKSPACE`) points to a missing directory or malformed `imgforge.toml`, resolution fails closed with `CoreError::WorkspaceInvalid` or `CoreError::ConfigInvalid` without falling back to CWD. `WorkspacePathsConfig` (`library_dir`, `runs_dir`, `exports_dir`) rejects absolute paths and `..` traversal. `BackendConfig` intentionally omits any binary path key so untrusted workspace manifests cannot override `--codex-bin` / `IMGFORGE_CODEX_BIN`.
+
+## 2. Tool-Local OAuth & `TempCodexHome` (`crates/imgforge-core/src/auth.rs`)
+
+`resolve_codex_auth_dir` stores credentials exclusively under `$XDG_DATA_HOME/imgforge/codex/auth.json` (when `$XDG_DATA_HOME` is non-empty and absolute; otherwise `$HOME/.local/share/imgforge/codex/auth.json`).
+
+- `AuthManager::login` creates the auth directory at `0700`, spawns `codex login [--device-auth]` with `CODEX_HOME` pointed at that directory and `OPENAI_API_KEY` removed, verifies `auth.json` is a non-symlink regular file, and enforces `0600` permissions.
+- `TempCodexHome::create` validates `0700` dir and `0600` non-symlink `auth.json` (`O_NOFOLLOW`), allocates a private `0700` `TempDir`, writes private `0600` copies of `auth.json` and minimal `config.toml` (`O_CREAT | O_EXCL`), and removes the directory automatically on `Drop`.
+
+## 3. `ImageBackend` & `CodexNativeBackend` (`crates/imgforge-core/src/backend.rs`)
+
+`ImageBackend` is the async testing seam (`name()`, `generate(&ImageGenerationRequest) -> ImageGenerationOutput`) shared across `generate`, `pack`, and `edit`.
+
+`CodexNativeBackend::generate` validates target pixel bounds (`checked_pixel_count`), verifies every `-i` reference PNG via `read_regular_file_nofollow` and `decode_png_checked`, materializes a `TempCodexHome`, builds `[RENDER_TARGET]` instructions (`build_generation_prompt`), and spawns `codex exec --ephemeral --json [-i <FILE>...] -- <PROMPT>` via argument arrays with `OPENAI_API_KEY` removed. It extracts a path-safe `thread_id` (`[A-Za-z0-9_-]+`) from JSONL stdout, locates the generated PNG under `$CODEX_HOME/generated_images/<thread_id>/` (or newest regular `.png` fallback, rejecting symlinks), verifies the 8-byte PNG signature, rejects aspect-ratio deviation exceeding `5%` (`MAX_ASPECT_RATIO_ERROR = 0.05`) fail-closed, and resamples via `FilterType::Lanczos3` to exact `width x height`.
+
+## 4. `PromptCompiler` & `SceneComposer` (`prompt_compiler.rs`, `composer.rs`)
+
+- **`PromptCompiler` (`crates/imgforge-core/src/prompt_compiler.rs`):** Validates `SceneSpec` (`schema_version == 1`, non-empty identifiers without control characters, finite non-negative `depth_bands` with `far_meters > near_meters`, `<= 3` `foreground_slots` strictly increasing left-to-right by `position_x_ratio`, positive `height_meters`, explicit `left_hand`/`right_hand` `HandBinding`s, non-empty unique `ExclusiveSurfaceMap` slots with `#RRGGBB` hex, `Visibility` compatibility against resolved `Subject` cards, and zero active negation tokens/phrases). Compiles deterministic `[SCENE]`, `[CAMERA]`, `[DEPTH_BANDS]`, `[FOREGROUND_SLOTS_LEFT_TO_RIGHT]`, `[STYLE]`, `[ATMOSPHERE]`, and `[OUTPUT]` sections, collapsing whitespace in prose fields to prevent section-header spoofing.
+- **`SceneComposer` (`crates/imgforge-core/src/composer.rs`):** Invoked only for unstructured prose (`compose` or `--compose`). Bounds prose to `32 KiB` (`MAX_UNTRUSTED_PROSE_BYTES`), neutralizes `<<<`/`>>>` delimiter breakouts inside `<<<UNTRUSTED_SCENE_PROSE>>>` ... `<<<END_UNTRUSTED_SCENE_PROSE>>>`, runs `codex exec -s read-only --ephemeral --output-schema` with `SCENE_SPEC_OUTPUT_SCHEMA` (`additionalProperties: false`), deserializes with `#[serde(deny_unknown_fields)]`, and validates through `PromptCompiler::compile`.
+
+## 5. `VisionCritic` (`crates/imgforge-core/src/critic.rs`)
+
+`VisionCritic::evaluate` inspects a target PNG (`-i <target>`) against optional reference anchors (`-i <ref>...`) with `codex exec -s read-only --ephemeral --output-schema` (`CRITIC_REPORT_OUTPUT_SCHEMA`). Checklist entries (`TraitCheckInput`) cover five canonical `TraitCategory` values (`identity`, `hand_props`, `weapon_geometry`, `style_adherence`, `zero_leaked_text`) and are wrapped in `<<<TRAIT_CHECKLIST>>>` delimiters with control characters stripped. `validate_critic_report_for_traits` verifies 1:1 trait ID and category completeness and requires `report.passed == report.checks.iter().all(|c| c.passed)`.
+
+## 6. CLI, MCP, and Embedded Web Canvas Server (`main.rs`, `mcp.rs`, `server.rs`)
+
+- **CLI (`crates/imgforge-cli/src/main.rs`):** Exposes `auth`, `compose`, `validate`, `promote`, `generate`, `run`, `edit`, `guide`, `export`, `critic`, `library`, `pack`, `ui`, `mcp`, and `status`. Commands that do not mutate a workspace (`auth`, `ui`, `compose`, `guide`, `critic`, `validate <SCENE_SPEC>`, `library list/show`) operate cleanly even when no `imgforge.toml` is present.
+- **MCP (`crates/imgforge-cli/src/mcp.rs`):** `ImgforgeMcpServer` uses `rmcp` (`ToolRouter` + `ServerHandler`) over stdio (default) or `--http 127.0.0.1:<port>` (`/mcp` with `enforce_origin_validation()` and loopback-only binding). Exposes 8 tools (`compose`, `generate`, `pack`, `edit`, `guide`, `export`, `validate`, `promote`) and 4 resources (`imgforge://manifest`, `imgforge://subjects`, `imgforge://styles-atmospheres`, `imgforge://runs`). Every MCP path argument passes `validate_no_traversal_or_nul`, `symlink_metadata`, and canonical prefix containment inside the resolved workspace root, while downstream `imgforge-core` file reads enforce `O_NOFOLLOW`.
+- **Web Canvas Server (`crates/imgforge-cli/src/server.rs`):** `serve_ui` binds strictly to `127.0.0.1:<port>`, embeds `frontend/dist` via `rust-embed`, validates `Host` (`127.0.0.1`, `localhost`, or `[::1]`), attaches strict `Content-Security-Policy` and `X-Content-Type-Options: nosniff` headers, serves `GET /api/health` (`status`, `version`, `backend`, `authProvisioned`) alongside the Phase 5 REST/WS endpoints (`/api/workspace`, `/api/assets/*`, `/api/styles`, `/api/atmospheres`, `/api/subjects/*/palette-lock`, `/api/guide/*`, `/api/packs/*`, `/api/edit/patch`, `/api/runs/*`, `/api/export`, `/api/ws`), and returns structured `404` JSON for unknown `/api/*` routes. (Phase 6 adds the `imgforge eval` CLI subcommand in `crates/imgforge-cli/src/main.rs`.)
+
+---
+
+## Data Flow & Extension Checklist
+
+```text
+  Prose Input ──(optional)──> SceneComposer (codex exec -s read-only --output-schema)
+                                    │
+                                    ▼
+  Structured SceneSpec ─────> PromptCompiler (Rust: negations, geometry, Visibility)
+                                    │
+                                    ▼
+  CompiledPrompt + Refs ────> CodexNativeBackend (TempCodexHome -> codex exec --json)
+                                    │
+                                    ▼
+  8-byte PNG + <=5% AR ─────> Lanczos3 WxH ──> ColorQaEngine ──> RunStore (vNNN.png/.meta.json)
+```
+
+**Adding a new `ImageBackend` or MCP capability:**
+
+1. Implement `ImageBackend` in `crates/imgforge-core/src/backend.rs` and keep `CodexNativeBackend` isolated behind `TempCodexHome`.
+2. Wire any new `BackendKind` variant in `crates/imgforge-core/src/config.rs` with `#[serde(deny_unknown_fields)]`.
+3. Enforce `validate_no_traversal_or_nul` and workspace containment helpers in `crates/imgforge-cli/src/mcp.rs` for any new path parameter before calling `imgforge-core`.
+
+================================================================================
+FILE: docs/implementation/domain-and-reference-packs.md
+URL: https://hartorn-inc.github.io/imgforge/implementation/domain-and-reference-packs
+================================================================================
+
+# Domain Model, Library Precedence, Lifecycle, and ReferencePacks
+
+Companion implementation reference for style-neutral `Subject`s, first-class `Style`s and `Atmosphere`s, `Visibility` isolation, `project > user > builtin` precedence, `Lifecycle` + `manifest.lock.json`, style-scoped `ReferencePack` pipelines, host calibration strips, bounding-box slicing, and dynamic `Atlas` packing ([ADR 0003](../adr/0003-style-scoped-reference-packs.md), [ADR 0005](../adr/0005-host-composited-calibration-and-fail-closed-color-qa.md)).
+
+## Domain Schema, Precedence & Chain Comparison
+
+| Concept | Storage Location | Precedence / Scope | Key Invariants | Source |
+|---|---|---|---|---|
+| `Subject` | `library/subjects/<slug>/card.yaml` | `project > user` (no built-ins) | Style-neutral; `height_m > 0` required for `character`/`creature`; `PaletteLock`; `ExclusiveSurfaceMap`; `Visibility` | `crates/imgforge-core/src/subject.rs` |
+| `Style` | `library/styles/<slug>/card.yaml` + `exemplars/*.png` | `project > user > builtin` (`5` presets) | `1..=3` safe relative `.png` exemplars; positive `style_guardrails` | `crates/imgforge-core/src/style.rs`, `presets.rs` |
+| `Atmosphere` | `library/atmospheres/<slug>/card.yaml` | `project > user > builtin` (`4` presets) | `color_temperature_k` in `1000..=20000`; `max_ambient_tint_blend` in `0.0..=1.0`; `ExposureFloor` | `crates/imgforge-core/src/atmosphere.rs`, `presets.rs` |
+| `ReferencePack` (`character`/`creature`) | `library/subjects/<slug>/packs/<style_slug>/` | Scoped per `(subject, style)` | 2-step chain: `turnaround.png` -> `poses_expressions.png` + `inventory_flatlay.png` (`1536x1024`) | `crates/imgforge-core/src/reference_pack.rs` |
+| `ReferencePack` (`prop`/`location`) | `library/subjects/<slug>/packs/<style_slug>/` | Scoped per `(subject, style)` | 1-sheet template: `sheet.png` (`1536x1024`) | `crates/imgforge-core/src/reference_pack.rs` |
+| `Lifecycle` & `manifest.lock.json` | `vNNN.meta.json`, `pack.json`, `library/manifest.lock.json` | Strict forward state machine | `draft -> candidate -> validated -> canonical -> superseded`; `SeedInput` is strictly input-only | `crates/imgforge-core/src/lifecycle.rs`, `store.rs`, `validation.rs` |
+| Dynamic `Atlas` | Ephemeral or `pack atlas` PNG (`1536x1024`) | `1..=3` focal `Subject`s | Packs selected `slice_ids` on `#252830` with `16 px` padding; zero clipping or overlap | `crates/imgforge-core/src/atlas.rs` |
+
+---
+
+## 1. Domain Schemas: `Subject`, `Style`, `Atmosphere`, and `Visibility`
+
+- **`Subject` (`crates/imgforge-core/src/subject.rs`):** Defines `kind` (`character`, `creature`, `prop`, `location`), kebab-case `slug`, `display_name`, `height_m` (mandatory positive float for `character`/`creature`), optional default `hand_bindings`, `asymmetric_markers`, `exclusive_surface_map`, `positive_weapon_geometry`, `palette_lock`, `visibility`, `tags`, and `lifecycle`. All `#RRGGBB` hex colors are normalized uppercase on load.
+- **`Style` (`crates/imgforge-core/src/style.rs`, `presets.rs`):** Captures `medium`, `linework`, `shading_and_texture`, `palette_profile`, `framing_and_border`, `style_guardrails`, and `1..=3` relative `.png` paths in `exemplars`. Five built-in presets ship compiled into the binary (`franco-belgian-line`, `dark-fantasy-realistic`, `manga-ink`, `parchment-handout`, `topdown-battlemap`) with embedded `64x64` PNG exemplars.
+- **`Atmosphere` (`crates/imgforge-core/src/atmosphere.rs`, `presets.rs`):** Captures `key_light_direction`, `secondary_light_direction`, `color_temperature_k` (`1000..=20000`), `max_ambient_tint_blend` (`0.0..=1.0`), `exposure_floor` (`min_p10_l_star <= min_mean_l_star` in `0.0..=100.0`), and `weather_and_particles`. Four built-in presets ship compiled in (`neutral-studio`, `golden-dawn`, `overcast-dusk`, `torchlit-crypt`).
+- **`Visibility` (`crates/imgforge-core/src/scene_spec.rs`, `registry.rs`, `store.rs`):** Ordered enum `Public < Restricted < Internal`. `check_visibility_compatibility` fails closed (`CoreError::VisibilityViolation`) whenever an asset's visibility exceeds the target `SceneSpec`, `Atlas`, `Edit`, `Validate`, or `Export` context. `inspect_asset_image_visibility` inspects both `RunStore` (`vNNN.meta.json`) and `LibraryRegistry` (`card.yaml` and `pack.json`, taking the strictest classification).
+
+## 2. `LibraryRegistry` Precedence (`crates/imgforge-core/src/registry.rs`)
+
+`LibraryRegistry` resolves cards in strict order: `project` (`<workspace>/library`) > `user` (`$XDG_CONFIG_HOME/imgforge` if non-empty and absolute, else `$HOME/.config/imgforge`) > `builtin`.
+
+Every container and card directory is verified with `verify_optional_contained_dir_no_symlinks`, `read_regular_file_nofollow`, and directory-to-`slug` equality. `load_and_verify_style_exemplars` walks every path segment for symlinks, enforces canonical containment inside the style directory, checks the 8-byte PNG signature, and decodes the image. Malformed higher-tier cards fail closed rather than falling back to a lower tier.
+
+## 3. `Lifecycle`, `SeedInput`, and `manifest.lock.json` (`lifecycle.rs`, `store.rs`, `validation.rs`)
+
+- **Five-State Progression (`crates/imgforge-core/src/lifecycle.rs`):** `Lifecycle` advances strictly along `draft -> candidate -> validated -> canonical -> superseded`. Backward, skipped, or post-`superseded` transitions fail closed (`CoreError::LifecycleTransitionInvalid`). `SeedInput` (path + SHA-256 + optional label) is strictly a bootstrap input role and never appears in `Lifecycle`.
+- **Immutable Storage (`crates/imgforge-core/src/store.rs`):** `RunStore` writes `runs/<slug>/vNNN.png` and `vNNN.meta.json` atomically (`NamedTempFile` + `sync_all` + `persist`) with full `input_hashes`. `ManifestLockStore` maintains `library/manifest.lock.json`, refusing non-increasing versions or unsafe relative artifact paths before mutating disk, promoting `validated -> canonical`, transitioning prior `canonical` entries to `superseded`, and verifying all checksums via `verify_canonical_checksums`.
+- **Validation Service (`crates/imgforge-core/src/validation.rs`):** `validate_run` and `validate_reference_pack` verify symlink-free containment, SHA-256 digests, dimensions, `ColorQaEngine` gates (plus pixel-exact `DeltaE_2000 <= 0.5` calibration swatches on packs), and optional/required `VisionCritic` reports before transitioning `draft -> candidate -> validated`.
+
+## 4. Style-Scoped `ReferencePack` & `#252830` Calibration (`reference_pack.rs`, `calibration.rs`)
+
+`ReferencePackPipeline::generate` writes under `library/subjects/<subject_slug>/packs/<style_slug>/` (refusing overwrite if the existing pack is `canonical` or `superseded`):
+
+1. **Visibility & Seed Check:** If a `seed_path` is provided, `inspect_asset_image_visibility` enforces `seed_vis <= subject.visibility` before invoking `ImageBackend`.
+2. **Kind-Specific Chain (`1536x1024`):**
+   - `character` / `creature`: Step 1 generates `turnaround.png` using `[Seed?, Style exemplars...]`. Step 2 generates `poses_expressions.png` and `inventory_flatlay.png` anchored on `[turnaround.png, Style exemplars...]`.
+   - `prop` / `location`: Generates single-sheet `sheet.png` using `[Seed?, Style exemplars...]`.
+3. **Structural Gate & Host Calibration (`crates/imgforge-core/src/calibration.rs`):** `validate_reference_sheet_structure` enforces exact `1536x1024`, minimum `#252830` (`STUDIO_BG_RGB`) overall coverage (`>= 15%`) and 1 px perimeter coverage (`>= 50%`), and non-blank foreground (`>= 256 px`). `composite_calibration_strip_png` paints the bottom `#252830` strip (`72 px` tall when `48x48` cells fit) with a 6-step CIE `L*` gray wedge (`15, 30, 45, 60, 75, 90`) and pixel-exact `PaletteLock` swatches.
+
+## 5. Bounding-Box Slicer & Dynamic `Atlas` (`slicer.rs`, `atlas.rs`)
+
+- **Foreground Slicer (`crates/imgforge-core/src/slicer.rs`):** Excludes bottom calibration strip rows (`exclude_bottom_rows`), builds a foreground mask where `studio_bg_distance > 28.0`, bridges thin gaps via separable 1D-sliding-window dilation (`merge_gap_px`, default `8 px`), extracts 8-connected components using un-dilated bounds, optionally merges centroids by `grid_priors: (cols, rows)`, applies manual `RectOverride`s (`ReplaceAll` or `MergeById`), and atomically writes `slices/<id>.png` and `slices.json`. Multi-sheet `character`/`creature` packs require `sheet_overrides` keyed by `ReferenceSheetRole` to avoid slice ID collisions.
+- **Dynamic `Atlas` (`crates/imgforge-core/src/atlas.rs`):** `pack_dynamic_atlas` validates `1..=3` focal subjects and `Visibility` across both `Subject` and `pack.json`, loads only requested `slice_ids` from `slices.json`, sorts height-descending, and shelf-packs onto `#252830` `1536x1024` page(s) with `16 px` padding, verifying zero clipping and zero overlap (`verify_page_placements`).
+
+---
+
+## ReferencePack Flow & Extension Checklist
+
+```text
+  Subject card.yaml + Style card.yaml (+ optional Seed PNG)
+         │
+         ▼  [visibility check + symlink/O_NOFOLLOW check]
+  ReferencePackPipeline::generate
+    ├── character/creature: Step 1 turnaround.png ──> Step 2 poses_expressions.png + inventory_flatlay.png
+    └── prop/location:      1-sheet sheet.png
+         │
+         ▼  validate_reference_sheet_structure (#252830) -> host calibration strip -> bbox slicer
+  pack.json (Lifecycle::Draft) + slices.json + slices/*.png
+         │
+         ▼  validate_reference_pack (SHA-256 + swatch DeltaE<=0.5 + sparkle QA + VisionCritic)
+  Lifecycle::Validated ──> promote_reference_pack ──> Lifecycle::Canonical (manifest.lock.json)
+```
+
+**Adding a built-in `Style`/`Atmosphere` preset or a `ReferenceSheetRole`:**
+
+1. Register any new built-in preset slug in `BUILTIN_STYLE_SLUGS` or `BUILTIN_ATMOSPHERE_SLUGS`, define its positive-only card in `builtin_style`/`builtin_atmosphere`, and add a deterministic PNG entry to `exemplar_cache` in `crates/imgforge-core/src/presets.rs`.
+2. Add any new sheet variant to `ReferenceSheetRole` (`filename`, `slice_prefix`) and wire its generation step inside `ReferencePackPipeline::generate` in `crates/imgforge-core/src/reference_pack.rs`.
+3. Update `validate_reference_pack` in `crates/imgforge-core/src/validation.rs` and `slicer.rs` `sheet_overrides` handling if the new role changes sheet counts or slicing rules.
+4. Add parametrized unit tests covering preset validation, `LibraryRegistry` precedence, and sheet slicing/validation in `crates/imgforge-core`.
+
+================================================================================
+FILE: docs/implementation/imaging-color-qa-and-export.md
+URL: https://hartorn-inc.github.io/imgforge/implementation/imaging-color-qa-and-export
+================================================================================
+
+# Imaging, Color QA, SpatialGuides, Editing, and Export
+
+Companion implementation reference for fail-closed OKLab/`DeltaE_2000` `ColorQaEngine`, `WholeImageEdit` and `PatchEdit` Laplacian compositing, `GuideSpec` / `GuideRenderer` (`tiny-skia` + `resvg`), and deterministic `Export` profiles with explicit `--match-grade` ([ADR 0002](../adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec.md), [ADR 0005](../adr/0005-host-composited-calibration-and-fail-closed-color-qa.md)).
+
+## Pipeline & Mode Comparison
+
+| Pipeline / Stage | Mutation / Grading Behavior | Spatial / Color Strategy | QA / Failure Policy | Source |
+|---|---|---|---|---|
+| `ColorQaEngine` | Read-only QA; never mutates or re-grades whole images | CIE `L*` exposure floor, OKLab k-means (`K = 6`) + `DeltaE_2000`, `1 - M` drift, DoG sparkle (`4..=64 px^2`) | Fail-closed (`CoreError::ColorQaFailed`); emits RGBA diagnostic heatmaps | `crates/imgforge-core/src/color_qa.rs` |
+| `WholeImageEdit` | Never re-grades backend output | Passes target PNG + reference anchors to `ImageBackend` | Runs `ColorQaEngine`; records `Draft` and fails closed unless `allow_qa_fail` | `crates/imgforge-core/src/edit.rs` |
+| `PatchEdit` | Local collar harmonization ONLY (`[0.75, 1.35]`) | `1:1` square crop + `16..=32 px` collar + `PatchPrepMode` + 5-level Laplacian + cosine DT feather | Guarantees zero `DeltaE_2000` drift outside footprint (`1 - M`) | `crates/imgforge-core/src/edit.rs` |
+| `GuideRenderer` (`OverlayGuide`) | Annotates copy of workspace-contained `targetImagePath` | `tiny-skia` haloed `OverlayRegion`s + `ActionVector`s | Symlink-free containment + `GuideSpec` `schemaVersion: "1.0"` validation | `crates/imgforge-core/src/guide_renderer.rs` |
+| `GuideRenderer` (`Blockout`) | Renders from scratch on `#252830` | `DepthBand` zones + `resvg` text-free `SubjectMannequin`s + `ActionVector`s | `targetImagePath` must be `null`; byte-deterministic PNG output | `crates/imgforge-core/src/guide_renderer.rs` |
+| `Export` | Opt-in `--match-grade` ONLY (`L*` CDF `0.25..=0.45` + `.cube` 3D LUT) | `vtt_token` (`4x` SS AA), `vtt_map` (`Lanczos3`), `web_webp`, `grid_2x2` | Fail-closed `Visibility` gate; creates no `Lifecycle` version | `crates/imgforge-core/src/export.rs` |
+
+---
+
+## 1. Fail-Closed `ColorQaEngine` (`crates/imgforge-core/src/color_qa.rs`)
+
+`ColorQaEngine` operates strictly read-only on `&RgbaImage` inputs (`palette::Oklab`, `Lab<D65>`, `Ciede2000`):
+
+1. **Exposure & Shadow-Crush (`evaluate_exposure`):** Samples interior opaque pixels (inset `2 px` when dimensions allow), computes `mean_l_star`, `p10_l_star`, `p90_l_star`, and `clipped_black_ratio` (`L* < 5.0`), and checks against `Atmosphere.exposure_floor`, `max_clipped_black_ratio` (`0.15`), and optional anchor tolerances (`12.0` mean, `8.0` P10).
+2. **`PaletteLock` Adherence & Bleed (`evaluate_palette_adherence`):** Runs deterministic farthest-first OKLab k-means (`K = 6`, `25` iterations) inside `SubjectRoiSpec` bounding boxes (or full image when empty). Clusters meeting `min_cluster_weight` (`0.03`) are compared against `PaletteLock` swatches (`max_swatch_delta_e2000 = 22.0`, `max_lightness_shift = 28.0`, `max_chroma_shift = 28.0`), and every ROI pixel is checked against configured `ForbiddenHueSector` ranges (supporting wrap-around hues).
+3. **Untouched-Region Drift (`evaluate_untouched_drift`):** Evaluates `srgb_delta_e_2000` between `before` and `after` across all pixels where `edit_mask[i] <= 1e-4` (`1 - M`) against mean, P95, per-pixel max, and exceeding fraction bounds.
+4. **Sparkle / Yellow-Dot Creep (`detect_sparkles`):** Computes normalized yellow-excess `((R + G) / 2 - B).max(0)`, applies separable 2D Gaussian blurs (`sigma_small = 0.8`, `sigma_large = 2.4`), thresholds positive DoG residual (`min_dog_residual = 0.20`) combined with bright CIELAB yellow sector (CIE `L* >= 78.0`, `b* >= 55.0`, `C* >= 60.0`, hue `72..=115 deg`) outside `allowed_mask`, suppresses high-pass edge candidates belonging to large yellow regions (`> 64 px^2`), and flags 8-connected blobs sized `4..=64 px^2`, failing when `> 0.20%` (`0.002`) of non-allowed pixels or `> 256` blobs are flagged.
+5. **Diagnostic Heatmaps (`render_heatmap_rgba` / `render_heatmap_png`):** Renders transparent RGBA overlays for `HeatmapKind::Drift`, `Bleed`, `Sparkle`, and `OutOfRoi`.
+
+## 2. `WholeImageEdit` & `PatchEdit` (`crates/imgforge-core/src/edit.rs`)
+
+Both edit paths verify `Visibility` across target image, optional mask PNG, reference anchors, and `Subject` cards before invoking `ImageBackend`.
+
+- **`WholeImageEdit` (`execute_whole_image_edit`):** Forwards `[target_image, refs...]` to `ImageBackend`, runs `ColorQaEngine::evaluate_whole_image` without altering pixels, records a `Run`, and fails closed on QA failure unless `fail_closed_on_qa = false`.
+- **`PatchEdit` (`execute_patch_edit`, `composite_calibrated_patch`):**
+  1. `resolve_unified_mask` normalizes `PixelRect` ROI, `SquareRoi`, `MaskImagePath` (varied alpha channel or luminance), or `MaskValues` into `[0.0, 1.0]` weights and computes the tight `roi_rect`.
+  2. `compute_square_crop_rect` centers a `1:1` square crop sized `max(roi.width, roi.height) + 2 * collar_width_px` (`collar_width_px` in `16..=32`, default `24`), clamped to canvas bounds.
+  3. `prepare_patch_target` prepares the `WxW` crop using `PatchPrepMode`: `CropOnly`, `BlankInsideMask` (`#252830`), or `CueOutline` (`#F6AD55` inner boundary + `#1A1D24` halo).
+  4. `ImageBackend::generate` runs at exact `WxW`.
+  5. `euclidean_distance_transform` computes exact `O(W * H)` distance outside `mask > 0.5`.
+  6. `apply_collar_reinhard_oklab` computes 10%-trimmed mean/std in `Oklab` over the outer collar ring (`1..=collar_width_px` where `crop_mask <= 1e-3`) and transfers tone/color onto the generated patch with per-channel gains clamped strictly to `[0.75, 1.35]`.
+  7. `build_cosine_feathered_alpha` applies raised-cosine falloff over `feather_px` (`2..=collar_width_px`, default `12`) and tapers interior crop boundaries to `0.0`.
+  8. `laplacian_pyramid_blend` builds 5-level (`DEFAULT_PYRAMID_LEVELS = 5`) linear-light sRGB Laplacian pyramids and Gaussian alpha pyramids (`5x5` separable kernel), blends per band, reconstructs, and writes strictly where `feathered_alpha > 0.0`.
+  9. `evaluate_untouched_drift` verifies zero `DeltaE_2000` mutation outside the composite footprint (`max_delta_e2000 == 0.0`).
+
+## 3. `GuideSpec` & `GuideRenderer` (`crates/imgforge-core/src/guide_renderer.rs`)
+
+`GuideSpec` matches `frontend/src/types/guideSpec.ts` 1:1 (`camelCase` JSON, `schemaVersion: "1.0"`, `#[serde(deny_unknown_fields)]`) with hard caps (`MAX_GUIDE_CANVAS_DIM = 16384`, `depthBands <= 64`, `mannequins <= 128`, `actionVectors <= 256`, `overlayRegions <= 256`, `points <= 1024`).
+
+- **`OverlayGuide`:** Requires non-empty workspace-relative `targetImagePath`, verified symlink-free inside `workspace_root` (`validate_strict_relative_path`, `verify_contained_path_no_symlinks`, `read_regular_file_nofollow`), Lanczos3-resized if needed to `canvasWidth x canvasHeight`.
+- **`Blockout`:** Requires `targetImagePath: null`. Fills `#252830`, paints `depthBands` with `#1A1D24` dividers, and renders proportionally scaled `SubjectMannequin` silhouettes (`pixels_per_meter = canvasHeight * 0.22`) via `resvg` from pure text-free SVG geometry (`Left`, `Right`, `Front`, `Back`).
+- Both variants finish by drawing `overlayRegions` (`Rect`, `Ellipse`, `Polyline`) and `actionVectors` (`Solid`, `Dashed`, triangular arrowheads) with high-contrast outer halos using `tiny-skia`. `build_recommended_blockout(&SceneSpec)` provides a shared scaffold for CLI, MCP, and UI.
+
+## 4. `Export` Profiles & `--match-grade` (`crates/imgforge-core/src/export.rs`)
+
+`execute_export` enforces `Visibility` (`source_visibility <= profile_visibility`, auto-raising `PngPath` visibility via `inspect_asset_image_visibility`) before reading or writing outputs, and writes atomically without creating `Lifecycle` versions:
+
+- **Optional `--match-grade`:** Executed only when explicitly enabled. Supports `apply_damped_l_star_cdf_match` (`cdf_damp_strength` strictly in `0.25..=0.45`, default `0.35`, preserving `a*, b*`) and `CubeLut::parse` / `apply_to_image` (Adobe 3D `.cube` `LUT_3D_SIZE` `2..=65` with trilinear RGB interpolation).
+- **`vtt_token`:** Center-crops `1:1`, Lanczos3-resizes to `size_px` (`16..=4096`, default `512`), composites a `4x4` supersampled anti-aliased circular mask with dark rims and role-colored ring (`#D4A843` default) to `<slug>_token.png`, plus optional flat-backdrop `<slug>_token.jpg`.
+- **`vtt_map`:** Lanczos3-resizes to `(cols * grid_px) x (rows * grid_px)` (default `24x18` at `140 px`) or explicit `scale_factor`, flattens alpha over `#252830`, and encodes `<slug>_<cols>x<rows>.jpg`.
+- **`web_webp`:** Encodes deterministic WebP `<slug>.webp`.
+- **`grid_2x2`:** Splits into four quadrant PNGs (`_tl.png`, `_tr.png`, `_bl.png`, `_br.png`).
+
+---
+
+## `PatchEdit` & `Export` Decision Flow & Extension Checklist
+
+```text
+  Edit Needed?
+    ├── Localized defect (ROI or mask) ──> PatchEdit: 1:1 crop + collar (16..=32px)
+    │                                      ──> PatchPrepMode -> Backend WxW
+    │                                      ──> Collar OKLab Reinhard [0.75, 1.35]
+    │                                      ──> Cosine DT + 5-level Laplacian -> 0.0 drift outside
+    └── Global lighting/composition    ──> WholeImageEdit -> ColorQaEngine (no silent re-grade)
+
+  Deliverable Needed?
+    └── Export (run_slug:ver or input) ──> Visibility gate -> optional --match-grade -> Profile PNG/JPG/WebP
+```
+
+**Adding a `ColorQaEngine` detector/heatmap, `GuideRenderer` cue, or `ExportProfile`:**
+
+1. **Color QA (`crates/imgforge-core/src/color_qa.rs`):** Add new read-only detector metrics or `HeatmapKind` variants without mutating whole-image pixels, and surface failures through `ColorQaReport`.
+2. **Spatial Guidance (`crates/imgforge-core/src/guide_renderer.rs`):** Update `GuideSpec` (`#[serde(deny_unknown_fields)]`) and `GuideRenderer::render` in lockstep with `frontend/src/types/guideSpec.ts` and deterministic `tiny-skia`/`resvg` vector drawing.
+3. **Export (`crates/imgforge-core/src/export.rs`):** Add the `ExportProfile` variant and deterministic encoder in `execute_export` behind `check_visibility_compatibility`, keeping grading strictly gated behind explicit `--match-grade`.
+4. **CLI/MCP & Tests:** Expose any new profile or flag in `crates/imgforge-cli/src/main.rs` and `mcp.rs`, then add parametrized tests verifying fail-closed invariants and byte-deterministic output.
+
+================================================================================
+FILE: docs/adr/0001-rust-core-with-embedded-web-canvas.md
+URL: https://hartorn-inc.github.io/imgforge/adr/0001-rust-core-with-embedded-web-canvas
+================================================================================
+
+# 0001. Rust Core Binary with Embedded Localhost Web Canvas UI
+
+- **Status**: accepted
+
+We will build `imgforge` as a single Rust binary (`axum` + `rmcp` + `image`/`palette`/`tiny-skia`/`resvg`) with an embedded TypeScript/HTML5 Canvas SPA (`rust-embed`) served on `127.0.0.1:<port>`, compiled inside a Docker `rust` + `node` builder container via `Makefile` and executed directly on the WSL2 host.
+
+We rejected Tauri/egui desktop GUIs (fragile WebKitGTK/WSLg HiDPI and clipboard/drag-and-drop behavior on WSL2) and Python/OpenCV core libraries (slow MCP cold-start and per-repo virtualenv drift). Building in Docker keeps the WSL2 host free of language toolchains while running the compiled Linux binary natively on the host lets it spawn `codex exec` and bind `127.0.0.1` for the Windows browser without container-boundary friction.
+
+================================================================================
+FILE: docs/adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec.md
+URL: https://hartorn-inc.github.io/imgforge/adr/0002-chatgpt-plus-oauth-via-isolated-codex-exec
+================================================================================
+
+# 0002. ChatGPT Plus OAuth via Isolated Codex Exec as Sole Built-in Image Backend
+
+- **Status**: accepted
+
+`imgforge` defines an extensible `ImageBackend` trait, but ships `CodexNativeBackend` (spawning `codex exec` with an isolated per-job `CODEX_HOME` and built-in `image_gen` backed by ChatGPT Plus OAuth) as its sole active backend; `OPENAI_API_KEY` API calls and `chatgpt.com` Chrome CDP automation (`ChatGptCdpBackend`) are excluded from core.
+
+Credentials are stored exclusively in a tool-local location managed by `imgforge auth` at `$XDG_DATA_HOME/imgforge/codex/auth.json` (falling back to `~/.local/share/imgforge/codex/auth.json` when `XDG_DATA_HOME` is unset) with strict `0600` file permissions (`0700` on parent directories), rather than symlinking or reading a global `~/.codex/auth.json`. For each `codex exec` invocation, `CodexNativeBackend` materializes a private copy of that tool-local `auth.json` (`0600`) inside a fresh temporary `CODEX_HOME` directory and removes it once the run finishes, isolating `imgforge` from user-global Codex CLI state and concurrent sessions.
+
+Because Codex `image_gen` provides neither native alpha-mask inpainting nor strict exact-pixel sizing guarantees (occasionally returning scaled square dimensions such as `1254x1254` for `1024x1024`), `imgforge` enforces a `<= 5%` aspect-ratio tolerance (fail-closed otherwise) with host-side Lanczos resampling, and unifies ROI-crop and painted-mask edits into a single host-blended `PatchEdit` pipeline. This eliminates per-image API billing and browser-DOM/Turnstile fragility at the cost of coupling to `codex-cli` output conventions.
+
+================================================================================
+FILE: docs/adr/0003-style-scoped-reference-packs.md
+URL: https://hartorn-inc.github.io/imgforge/adr/0003-style-scoped-reference-packs
+================================================================================
+
+# 0003. Style-Scoped Reference Packs Under Style-Neutral Subject Identity
+
+- **Status**: accepted
+
+A `Subject` stores style-neutral structured identity (`card.yaml`: proportions, physical height, `PaletteLock`, `ExclusiveSurfaceMap`, positive weapon geometry) separately from its rendered `ReferencePack` sheets, which are scoped by `(subject_slug, style_slug)` under `library/subjects/<slug>/packs/<style_slug>/`.
+
+Keeping a single global turnaround sheet per `Subject` causes severe outline and rendering bleed (for example, Franco-Belgian black ink outlines leaking into painterly dark-fantasy outputs) when cross-style generation passes mismatched sheets alongside target `Style` exemplars. Scoping packs by `Style` avoids cross-style bleed at the cost of generating or bootstrapping a target-style `ReferencePack` when a subject is first rendered in a new style.
+
+================================================================================
+FILE: docs/adr/0004-deterministic-prompt-compiler-over-double-llm.md
+URL: https://hartorn-inc.github.io/imgforge/adr/0004-deterministic-prompt-compiler-over-double-llm
+================================================================================
+
+# 0004. Deterministic Rust PromptCompiler with Optional Prose-Only SceneComposer
+
+- **Status**: accepted
+
+`imgforge` splits prompt preparation into two distinct stages: a deterministic, sub-millisecond Rust `PromptCompiler` (`SceneSpec` -> validated positive-only prompt) and an optional `SceneComposer` (`codex exec -s read-only`) invoked only when the caller supplies unstructured prose rather than a `SceneSpec`.
+
+Running an LLM compiler on every request—even when an MCP coding agent or the Web Canvas UI has already produced a structured `SceneSpec`—adds 5–15 seconds of latency per call and introduces double-LLM drift on weapon geometry and slot ordering. Making `SceneSpec` the canonical boundary keeps agentic runs deterministic and fast while still allowing human prose prompts via `imgforge compose` or `--compose`.
+
+================================================================================
+FILE: docs/adr/0005-host-composited-calibration-and-fail-closed-color-qa.md
+URL: https://hartorn-inc.github.io/imgforge/adr/0005-host-composited-calibration-and-fail-closed-color-qa
+================================================================================
+
+# 0005. Host-Composited Calibration Strips and Fail-Closed Whole-Image Color QA
+
+- **Status**: accepted
+
+`imgforge` composites the `#252830` neutral calibration strip (`L*` gray wedge + exact `PaletteLock` swatches) deterministically on the host onto `ReferencePack` sheets rather than asking `image_gen` to draw hex swatches, slices components by foreground bounding-box detection (with grid priors and UI overrides), and treats whole-image OKLab/`DeltaE_2000` drift detectors strictly as fail/flag QA gates (never silently re-grading whole images outside explicit `export --match-grade`).
+
+Generative models alter unshaded swatch RGB values and shift element positions across outputs, breaking blind pixel slicing and downstream color checks. Meanwhile, automatic global color transfer on whole scenes often washes out intentional atmospheric lighting; keeping `PatchEdit` local harmonization automatic while gating whole-image drift explicitly preserves both color integrity and human editorial control.
+
+================================================================================
+FILE: GLOSSARY.md
+URL: https://github.com/Hartorn-Inc/imgforge/blob/main/GLOSSARY.md
+================================================================================
+
+# imgforge
+
+`imgforge` is a standalone visual consistency engine for generating, editing, validating, and exporting multi-asset raster artwork via both agentic CLI/MCP workflows and a local Web Canvas UI.
+
+## Language
+
+### Core Domain Entities
+
+**Subject**:
+A recurring visual entity (`character`, `creature`, `prop`, or `location`) defined by a style-neutral identity specification (`card.yaml`) including proportions, physical height, material bindings, and `PaletteLock` swatches.
+_Avoid_: CharacterCard, PropCard, Entity, AssetSpec
+
+**Style**:
+A first-class rendering definition (`card.yaml` plus `1–3` visual `exemplars`) specifying medium, linework, shading, texture, framing rules, and anti-drift guardrails independently of any `Subject` or `Atmosphere`.
+_Avoid_: StyleCard, Theme, RenderPreset
+
+**Atmosphere**:
+A lighting and environmental mood specification (`card.yaml`) defining light direction, color temperature (Kelvin), `exposure_floor`, maximum ambient tint blend, and atmospheric particles.
+_Avoid_: AmbianceCard, LightingCard, Mood
+
+**ReferencePack**:
+A style-scoped set of canonical reference sheets (`turnaround`, `poses_expressions`, and `inventory_flatlay` for `character`/`creature`, or single-sheet templates for `prop`/`location`) and their component-detected slices belonging to one `(Subject, Style)` pair.
+_Avoid_: CharSheet, ModelSheet, GlobalRefSheet
+
+**Seed**:
+An initial input image (for example an existing parchment portrait or an approved `explore` `Run`) supplied as a bootstrap visual input to generate a `ReferencePack`.
+_Avoid_: DraftState, AnchorState
+
+**Atlas**:
+A composite image dynamically packed from selected `ReferencePack` slices (such as specific character angles and weapons) to minimize visual attention dilution in multi-subject scenes.
+_Avoid_: MegaSheet, MontageDump
+
+### Color & Composition Contracts
+
+**PaletteLock**:
+A set of exact unshaded base albedo hex colors bound to a `Subject` for deterministic OKLab/`DeltaE_2000` color-drift verification.
+_Avoid_: ColorTheme, SwatchHint
+
+**ExclusiveSurfaceMap**:
+An exhaustive assignment of material and base color to every visible surface or garment slot of a `Subject` so neighboring colors cannot bleed across boundaries.
+_Avoid_: NegativeColorBan, SlotColors
+
+**SceneSpec**:
+A structured, machine-validated composition specification (camera shot, depth planes, left-to-right slots, metric heights, hand bindings, `Subject` refs, `Style`, and `Atmosphere`) consumed by the `PromptCompiler`.
+_Avoid_: RawPrompt, CompositionNote
+
+**SceneComposer**:
+The optional LLM stage (`codex exec -s read-only`) that translates unstructured prose intent into a structured `SceneSpec`.
+_Avoid_: PromptWriter
+
+**PromptCompiler**:
+The deterministic Rust stage that validates `SceneSpec` invariants and compiles the final positive-only prompt payload sent to an `ImageBackend`.
+_Avoid_: PromptSanitizer, LLMCompiler
+
+### Spatial Guidance
+
+**SpatialGuide**:
+A programmatic visual reference image rendered deterministically from a `GuideSpec` JSON definition by `GuideRenderer` to constrain layout, scale, or trajectories.
+_Avoid_: Patron, LayoutHint
+
+**OverlayGuide**:
+A `SpatialGuide` variant that draws haloed vector lines, regions, or cues directly onto a copy of an existing target image for targeted trajectory or object fixes.
+_Avoid_: MethodA, GuidedOverlay
+
+**Blockout**:
+A `SpatialGuide` variant rendered from scratch containing depth-band color zones, proportionally scaled `Subject` mannequins, and action vectors.
+_Avoid_: MethodB, StickFigurePatron
+
+**GuideSpec**:
+The shared JSON schema edited in the Web Canvas UI and consumed by `GuideRenderer` (`tiny-skia`/`resvg`) to produce a `SpatialGuide`.
+_Avoid_: PatronJson, CanvasDrawing
+
+**GuideRenderer**:
+The deterministic Rust vector-to-raster engine (`tiny-skia`/`resvg`) that renders a `GuideSpec` into a `SpatialGuide` PNG.
+_Avoid_: PatronRenderer
+
+### Editing, Lifecycle & Deliverables
+
+**WholeImageEdit**:
+An edit strategy that passes the entire target image and reference anchors to `image_gen` for global or multi-region adjustments.
+_Avoid_: Mode5A, FullFix
+
+**PatchEdit**:
+A localized edit strategy that extracts a `1:1` square crop around an ROI or painted mask, optionally blanks/cues the target region, invokes `image_gen`, and seamlessly composites the patch via collar-ring OKLab Reinhard transfer and Laplacian pyramid blending.
+_Avoid_: Mode5B, Mode5C, MaskInpaint
+
+**Run**:
+A single versioned execution record (`vNNN.png` + `vNNN.meta.json`) capturing exact input hashes, compiled prompt, backend metadata, and automated/VLM QA reports.
+_Avoid_: Job, GenerationFile
+
+**Lifecycle**:
+The five-state progression of an asset (`draft` -> `candidate` -> `validated` -> `canonical` -> `superseded`), where `canonical` assets are immutable and frozen in `manifest.lock.json`.
+_Avoid_: ApprovalFlag, SeedState
+
+**VisionCritic**:
+The structured read-only VLM inspection stage (`codex exec --output-schema`) that evaluates a `Run` against binary per-trait checklists (identity, hand props, weapon geometry, style adherence, zero leaked text).
+_Avoid_: AutoJudge, CriticBot
+
+**Export**:
+A deterministic, reproducible post-processed deliverable (such as a circular VTT token, upscaled battlemap JPEG, or WebP web image) derived from a `Run` or `canonical` asset rather than tracked as an independent lifecycle version.
+_Avoid_: DerivedAsset, OutputVersion
+
+**Visibility**:
+An access classification (`public`, `restricted`, or `internal`) attached to a `Subject`, `SceneSpec`, or `Export` profile to prevent spoiler-sensitive assets from leaking into public outputs.
+_Avoid_: SpoilerFlag, AudienceMode

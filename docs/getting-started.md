@@ -1,3 +1,8 @@
+---
+title: "Getting Started"
+description: "Install imgforge, provision tool-local ChatGPT Plus OAuth, configure imgforge.toml, and run ReferencePack, SceneSpec, PatchEdit, Export, MCP, and Web Canvas UI workflows."
+---
+
 # Getting Started
 
 Get `imgforge` installed, authenticate with tool-local ChatGPT Plus OAuth, configure an `imgforge.toml` workspace, and run your first end-to-end generation, `PatchEdit`, and `Export` workflow.

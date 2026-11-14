@@ -7,7 +7,9 @@
   "description": "VitePress + Archify documentation site for imgforge",
   "scripts": {
     "docs:dev": "vitepress dev",
-    "docs:build": "vitepress build",
+    "docs:llms": "node ../scripts/build-llms-txt.mjs",
+    "docs:llms:check": "node ../scripts/build-llms-txt.mjs --check",
+    "docs:build": "node ../scripts/build-llms-txt.mjs && vitepress build",
     "docs:preview": "vitepress preview"
   },
   "devDependencies": {

@@ -9,7 +9,9 @@ on:
       - main
     paths:
       - docs/**
+      - GLOSSARY.md
       - scripts/build-diagrams.mjs
+      - scripts/build-llms-txt.mjs
       - scripts/archify/**
       - .github/workflows/pages.yml
   workflow_dispatch:
@@ -45,6 +47,9 @@ jobs:
 
       - name: Validate Archify diagrams
         run: node scripts/build-diagrams.mjs --check
+
+      - name: Validate llms.txt corpus
+        run: node scripts/build-llms-txt.mjs --check
 
       - name: Build VitePress site
         run: npm --prefix docs run docs:build

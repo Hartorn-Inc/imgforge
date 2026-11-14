@@ -1,5 +1,8 @@
 ---
 layout: home
+title: "imgforge — Visual Consistency Engine"
+titleTemplate: false
+description: "Standalone Rust visual consistency engine with deterministic PromptCompiler, style-scoped ReferencePacks, fail-closed OKLab Color QA, PatchEdit compositing, MCP server, and embedded Web Canvas UI."
 
 hero:
   name: "imgforge"
