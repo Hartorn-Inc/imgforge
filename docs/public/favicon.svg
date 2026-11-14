@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none">
+  <defs>
+    <linearGradient id="fav-slate" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E2430"/>
+      <stop offset="100%" stop-color="#0F131A"/>
+    </linearGradient>
+    <linearGradient id="fav-amber" x1="16" y1="16" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#EA580C"/>
+    </linearGradient>
+    <linearGradient id="fav-teal" x1="20" y1="42" x2="48" y2="20" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#14B8A6"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#fav-slate)" stroke="#334155" stroke-width="2"/>
+  <path d="M18 20H46L41 30H23L18 20Z" fill="url(#fav-amber)"/>
+  <path d="M23 33H41L36 44H28L23 33Z" fill="url(#fav-teal)"/>
+  <circle cx="32" cy="14" r="2.25" fill="#FDE68A"/>
+  <path d="M14 48H50" stroke="#475569" stroke-width="2" stroke-linecap="round"/>
+</svg>

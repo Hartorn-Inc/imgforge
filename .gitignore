@@ -5,6 +5,14 @@ target/
 frontend/node_modules/
 frontend/dist/
 
+# VitePress documentation dependencies & build artifacts
+docs/node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
+
+# Archify scratch artifacts
+.archify/
+
 # Git worktrees
 .worktrees/
 
