@@ -23,6 +23,36 @@ See [`GLOSSARY.md`](GLOSSARY.md) for the canonical domain vocabulary (`Subject`,
 | [`skills/imgforge/SKILL.md`](skills/imgforge/SKILL.md) | Portable agent workflow skill for `imgforge` CLI & MCP tools |
 | [`skills/scene-composition/SKILL.md`](skills/scene-composition/SKILL.md) | Portable skill for direct `SceneSpec` authoring without `SceneComposer` |
 
+## Installation
+
+Install prebuilt release binaries verified with `SHA256SUMS.txt`, or build from source:
+
+- **macOS / Linux (one-line installer, installs to `~/.local/bin`):**
+
+  ```bash
+  curl -fsSL https://github.com/Hartorn-Inc/imgforge/releases/latest/download/install.sh | bash
+  ```
+
+  Optional environment overrides: `IMGFORGE_VERSION` (for example `0.1.0` or `v0.1.0`, default `latest`) and `IMGFORGE_INSTALL_DIR` (default `~/.local/bin`).
+
+- **Windows (PowerShell, installs to `%LOCALAPPDATA%\imgforge\bin` and adds to User `PATH`):**
+
+  ```powershell
+  irm https://github.com/Hartorn-Inc/imgforge/releases/latest/download/install.ps1 | iex
+  ```
+
+- **Cargo Binstall:**
+
+  ```bash
+  cargo binstall imgforge
+  ```
+
+- **Build from Source (Docker + Make):**
+
+  ```bash
+  make build
+  ```
+
 ## Build & Verification (Docker + Make)
 
 All build, format, lint, and test commands run inside the pinned `Dockerfile` (`Rust 1.100.0` + `Node 22.23.5 LTS` on Debian Bookworm) via `Makefile`. No Rust or Node toolchains need to be installed on the host.
