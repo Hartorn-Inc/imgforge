@@ -102,11 +102,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             archive_ext: tar.gz
             bin_name: imgforge
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive_ext: tar.gz
             bin_name: imgforge
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             archive_ext: tar.gz
             bin_name: imgforge
@@ -199,7 +199,8 @@ jobs:
           cp LICENSE README.md "$stage/"
           archive="dist/imgforge-${RELEASE_TAG}-${CARGO_BUILD_TARGET}.tar.gz"
           tar -C "$stage" -czf "$archive" "$BIN_NAME" LICENSE README.md
-          tar -tzf "$archive" | grep -qx "$BIN_NAME"
+          tar_list="$(tar -tzf "$archive")"
+          printf '%s\n' "$tar_list" | grep -qx "$BIN_NAME"
 
       - name: Package release archive (zip)
         if: matrix.archive_ext == 'zip'
