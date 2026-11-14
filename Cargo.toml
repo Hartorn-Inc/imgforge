@@ -13,7 +13,7 @@ rust-version = "1.88"
 authors = ["Hartorn"]
 repository = "https://github.com/Hartorn-Inc/imgforge"
 homepage = "https://hartorn-inc.github.io/imgforge/"
-documentation = "https://hartorn-inc.github.io/imgforge/"
+documentation = "https://hartorn-inc.github.io/imgforge/reference"
 keywords = ["image-generation", "visual-consistency", "mcp", "vtt", "canvas"]
 categories = ["command-line-utilities", "multimedia::images"]
 
