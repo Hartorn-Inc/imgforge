@@ -1,140 +1,14 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>Giskard-AI/.github",
-    "config:best-practices",
-    ":dependencyDashboard",
-    ":pinAllExceptPeerDependencies",
-    "docker:pinDigests",
-    "security:openssf-scorecard",
-    ":enableVulnerabilityAlertsWithLabel(security)"
+    "github>Hartorn-Inc/.github",
+    "github>Hartorn-Inc/.github:automerge",
+    ":dependencyDashboard"
   ],
   "baseBranchPatterns": [
     "main"
   ],
-  "semanticCommits": "enabled",
-  "commitMessageAction": "bump",
-  "rangeStrategy": "pin",
-  "internalChecksFilter": "strict",
-  "prCreation": "not-pending",
-  "rebaseWhen": "behind-base-branch",
-  "automerge": false,
-  "platformAutomerge": false,
-  "npmrc": "ignore-scripts=true\n",
-  "packageRules": [
-    {
-      "description": "3-day release cooldown for Cargo crate updates",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchDatasources": [
-        "crate"
-      ],
-      "minimumReleaseAge": "3 days"
-    },
-    {
-      "description": "Group non-major Cargo crate updates",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchDatasources": [
-        "crate"
-      ],
-      "matchUpdateTypes": [
-        "minor",
-        "patch"
-      ],
-      "groupName": "cargo dependencies",
-      "groupSlug": "cargo-dependencies"
-    },
-    {
-      "description": "3-day cooldown for npm patch updates in frontend/ and docs/",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchFileNames": [
-        "frontend/**",
-        "docs/**"
-      ],
-      "matchUpdateTypes": [
-        "patch",
-        "pin",
-        "digest"
-      ],
-      "minimumReleaseAge": "3 days"
-    },
-    {
-      "description": "7-day cooldown for npm minor updates in frontend/ and docs/",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchFileNames": [
-        "frontend/**",
-        "docs/**"
-      ],
-      "matchUpdateTypes": [
-        "minor"
-      ],
-      "minimumReleaseAge": "7 days"
-    },
-    {
-      "description": "14-day cooldown for npm major updates in frontend/ and docs/",
-      "matchManagers": [
-        "npm"
-      ],
-      "matchFileNames": [
-        "frontend/**",
-        "docs/**"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "minimumReleaseAge": "14 days"
-    },
-    {
-      "description": "7-day cooldown and grouping for GitHub Actions",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "minimumReleaseAge": "7 days",
-      "groupName": "github-actions",
-      "groupSlug": "github-actions"
-    },
-    {
-      "description": "7-day cooldown and grouping for Docker images",
-      "matchManagers": [
-        "dockerfile",
-        "docker-compose",
-        "custom.regex"
-      ],
-      "matchDatasources": [
-        "docker"
-      ],
-      "minimumReleaseAge": "7 days",
-      "groupName": "docker images",
-      "groupSlug": "docker-images"
-    },
-    {
-      "description": "Allow optional timestamps and require Dependency Dashboard approval for zizmor image updates",
-      "matchPackageNames": [
-        "ghcr.io/zizmorcore/zizmor"
-      ],
-      "minimumReleaseAgeBehaviour": "timestamp-optional",
-      "dependencyDashboardApproval": true
-    }
-  ],
-  "customManagers": [
-    {
-      "customType": "regex",
-      "description": "Track pinned ZIZMOR_IMAGE in Zizmor workflow and scan script",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/zizmor\\.yml$/",
-        "/^scripts/zizmor/scan\\.sh$/"
-      ],
-      "matchStrings": [
-        "ZIZMOR_IMAGE(?:\\s*:\\s*|\\s*=\\s*[\"']?(?:\\$\\{ZIZMOR_IMAGE:-)?)[\"']?(?<depName>ghcr\\.io/zizmorcore/zizmor):(?<currentValue>[^\\s@\"'}]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
-      ],
-      "datasourceTemplate": "docker"
-    }
+  "ignorePaths": [
+    "scripts/archify/**"
   ]
 }

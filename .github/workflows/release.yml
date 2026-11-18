@@ -71,14 +71,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Cache Cargo and npm build caches
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/imgforge
-          key: imgforge-cache-${{ runner.os }}-${{ hashFiles('Dockerfile', 'Cargo.lock', 'frontend/package-lock.json') }}
-          restore-keys: |
-            imgforge-cache-${{ runner.os }}-
-
       - name: Build builder container and run fmt, lint, and tests
         run: make docker-build && make fmt-check && make lint && make test
 
@@ -132,11 +124,6 @@ jobs:
         with:
           toolchain: "1.100.0"
           targets: ${{ matrix.target }}
-
-      - name: Cache Cargo workspace
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          prefix-key: release-${{ matrix.target }}
 
       - name: Install frontend dependencies
         run: npm --prefix frontend ci --ignore-scripts
